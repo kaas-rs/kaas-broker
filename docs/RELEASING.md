@@ -5,7 +5,7 @@ Releases are tag-driven. Pushing a semver tag to `main` triggers the
 publishes the broker image, the operator image, and the Helm chart to GHCR.
 
 Every `v*` tag builds the broker and operator from `bins/*/Dockerfile`
-and publishes to `kaas[-preview]` / `kaas-operator[-preview]`. The
+and publishes to `kaas-broker[-preview]` / `kaas-broker-operator[-preview]`. The
 `v0.2.x` line is the first cut from the Rust workspace; `v0.1.x` tags
 predate it (the version line jumped from `v0.1.190-preview` to
 `v0.2.0-preview` at the cutover — the one pre-authorised exception to
@@ -81,12 +81,12 @@ tag and the Helm chart version (so `v0.1.3-preview` → `0.1.3-preview`).
 
 Pre-release tags (`v*-*`) publish to:
 
-- `ghcr.io/kaas-rs/kaas-preview:<version>`
-- `ghcr.io/kaas-rs/kaas-operator-preview:<version>`
-- `oci://ghcr.io/kaas-rs/charts/kaas:<version>`
+- `ghcr.io/kaas-rs/kaas-broker-preview:<version>`
+- `ghcr.io/kaas-rs/kaas-broker-operator-preview:<version>`
+- `oci://ghcr.io/kaas-rs/charts/kaas-broker:<version>`
 
 Stable tags (no pre-release suffix) publish to the un-suffixed names
-(`kaas`, `kaas-operator`). No stable tag has been cut yet.
+(`kaas-broker`, `kaas-broker-operator`). No stable tag has been cut yet.
 
 Images are built `linux/amd64` only.
 
@@ -108,10 +108,10 @@ Images are built `linux/amd64` only.
 4. After the run completes, verify the artifacts exist:
    ```bash
    # chart
-   helm pull oci://ghcr.io/kaas-rs/charts/kaas --version 0.1.4-preview
+   helm pull oci://ghcr.io/kaas-rs/charts/kaas-broker --version 0.1.4-preview
    # images (any registry-aware tool works)
    docker buildx imagetools inspect \
-     ghcr.io/kaas-rs/kaas-preview:0.1.4-preview
+     ghcr.io/kaas-rs/kaas-broker-preview:0.1.4-preview
    ```
 
 The `Chart.yaml` `version`/`appVersion` fields are overridden by the CI

@@ -1,5 +1,5 @@
 apiVersion: v2
-name: kaas
+name: kaas-broker
 description: Kafka-protocol-compatible broker on shared storage with Kubernetes-native coordination
 type: application
 version: 0.1.0

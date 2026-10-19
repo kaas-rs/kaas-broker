@@ -66,11 +66,11 @@ jobs:
           echo "owner=${OWNER}" >> "$GITHUB_OUTPUT"
           echo "image_tag=${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           if [[ "$VERSION" == *-* ]]; then
-            echo "broker_image=ghcr.io/${OWNER}/kaas-preview" >> "$GITHUB_OUTPUT"
-            echo "operator_image=ghcr.io/${OWNER}/kaas-operator-preview" >> "$GITHUB_OUTPUT"
+            echo "broker_image=ghcr.io/${OWNER}/kaas-broker-preview" >> "$GITHUB_OUTPUT"
+            echo "operator_image=ghcr.io/${OWNER}/kaas-broker-operator-preview" >> "$GITHUB_OUTPUT"
           else
-            echo "broker_image=ghcr.io/${OWNER}/kaas" >> "$GITHUB_OUTPUT"
-            echo "operator_image=ghcr.io/${OWNER}/kaas-operator" >> "$GITHUB_OUTPUT"
+            echo "broker_image=ghcr.io/${OWNER}/kaas-broker" >> "$GITHUB_OUTPUT"
+            echo "operator_image=ghcr.io/${OWNER}/kaas-broker-operator" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Build + push broker image
@@ -107,5 +107,5 @@ jobs:
           helm registry login ghcr.io \
             -u "${{ github.actor }}" \
             -p "${{ secrets.GITHUB_TOKEN }}"
-          helm push "kaas-${CHART_VERSION}.tgz" \
+          helm push "kaas-broker-${CHART_VERSION}.tgz" \
             "oci://ghcr.io/${OWNER}/charts"

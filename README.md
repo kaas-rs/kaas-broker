@@ -27,7 +27,7 @@ Deploy with the Helm chart in [`deploy/helm/kaas/`](./deploy/helm/kaas/) — see
 handling):
 
 ```bash
-helm install kaas oci://ghcr.io/kaas-rs/charts/kaas
+helm install kaas oci://ghcr.io/kaas-rs/charts/kaas-broker
 ```
 
 Two images ship from this repo: the broker (`bins/kaas`) and the operator

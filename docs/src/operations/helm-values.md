@@ -19,10 +19,10 @@ Two Helm behaviors worth knowing before overriding anything:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `image.repository` | `""` | Broker image. Empty derives `ghcr.io/kaas-rs/kaas`, with a `-preview` suffix appended automatically when the resolved tag is a pre-release (contains `-`) — the same naming rule the release workflow uses. An explicit value overrides the derivation. |
+| `image.repository` | `""` | Broker image. Empty derives `ghcr.io/kaas-rs/kaas-broker`, with a `-preview` suffix appended automatically when the resolved tag is a pre-release (contains `-`) — the same naming rule the release workflow uses. An explicit value overrides the derivation. |
 | `image.tag` | `""` | Defaults to the chart's `appVersion`. |
 | `image.pullPolicy` | `IfNotPresent` | |
-| `operator.image.*` | `""` / `""` / `IfNotPresent` | Same derivation for `ghcr.io/kaas-rs/kaas-operator[-preview]`. |
+| `operator.image.*` | `""` / `""` / `IfNotPresent` | Same derivation for `ghcr.io/kaas-rs/kaas-broker-operator[-preview]`. |
 
 ## `operator`
 

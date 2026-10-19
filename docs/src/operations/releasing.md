@@ -11,9 +11,9 @@ Pushing a semver tag to `main` triggers the release workflow
 (`.github/workflows/docker-publish.yml`), which builds and publishes three
 artifacts to GHCR:
 
-- the broker image — `ghcr.io/kaas-rs/kaas[-preview]`
-- the operator image — `ghcr.io/kaas-rs/kaas-operator[-preview]`
-- the Helm chart — `oci://ghcr.io/kaas-rs/charts/kaas`
+- the broker image — `ghcr.io/kaas-rs/kaas-broker[-preview]`
+- the operator image — `ghcr.io/kaas-rs/kaas-broker-operator[-preview]`
+- the Helm chart — `oci://ghcr.io/kaas-rs/charts/kaas-broker`
 
 Pre-release tags (anything containing `-`, like `v0.3.1-preview`) get the
 `-preview` image-name suffix automatically; the chart's image helpers

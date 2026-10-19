@@ -1,5 +1,5 @@
 image:
-  # The default repository is ghcr.io/kaas-rs/kaas, with a
+  # The default repository is ghcr.io/kaas-rs/kaas-broker, with a
   # "-preview" suffix appended automatically when the resolved tag is
   # a pre-release (contains "-"), mirroring the release workflow's
   # naming rule. An explicit repository overrides that derivation.

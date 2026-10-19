@@ -2,8 +2,13 @@
 Common template helpers.
 */}}
 
+{{- /* Pinned to "kaas", not .Chart.Name: the chart was renamed to
+       kaas-broker, and this name feeds the StatefulSet/Deployment
+       selector labels (immutable) and the default fullname. Deriving it
+       from the chart name would make a plain upgrade from a "kaas"
+       chart fail on the selector and orphan the PVCs. */ -}}
 {{- define "kaas.name" -}}
-{{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
+{{- default "kaas" .Values.nameOverride | trunc 63 | trimSuffix "-" -}}
 {{- end -}}
 
 {{- define "kaas.fullname" -}}
@@ -94,7 +99,7 @@ image names.
 {{- $repo := .Values.image.repository -}}
 {{- if not $repo -}}
   {{- $pre := contains "-" $tag | ternary "-preview" "" -}}
-  {{- $repo = printf "ghcr.io/kaas-rs/kaas%s" $pre -}}
+  {{- $repo = printf "ghcr.io/kaas-rs/kaas-broker%s" $pre -}}
 {{- end -}}
 {{ $repo }}:{{ $tag }}
 {{- end -}}
@@ -326,7 +331,7 @@ is empty (broker treats unset env as "no superUsers").
 {{- $repo := .Values.operator.image.repository -}}
 {{- if not $repo -}}
   {{- $pre := contains "-" $tag | ternary "-preview" "" -}}
-  {{- $repo = printf "ghcr.io/kaas-rs/kaas-operator%s" $pre -}}
+  {{- $repo = printf "ghcr.io/kaas-rs/kaas-broker-operator%s" $pre -}}
 {{- end -}}
 {{ $repo }}:{{ $tag }}
 {{- end -}}
