@@ -11,7 +11,7 @@ Current release line: `v0.2.x-preview`.
 
 ## Documentation
 
-- **[The kaas book](https://kaas-rs.github.io/kaas/)** — architecture (Part I is
+- **[The kaas book](https://kaas-rs.github.io/kaas-broker/)** — architecture (Part I is
   the authoritative architecture doc), Kafka compatibility (the generated API
   matrix + per-KIP status), code tour, operations. Source in [`docs/`](./docs/),
   rebuilt from `main` on every push; build locally with `cargo xtask docs` (or

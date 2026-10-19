@@ -4,7 +4,7 @@ name: release
 # to GHCR. Guardrails:
 #   - pre-release tags (v*-*) publish to separate image names
 #
-# Runs on the kaas-rs/kaas ARC runner set (apps/arc-runners in the
+# Runs on the kaas-rs/kaas-broker ARC runner set (apps/arc-runners in the
 # k3s-cluster repo). containerMode=dind provides a privileged Docker daemon
 # which supports QEMU, multi-arch, and GHA cache.
 on:

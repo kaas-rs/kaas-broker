@@ -6,8 +6,8 @@ src = "src"
 
 [output.html]
 default-theme = "rust"
-git-repository-url = "https://github.com/kaas-rs/kaas"
-edit-url-template = "https://github.com/kaas-rs/kaas/edit/main/docs/{path}"
+git-repository-url = "https://github.com/kaas-rs/kaas-broker"
+edit-url-template = "https://github.com/kaas-rs/kaas-broker/edit/main/docs/{path}"
 additional-js = ["mermaid.min.js", "mermaid-init.js"]
 
 [output.html.search]

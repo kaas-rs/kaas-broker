@@ -22,7 +22,7 @@
 //! `skip_serializing_if` behaviour fails the test — that's the
 //! catch the [gh #169] hedge wants before Phase 9 cutover.
 //!
-//! [gh #169]: https://github.com/kaas-rs/kaas/issues/169
+//! [gh #169]: https://github.com/kaas-rs/kaas-broker/issues/169
 //!
 //! Regenerating: `cd archive && go run ./cmd/capture-txn-fixtures
 //! ../crates/kaas-coordinator/tests/fixtures/` overwrites every

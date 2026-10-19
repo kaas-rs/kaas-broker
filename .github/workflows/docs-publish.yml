@@ -1,7 +1,7 @@
 name: Docs Publish
 
 # Builds the book and deploys it to this repo's own GitHub Pages site at
-# https://kaas-rs.github.io/kaas/.
+# https://kaas-rs.github.io/kaas-broker/.
 #
 # The landing page at https://kaas.rs/ is a separate site in
 # kaas-rs/kaas-landing-page and links here by absolute URL — the two

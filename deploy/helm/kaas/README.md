@@ -69,7 +69,7 @@ kubectl apply -f kaas/crds/
 
 # Or apply them straight from the repo at a specific ref:
 REF=v0.3.1-preview
-BASE=https://raw.githubusercontent.com/kaas-rs/kaas/${REF}/deploy/crds
+BASE=https://raw.githubusercontent.com/kaas-rs/kaas-broker/${REF}/deploy/crds
 for f in kaas.rs_kafkaclusters.yaml \
          kaas.rs_kafkatopics.yaml \
          kaas.rs_kafkausers.yaml; do

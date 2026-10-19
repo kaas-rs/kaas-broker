@@ -1,7 +1,7 @@
 # docs/
 
 The kaas documentation book and its supporting files. The book is published
-at **<https://kaas-rs.github.io/kaas/>**, rebuilt from `main` on every push.
+at **<https://kaas-rs.github.io/kaas-broker/>**, rebuilt from `main` on every push.
 The project landing page at <https://kaas.rs/> is an entirely separate site
 living in
 [kaas-rs/kaas-landing-page](https://github.com/kaas-rs/kaas-landing-page);
@@ -56,7 +56,7 @@ the compatibility claims from rotting. Three checks:
 ## Publishing
 
 `.github/workflows/docs-publish.yml` builds the book and deploys it to this
-repo's own GitHub Pages site, <https://kaas-rs.github.io/kaas/>. Editing
+repo's own GitHub Pages site, <https://kaas-rs.github.io/kaas-broker/>. Editing
 `docs/src/` is all you need to do; the publish is automatic.
 
 **The landing page is a separate site, not a separate half of this one.**
