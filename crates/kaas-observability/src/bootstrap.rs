@@ -10,6 +10,9 @@
 //! * `KAAS_METRIC_EXPORT_INTERVAL` — duration string (`30s` etc.).
 //!   Default `30s` per gh #133 (SDK default is 60s → `rate([1m])`
 //!   panels see one sample and gap).
+//! * `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SERVICE_NAME` — the standard
+//!   resource env vars (gh #269); see [`compose_resource`] for how they
+//!   rank against kaas's own attributes.
 //! * `OTEL_SERVICE_VERSION`, `MY_POD_NAME`, `KAAS_NAMESPACE` — folded
 //!   into resource attributes so Grafana can filter by broker /
 //!   namespace.
@@ -23,9 +26,10 @@ use std::time::Duration;
 
 use opentelemetry::global;
 use opentelemetry::trace::TracerProvider as _;
-use opentelemetry::KeyValue;
+use opentelemetry::{Key, KeyValue};
 use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use opentelemetry_sdk::resource::{EnvResourceDetector, TelemetryResourceDetector};
 use opentelemetry_sdk::runtime;
 use opentelemetry_sdk::trace::{BatchSpanProcessor, Sampler, Tracer as SdkTracer, TracerProvider};
 use opentelemetry_sdk::Resource;
@@ -179,28 +183,61 @@ pub async fn bootstrap(
 }
 
 fn build_resource(service: &str) -> Resource {
-    let mut attrs = vec![KeyValue::new("service.name", service.to_string())];
-    if let Ok(v) = std::env::var("OTEL_SERVICE_VERSION") {
-        if !v.is_empty() {
-            attrs.push(KeyValue::new("service.version", v));
-        }
+    // `Resource::new` alone runs no detectors, which is how
+    // `OTEL_RESOURCE_ATTRIBUTES` and `OTEL_SERVICE_NAME` went unread
+    // (gh #269). Not `Resource::default()` either: its service-name
+    // detector falls back to `unknown_service`, which would outrank
+    // kaas's own name once merged.
+    let detected = Resource::from_detectors(
+        Duration::ZERO,
+        vec![
+            Box::new(TelemetryResourceDetector),
+            Box::new(EnvResourceDetector::new()),
+        ],
+    );
+    compose_resource(service, &detected, |name| {
+        std::env::var(name).ok().filter(|v| !v.is_empty())
+    })
+}
+
+/// Layer kaas's attributes over what the environment declared
+/// (`detected`: `telemetry.sdk.*` plus `OTEL_RESOURCE_ATTRIBUTES`).
+///
+/// - `service.name` follows the SDK's own order — `OTEL_SERVICE_NAME`,
+///   then a `service.name` in `OTEL_RESOURCE_ATTRIBUTES` — with
+///   `service` standing in for `unknown_service` as the last resort.
+/// - Everything else kaas sets outranks `OTEL_RESOURCE_ATTRIBUTES`, as
+///   the resource SDK spec has it for application-provided attributes:
+///   the pod identity comes from the downward API and is what
+///   per-broker dashboards key on.
+fn compose_resource(
+    service: &str,
+    detected: &Resource,
+    var: impl Fn(&str) -> Option<String>,
+) -> Resource {
+    let service_name = var("OTEL_SERVICE_NAME")
+        .or_else(|| {
+            detected
+                .get(Key::new("service.name"))
+                .map(|v| v.to_string())
+        })
+        .unwrap_or_else(|| service.to_owned());
+    let mut attrs = vec![KeyValue::new("service.name", service_name)];
+    if let Some(v) = var("OTEL_SERVICE_VERSION") {
+        attrs.push(KeyValue::new("service.version", v));
     }
-    if let Ok(v) = std::env::var("MY_POD_NAME") {
-        if !v.is_empty() {
-            attrs.push(KeyValue::new("k8s.pod.name", v.clone()));
-            // Prometheus's OTLP receiver promotes service.instance.id
-            // to the `instance` label on every series; without it, all
-            // brokers flatten under the same `job=kaas` and
-            // per-broker drill-down in Grafana isn't possible.
-            attrs.push(KeyValue::new("service.instance.id", v));
-        }
+    if let Some(v) = var("MY_POD_NAME") {
+        attrs.push(KeyValue::new("k8s.pod.name", v.clone()));
+        // Prometheus's OTLP receiver promotes service.instance.id
+        // to the `instance` label on every series; without it, all
+        // brokers flatten under the same `job=kaas` and
+        // per-broker drill-down in Grafana isn't possible.
+        attrs.push(KeyValue::new("service.instance.id", v));
     }
-    if let Ok(v) = std::env::var("KAAS_NAMESPACE") {
-        if !v.is_empty() {
-            attrs.push(KeyValue::new("k8s.namespace.name", v));
-        }
+    if let Some(v) = var("KAAS_NAMESPACE") {
+        attrs.push(KeyValue::new("k8s.namespace.name", v));
     }
-    Resource::new(attrs)
+    detected.merge(&Resource::new(attrs))
 }
 
 fn build_sampler() -> Sampler {
@@ -311,6 +348,66 @@ mod tests {
         assert_eq!(parse_duration_str("abc"), None);
         assert_eq!(parse_duration_str("-1s"), None);
         assert_eq!(parse_duration_str("1years"), None);
+    }
+
+    fn vars<'a>(set: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            set.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_owned())
+        }
+    }
+
+    fn attr(resource: &Resource, key: &'static str) -> Option<String> {
+        resource.get(Key::new(key)).map(|v| v.to_string())
+    }
+
+    fn declared(attrs: &[(&'static str, &'static str)]) -> Resource {
+        Resource::new(attrs.iter().map(|(k, v)| KeyValue::new(*k, *v)))
+    }
+
+    #[test]
+    fn with_nothing_declared_the_service_is_named_by_kaas() {
+        let r = compose_resource("kaas", &declared(&[]), vars(&[]));
+        assert_eq!(attr(&r, "service.name").as_deref(), Some("kaas"));
+        assert_eq!(attr(&r, "service.instance.id"), None);
+    }
+
+    #[test]
+    fn otel_resource_attributes_reach_the_resource() {
+        let env = declared(&[("deployment.environment.name", "prod")]);
+        let r = compose_resource("kaas", &env, vars(&[]));
+        assert_eq!(
+            attr(&r, "deployment.environment.name").as_deref(),
+            Some("prod")
+        );
+    }
+
+    #[test]
+    fn service_name_prefers_otel_service_name_then_resource_attributes() {
+        let env = declared(&[("service.name", "from-attrs")]);
+        let r = compose_resource("kaas", &env, vars(&[]));
+        assert_eq!(attr(&r, "service.name").as_deref(), Some("from-attrs"));
+
+        let r = compose_resource("kaas", &env, vars(&[("OTEL_SERVICE_NAME", "from-env")]));
+        assert_eq!(attr(&r, "service.name").as_deref(), Some("from-env"));
+    }
+
+    #[test]
+    fn the_pod_identity_outranks_otel_resource_attributes() {
+        let env = declared(&[
+            ("k8s.pod.name", "someone-else"),
+            ("service.instance.id", "x"),
+        ]);
+        let r = compose_resource("kaas", &env, vars(&[("MY_POD_NAME", "kaas-1")]));
+        assert_eq!(attr(&r, "k8s.pod.name").as_deref(), Some("kaas-1"));
+        assert_eq!(attr(&r, "service.instance.id").as_deref(), Some("kaas-1"));
+    }
+
+    #[test]
+    fn the_built_resource_carries_the_sdk_attributes() {
+        let r = build_resource("kaas");
+        assert_eq!(attr(&r, "telemetry.sdk.language").as_deref(), Some("rust"));
     }
 
     #[test]

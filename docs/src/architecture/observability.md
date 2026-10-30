@@ -23,6 +23,14 @@ Helm chart):
   single sample and gap.
 - `OTEL_SERVICE_VERSION`, `MY_POD_NAME`, `KAAS_NAMESPACE` — folded into
   resource attributes so dashboards can filter by broker and namespace.
+- `OTEL_RESOURCE_ATTRIBUTES` and `OTEL_SERVICE_NAME` — the standard
+  resource variables, honoured alongside the SDK's `telemetry.sdk.*`
+  attributes. `service.name` is `OTEL_SERVICE_NAME`, else a
+  `service.name` in `OTEL_RESOURCE_ATTRIBUTES`, else `kaas` (or
+  `kaas-operator`). For everything else kaas sets, kaas wins: the pod
+  identity above comes from the downward API and is what per-broker
+  dashboards key on, so a conflicting `k8s.pod.name` or
+  `service.instance.id` in `OTEL_RESOURCE_ATTRIBUTES` is overridden.
 - `OTEL_TRACES_SAMPLER_ARG` — trace sampling ratio in `[0, 1]`, default
   0.1.
 
