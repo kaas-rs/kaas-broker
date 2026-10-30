@@ -1484,6 +1484,8 @@ dependencies = [
  "async-stream",
  "async-trait",
  "chrono",
+ "http",
+ "http-body-util",
  "k8s-openapi",
  "kaas-broker",
  "kaas-coordinator",
@@ -1500,6 +1502,7 @@ dependencies = [
  "tokio-stream",
  "tokio-util",
  "tonic",
+ "tower 0.5.3",
  "tracing",
  "twox-hash",
 ]

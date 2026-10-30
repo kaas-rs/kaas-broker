@@ -53,6 +53,7 @@ pub struct Metrics {
     // Cluster controller leadership.
     pub controller_failovers: Counter<u64>,
     pub controller_failover_duration: Histogram<f64>,
+    pub controller_lease_conflicts: Counter<u64>,
 
     // Assignment loop (controller-side).
     pub assignment_changes: Counter<u64>,
@@ -149,6 +150,12 @@ pub fn new_metrics(m: &Meter) -> Metrics {
             m,
             "kaas.controller.failover.duration",
             "Seconds from winning the lease to the first AssignmentLoop write",
+        ),
+        controller_lease_conflicts: counter(
+            m,
+            "kaas.controller.lease.conflicts",
+            "Controller Lease writes answered 409 because another writer got there first, by \
+             write (takeover, renew, release)",
         ),
 
         assignment_changes: counter(

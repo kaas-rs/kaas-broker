@@ -13,8 +13,9 @@ metadata:
   labels: {{- include "kaas.labels" . | nindent 4 }}
 rules:
   # Controller election + epoch watch via Leases. The broker
-  # acquires/renews the kaas-controller Lease with server-side
-  # apply, which needs `patch`.
+  # acquires/renews/releases the kaas-controller Lease with a
+  # resourceVersion-conditional replace, which needs `update`;
+  # `patch` covers older images that still server-side apply.
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
     verbs: [get, list, watch, create, update, patch]

@@ -47,3 +47,7 @@ parking_lot = { workspace = true }
 tempfile    = { workspace = true }
 tokio       = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 tokio-util  = { workspace = true }
+# Fake API server for the Lease compare-and-swap tests in kube_election.rs.
+http           = "1"
+http-body-util = "0.1"
+tower          = { version = "0.5", features = ["util"] }

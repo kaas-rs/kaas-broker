@@ -38,6 +38,7 @@ const EXPECTED_WIRED: &[&str] = &[
     "fsync_latency",
     "controller_failovers",
     "controller_failover_duration",
+    "controller_lease_conflicts",
     "assignment_changes",
     "assignment_file_writes",
     "assignment_file_write_latency",

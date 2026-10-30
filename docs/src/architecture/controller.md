@@ -13,8 +13,9 @@ propagation is a **JSON file on the shared volume**.
 The "controller" is just a broker holding the `kaas-controller` Lease —
 there is no separate process and no Raft quorum. The Lease's
 `leaseTransitions` counter is the cluster's epoch source: it increments
-exactly when the holder changes, and a releasing controller re-sends it
-so the epoch fence never rewinds.
+exactly when the holder changes, and every write carries it over from
+the Lease it just read, so a release can't reset it and the epoch fence
+never rewinds.
 
 ```mermaid
 sequenceDiagram
@@ -24,7 +25,7 @@ sequenceDiagram
     participant B as kaas-1<br/>(peer broker)
 
     B->>C: heartbeat gRPC :9094<br/>bidi stream, 1 s PING cadence
-    C->>L: acquire (server-side apply)<br/>holderIdentity = kaas-0,<br/>leaseTransitions +1 on takeover
+    C->>L: acquire (GET, then replace<br/>conditional on resourceVersion)<br/>holderIdentity = kaas-0,<br/>leaseTransitions +1 on takeover
     L-->>C: epoch = leaseTransitions
     Note over C: recompute triggers:<br/>first Lease win · KafkaTopic change ·<br/>broker join/leave (2 s alive-set poll)
     C->>C: balancer: partition +<br/>consumer-group assignments
@@ -43,6 +44,50 @@ per-partition Lease either: the
 singleton controller Lease is the only Kubernetes coordination
 primitive, and everything downstream of it travels through
 `assignment.json` on the shared volume.
+
+## One winner per transition
+
+Every write to the Lease — taking it over, renewing it, releasing it —
+is a read followed by a conditional write. The broker reads the Lease,
+decides, and writes back the object it read. That object still carries
+the read's `resourceVersion`, and the API server accepts the write only
+if the version still matches, answering `409 Conflict` otherwise. So two
+brokers that both find the Lease expired can't both win: one write
+lands, the other gets a 409 and goes back to waiting. This is the
+compare-and-swap Kubernetes provides for exactly this job, and it is how
+client-go's own leader election (`LeaseLock.Update`) writes the Lease.
+
+Earlier releases wrote the Lease with a forced server-side apply, which
+has no precondition: the last writer wins. Two candidates racing for an
+expired Lease both wrote the same next `leaseTransitions`, and both
+believed they were controller *at the same epoch*. The brokers' fence
+rejects an assignment only when its epoch is *lower* than the Lease's,
+so it couldn't tell the two apart, and `assignment.json` became
+whichever controller renamed last. A renew could also overwrite a
+takeover that had just landed, and a release blanked the Lease no matter
+who held it.
+
+What a 409 means depends on the write:
+
+| Write | On 409 |
+|---|---|
+| takeover | lost the race; wait and try again |
+| renew | transient; the next tick re-reads, and either still holds the Lease or sees the new holder and steps down |
+| release | someone else has written it; leave it alone |
+
+Each 409 is logged with the broker identities involved (a lost renew
+names the new holder and its epoch) and counted in
+`kaas.controller.lease.conflicts`, labelled by `write`. An occasional
+takeover conflict during a failover is normal; a steady stream of renew
+conflicts means two writers keep fighting over the Lease.
+
+The conditional write is not a fence. It guarantees one winner per
+transition, but a deposed controller keeps acting until its own next
+renew fails. The epoch checks on `assignment.json` and on every
+partition are what make that window harmless, as before. And during a
+rolling upgrade from a release that still force-applies, the
+older brokers can still overwrite; the gap closes once every broker runs
+the new image.
 
 ## What the controller does
 
@@ -156,6 +201,8 @@ persisted.
 ## Implementation notes (for contributors)
 
 - Controller-side logic lives in `crates/kaas-controller`:
+  `kube_election.rs` (the Lease campaign; its tests run the
+  conditional-write races against a fake API server),
   `heartbeat_server.rs` (serves `proto/heartbeat.proto`),
   `balancer.rs` (assignment computation), `assignment_writer.rs`
   (epoch-prefixed write).
