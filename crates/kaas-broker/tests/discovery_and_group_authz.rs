@@ -16,6 +16,13 @@
 //! is a Strimzi-shaped consumer holding only `Read` grants, which work
 //! only through Apache's `Read` ⇒ `Describe` implication. `ops` and
 //! `auditor` exercise the per-topic and cluster-wide halves.
+//!
+//! The filtering rows also check which denials get *reported*. A
+//! listing that leaves a topic or group out is answering the request,
+//! so it must check through `authorize_quietly`; the live canary,
+//! allowed 1 of 9 topics, logged 8 `acl: denied` warnings on every
+//! metadata refresh until it did. [`Audited`] records every denial that
+//! came through the reporting `authorize` instead.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -25,7 +32,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::{Bytes, BytesMut};
-use kaas_auth::{AclEngine, NoQuotaChecker, Principal, PrincipalKind};
+use kaas_auth::{
+    AclEngine, Authorizer, NoQuotaChecker, Operation, Principal, PrincipalKind, Resource,
+};
 use kaas_broker::{
     Broker, DeleteGroupsHandler, DescribeGroupsHandler, FindCoordinatorHandler, HeartbeatHandler,
     JoinGroupHandler, LeaveGroupHandler, ListGroupsHandler, ListOffsetsHandler, ListenerEntry,
@@ -95,6 +104,37 @@ const ACLS: &str = r#"{"acls":[
 struct Cluster {
     _tmp: tempfile::TempDir,
     broker: Arc<Broker>,
+    audit: Arc<Audited>,
+}
+
+/// The real ACL engine, plus a record of the denials that went through
+/// the reporting entry point (`kind/name`, in order).
+#[derive(Debug)]
+struct Audited {
+    acls: AclEngine,
+    reported: Mutex<Vec<String>>,
+}
+
+impl Authorizer for Audited {
+    fn authorize(&self, principal: &Principal, resource: &Resource, op: Operation) -> bool {
+        let allowed = self.acls.authorize(principal, resource, op);
+        if !allowed {
+            self.reported
+                .lock()
+                .push(format!("{}/{}", resource.kind.as_str(), resource.name));
+        }
+        allowed
+    }
+
+    fn authorize_quietly(&self, principal: &Principal, resource: &Resource, op: Operation) -> bool {
+        self.acls.authorize_quietly(principal, resource, op)
+    }
+}
+
+impl Cluster {
+    fn reported_denials(&self) -> Vec<String> {
+        self.audit.reported.lock().clone()
+    }
 }
 
 /// Alice's membership in `payments-app`, as her client knows it.
@@ -105,8 +145,12 @@ struct Member {
 
 fn cluster() -> Cluster {
     let tmp = tempfile::tempdir().unwrap();
-    let acls = Arc::new(AclEngine::new(tmp.path().join("acls.json")));
+    let acls = AclEngine::new(tmp.path().join("acls.json"));
     acls.install_for_test(ACLS);
+    let audit = Arc::new(Audited {
+        acls,
+        reported: Mutex::new(Vec::new()),
+    });
 
     let topics = Arc::new(TopicRegistry::new());
     for (name, partition_count) in [("audit-log", 1), ("payments", 3), ("orders", 2)] {
@@ -122,7 +166,7 @@ fn cluster() -> Cluster {
         topics,
         "test",
         0,
-        acls,
+        audit.clone(),
         Arc::new(NoQuotaChecker),
     ));
 
@@ -142,7 +186,11 @@ fn cluster() -> Cluster {
     mgr.set_txn_assignment_source(LocalTxnSource::new("kaas-0"));
     broker.install_coord_manager(mgr);
 
-    Cluster { _tmp: tmp, broker }
+    Cluster {
+        _tmp: tmp,
+        broker,
+        audit,
+    }
 }
 
 fn conn(user: &str) -> Mutex<ConnState> {
@@ -457,6 +505,7 @@ async fn metadata_all_topics_lists_only_what_bob_may_describe() {
     let mut names: Vec<&str> = resp.topics.iter().map(|t| t.name.as_str()).collect();
     names.sort_unstable();
     assert_eq!(names, ["audit-log"], "topic list leaked to bob");
+    assert_eq!(c.reported_denials(), Vec::<String>::new());
 }
 
 /// A named topic without `Describe` answers 29 whether or not it
@@ -469,6 +518,11 @@ async fn metadata_named_topic_without_describe_is_29_existing_or_not() {
         assert_eq!(t.error_code, ERR_TOPIC_AUTHZ_FAILED, "topic {}", t.name);
         assert!(t.partitions.is_empty(), "partitions of {} leaked", t.name);
     }
+    // Named topics are a refusal, so unlike the listing they report.
+    assert_eq!(
+        c.reported_denials(),
+        ["topic/payments", "topic/no-such-topic"]
+    );
 }
 
 #[tokio::test(start_paused = true)]
@@ -631,6 +685,9 @@ async fn list_groups_hides_groups_bob_may_not_describe() {
 
     let ids = list_groups_as(&c, BOB).await;
     assert!(ids.is_empty(), "groups leaked to bob: {ids:?}");
+    // Neither the cluster-wide shortcut nor the per-group filter is a
+    // refusal.
+    assert_eq!(c.reported_denials(), Vec::<String>::new());
 }
 
 #[tokio::test(start_paused = true)]
@@ -811,4 +868,5 @@ async fn offset_fetch_all_topics_leaves_out_undescribable_topics() {
     };
     assert_eq!(fetch_all(ALICE).await, ["orders", "payments"]);
     assert_eq!(fetch_all(CAROL).await, ["payments"]);
+    assert_eq!(c.reported_denials(), Vec::<String>::new());
 }

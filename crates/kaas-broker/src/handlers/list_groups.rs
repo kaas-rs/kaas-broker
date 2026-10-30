@@ -48,9 +48,11 @@ impl Handler for ListGroupsHandler {
         let req = list_groups::decode_request(&mut body, version)?;
         let filter = req.states_filter;
         let principal = principal_from(conn);
+        // Both checks only filter the listing, so neither reports a
+        // denial (see `Authorizer::authorize_quietly`).
         let authz = &self.broker.authorizer;
         let cluster_describe =
-            authz.authorize(&principal, &Resource::cluster(), Operation::Describe);
+            authz.authorize_quietly(&principal, &Resource::cluster(), Operation::Describe);
         let groups = match self.broker.coord_manager() {
             None => Vec::new(),
             Some(mgr) => mgr
@@ -59,7 +61,11 @@ impl Handler for ListGroupsHandler {
                 .filter(|g| filter.is_empty() || filter.iter().any(|f| f == g.state))
                 .filter(|g| {
                     cluster_describe
-                        || authz.authorize(&principal, &Resource::group(&g.id), Operation::Describe)
+                        || authz.authorize_quietly(
+                            &principal,
+                            &Resource::group(&g.id),
+                            Operation::Describe,
+                        )
                 })
                 .map(|g| list_groups::ListedGroup {
                     group_id: g.id,

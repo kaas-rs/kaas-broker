@@ -211,6 +211,17 @@ way Apache gates them (gh #268): see the
 [consumer-group table](../compat/api/consumer-groups.md) and
 [Metadata](../compat/api/produce-fetch.md#metadata).
 
+**Which denials are logged.** A denial of something the client named, a
+topic in a Produce or a named Metadata request, say, is logged as an
+`acl: denied` warning and counted in `kaas.acl.deny`, once per principal,
+resource and operation per 5-second decision-cache window. A check that
+only decides what a response shows is quiet: the all-topics Metadata,
+ListGroups and all-topics OffsetFetch filters, and the
+authorized-operations bitfield. Leaving a topic out of a listing answers
+the request rather than refusing it, and Apache's `logIfDenied = false`
+treats these checks the same way. Without that, a client allowed 1 of 9
+topics would log 8 warnings on every metadata refresh.
+
 **Authorization-only users (OAuth principals).** A `KafkaUser`'s
 `spec.authentication` is optional (gh #42). An OAUTHBEARER principal
 authenticates against the issuer, not against a stored credential, so

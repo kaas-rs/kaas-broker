@@ -114,9 +114,15 @@ impl DescribeClusterHandler {
         {
             return 0;
         }
+        // Each op the principal lacks is a clear bit, not a denial, so
+        // the bitfield checks quietly (Apache's `authorizedOperations`).
         CLUSTER_OPS
             .iter()
-            .filter(|(op, _)| self.broker.authorizer.authorize(principal, &cluster, *op))
+            .filter(|(op, _)| {
+                self.broker
+                    .authorizer
+                    .authorize_quietly(principal, &cluster, *op)
+            })
             .fold(0, |bits, (_, code)| bits | (1 << code))
     }
 }
@@ -417,6 +423,33 @@ mod tests {
         let h = DescribeClusterHandler::new(broker_with_auth(Arc::new(DescribeOnly)), &listeners());
         let resp = describe(&h, "internal", true, endpoint_type::BROKER, 1).await;
         assert_eq!(resp.cluster_authorized_operations, 1 << acl_op::DESCRIBE);
+    }
+
+    /// An op the principal lacks is a clear bit, not a denial: only the
+    /// `Describe` gate in front of the bitfield may report one.
+    #[tokio::test]
+    async fn the_bitfield_reports_no_denials() {
+        #[derive(Debug, Default)]
+        struct DescribeOnlyAudited {
+            reported: Mutex<Vec<Operation>>,
+        }
+        impl Authorizer for DescribeOnlyAudited {
+            fn authorize(&self, _: &Principal, _: &Resource, op: Operation) -> bool {
+                let allowed = matches!(op, Operation::Describe);
+                if !allowed {
+                    self.reported.lock().push(op);
+                }
+                allowed
+            }
+            fn authorize_quietly(&self, _: &Principal, _: &Resource, op: Operation) -> bool {
+                matches!(op, Operation::Describe)
+            }
+        }
+        let authz = Arc::new(DescribeOnlyAudited::default());
+        let h = DescribeClusterHandler::new(broker_with_auth(authz.clone()), &listeners());
+        let resp = describe(&h, "internal", true, endpoint_type::BROKER, 1).await;
+        assert_eq!(resp.cluster_authorized_operations, 1 << acl_op::DESCRIBE);
+        assert_eq!(*authz.reported.lock(), []);
     }
 
     // --- gh #249: fenced brokers -----------------------------------

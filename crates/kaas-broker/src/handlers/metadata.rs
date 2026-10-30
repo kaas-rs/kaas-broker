@@ -225,12 +225,17 @@ impl Handler for MetadataHandler {
         let mut topics = Vec::with_capacity(topic_names.len());
         for name in topic_names {
             // gh #268: before the registry lookup, so an unauthorized
-            // principal learns nothing about existence.
-            if !self.broker.authorizer.authorize(
-                &principal,
-                &Resource::topic(&name),
-                Operation::Describe,
-            ) {
+            // principal learns nothing about existence. The all-topics
+            // form only filters, so it checks quietly: leaving a topic
+            // out of the list is not a denial worth a log line.
+            let resource = Resource::topic(&name);
+            let authz = &self.broker.authorizer;
+            let allowed = if all_topics {
+                authz.authorize_quietly(&principal, &resource, Operation::Describe)
+            } else {
+                authz.authorize(&principal, &resource, Operation::Describe)
+            };
+            if !allowed {
                 if !all_topics {
                     topics.push(error_topic(name, ERR_TOPIC_AUTHZ_FAILED));
                 }

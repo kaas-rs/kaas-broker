@@ -7,12 +7,19 @@
 //! `(principal_name, resource_type, resource_name, op)` to keep the
 //! Produce/Fetch hot path off the rule walk.
 //!
+//! A denial is reported (a WARN and a `kaas.acl.deny` count) once per
+//! cache window, and only through [`Authorizer::authorize`]. The
+//! filtering checks go through [`Authorizer::authorize_quietly`] and
+//! never report: a listing that leaves a topic out is answering the
+//! request, not refusing it.
+//!
 //! Rule list sits behind `arc_swap::ArcSwap<Vec<AclRule>>` so
 //! `reload()` swaps atomically; the cache is wiped on every reload
 //! so a freshly-loaded deny rule takes effect on the next request.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -75,6 +82,24 @@ struct CacheKey {
 struct CachedDecision {
     allowed: bool,
     expires_at: Instant,
+    /// Whether this window's denial has been reported. Only a reporting
+    /// check sets it, so a quiet check that cached the denial first
+    /// can't swallow the next reporting check's audit line.
+    reported: AtomicBool,
+}
+
+/// Whether a check reports its denial; see [`Authorizer::authorize_quietly`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Audit {
+    Report,
+    Quiet,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct Verdict {
+    allowed: bool,
+    /// The caller should log and count this denial.
+    report: bool,
 }
 
 #[derive(Debug)]
@@ -236,46 +261,72 @@ fn implies(held: Operation, requested: Operation) -> bool {
         }
 }
 
-impl Authorizer for AclEngine {
-    fn authorize(&self, principal: &Principal, resource: &Resource, op: Operation) -> bool {
+impl AclEngine {
+    fn check(
+        &self,
+        principal: &Principal,
+        resource: &Resource,
+        op: Operation,
+        audit: Audit,
+    ) -> Verdict {
         let key = CacheKey {
             principal: principal.as_principal_string(),
             res_type: resource.kind.as_str().to_owned(),
             res_name: resource.name.clone(),
             op,
         };
+        let reporting = audit == Audit::Report;
         if let Some(entry) = self.cache.get(&key) {
             if entry.expires_at > Instant::now() {
-                return entry.allowed;
+                return Verdict {
+                    allowed: entry.allowed,
+                    report: reporting
+                        && !entry.allowed
+                        && !entry.reported.swap(true, Ordering::Relaxed),
+                };
             }
         }
         let allowed = self.evaluate(principal, resource, op);
-        if !allowed {
-            tracing::warn!(
-                principal = %principal,
-                resource = %format!("{}/{}", resource.kind.as_str(), resource.name),
-                operation = op.as_str(),
-                "acl: denied",
-            );
-            kaas_observability::metrics::global().acl_deny.add(
-                1,
-                &[
-                    kaas_observability::KeyValue::new(
-                        "resource_type",
-                        resource.kind.as_str().to_owned(),
-                    ),
-                    kaas_observability::KeyValue::new("operation", op.as_str().to_owned()),
-                ],
-            );
-        }
+        let report = reporting && !allowed;
         self.cache.insert(
             key,
             CachedDecision {
                 allowed,
                 expires_at: Instant::now() + CACHE_TTL,
+                reported: AtomicBool::new(report),
             },
         );
-        allowed
+        Verdict { allowed, report }
+    }
+}
+
+fn report_denial(principal: &Principal, resource: &Resource, op: Operation) {
+    tracing::warn!(
+        principal = %principal,
+        resource = %format!("{}/{}", resource.kind.as_str(), resource.name),
+        operation = op.as_str(),
+        "acl: denied",
+    );
+    kaas_observability::metrics::global().acl_deny.add(
+        1,
+        &[
+            kaas_observability::KeyValue::new("resource_type", resource.kind.as_str().to_owned()),
+            kaas_observability::KeyValue::new("operation", op.as_str().to_owned()),
+        ],
+    );
+}
+
+impl Authorizer for AclEngine {
+    fn authorize(&self, principal: &Principal, resource: &Resource, op: Operation) -> bool {
+        let verdict = self.check(principal, resource, op, Audit::Report);
+        if verdict.report {
+            report_denial(principal, resource, op);
+        }
+        verdict.allowed
+    }
+
+    fn authorize_quietly(&self, principal: &Principal, resource: &Resource, op: Operation) -> bool {
+        self.check(principal, resource, op, Audit::Quiet).allowed
     }
 }
 
@@ -471,5 +522,54 @@ mod tests {
             &Resource::topic("foo"),
             Operation::Read
         ));
+    }
+
+    // --- which denials are reported ------------------------------------
+
+    fn bob_describes_foo(e: &AclEngine, audit: Audit) -> Verdict {
+        e.check(&bob(), &Resource::topic("foo"), Operation::Describe, audit)
+    }
+
+    #[test]
+    fn a_quiet_check_decides_the_same_and_reports_nothing() {
+        let e = engine_with(
+            r#"{"acls":[{"principal":"User:alice",
+                "resource":{"type":"topic","name":"foo","patternType":"literal"},
+                "operations":["Read"],"permission":"Allow"}]}"#,
+        );
+        let foo = Resource::topic("foo");
+        let allowed = Verdict {
+            allowed: true,
+            report: false,
+        };
+        let denied = Verdict {
+            allowed: false,
+            report: false,
+        };
+        assert_eq!(
+            e.check(&alice(), &foo, Operation::Describe, Audit::Quiet),
+            allowed
+        );
+        assert_eq!(bob_describes_foo(&e, Audit::Quiet), denied);
+        assert!(!e.authorize_quietly(&bob(), &foo, Operation::Describe));
+    }
+
+    #[test]
+    fn a_denial_is_reported_once_per_cache_window() {
+        let e = engine_with(r#"{"acls":[]}"#);
+        assert!(bob_describes_foo(&e, Audit::Report).report);
+        assert!(!bob_describes_foo(&e, Audit::Report).report);
+    }
+
+    /// The quiet check runs first and caches the denial. The reporting
+    /// check that follows inside the same window must still report it,
+    /// or an all-topics listing would hide the audit line of a request
+    /// that named the topic.
+    #[test]
+    fn a_quiet_check_does_not_swallow_the_next_report() {
+        let e = engine_with(r#"{"acls":[]}"#);
+        assert!(!bob_describes_foo(&e, Audit::Quiet).report);
+        assert!(bob_describes_foo(&e, Audit::Report).report);
+        assert!(!bob_describes_foo(&e, Audit::Report).report);
     }
 }

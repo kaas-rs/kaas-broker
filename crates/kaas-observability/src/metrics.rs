@@ -233,7 +233,12 @@ pub fn new_metrics(m: &Meter) -> Metrics {
             "kaas.auth.failure",
             "Failed authentication attempts",
         ),
-        acl_deny: counter(m, "kaas.acl.deny", "Authorization denials"),
+        acl_deny: counter(
+            m,
+            "kaas.acl.deny",
+            "Authorization denials of a named resource, once per principal, resource and \
+             operation per 5 s cache window; ACL-filtered listings are not counted",
+        ),
         quota_throttle: counter(
             m,
             "kaas.quota.throttle",

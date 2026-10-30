@@ -18,6 +18,22 @@ use crate::types::{Operation, Principal, Resource};
 
 pub trait Authorizer: Send + Sync + std::fmt::Debug + 'static {
     fn authorize(&self, principal: &Principal, resource: &Resource, op: Operation) -> bool;
+
+    /// The same decision as [`Authorizer::authorize`], for a check whose
+    /// denial is an expected answer rather than an event: filtering a
+    /// listing the client didn't itemise (all-topics Metadata,
+    /// ListGroups, all-topics OffsetFetch) or filling an
+    /// authorized-operations bitfield. Implementations neither log nor
+    /// count these denials, as Apache's `logIfDenied = false` does. A
+    /// principal allowed 1 of 9 topics would otherwise log 8 warnings
+    /// on every metadata refresh.
+    ///
+    /// The default delegates to `authorize`, so an implementation that
+    /// doesn't override it errs towards noise, never towards a lost
+    /// audit line.
+    fn authorize_quietly(&self, principal: &Principal, resource: &Resource, op: Operation) -> bool {
+        self.authorize(principal, resource, op)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -58,6 +74,13 @@ impl Authorizer for SuperUserAuthorizer {
             return true;
         }
         self.inner.authorize(principal, resource, op)
+    }
+
+    fn authorize_quietly(&self, principal: &Principal, resource: &Resource, op: Operation) -> bool {
+        if self.supers.contains(&principal.as_principal_string()) {
+            return true;
+        }
+        self.inner.authorize_quietly(principal, resource, op)
     }
 }
 
@@ -104,6 +127,38 @@ mod tests {
         let inner: Arc<dyn Authorizer> = Arc::new(DenyAll);
         let su = SuperUserAuthorizer::new(vec!["User:root".to_owned()], inner);
         assert!(!su.authorize(&p_alice(), &r_foo(), Operation::Write));
+    }
+
+    /// Records which of the two entry points each check arrived on.
+    #[derive(Debug, Default)]
+    struct Recorder {
+        reporting: parking_lot::Mutex<usize>,
+        quiet: parking_lot::Mutex<usize>,
+    }
+    impl Authorizer for Recorder {
+        fn authorize(&self, _p: &Principal, _r: &Resource, _op: Operation) -> bool {
+            *self.reporting.lock() += 1;
+            false
+        }
+        fn authorize_quietly(&self, _p: &Principal, _r: &Resource, _op: Operation) -> bool {
+            *self.quiet.lock() += 1;
+            false
+        }
+    }
+
+    #[test]
+    fn super_user_wrapper_keeps_a_quiet_check_quiet() {
+        let inner = Arc::new(Recorder::default());
+        let su = SuperUserAuthorizer::new(vec!["User:root".to_owned()], inner.clone());
+        assert!(!su.authorize_quietly(&p_alice(), &r_foo(), Operation::Describe));
+        assert_eq!((*inner.reporting.lock(), *inner.quiet.lock()), (0, 1));
+    }
+
+    #[test]
+    fn super_user_short_circuits_a_quiet_check_too() {
+        let inner: Arc<dyn Authorizer> = Arc::new(DenyAll);
+        let su = SuperUserAuthorizer::new(vec!["User:alice".to_owned()], inner);
+        assert!(su.authorize_quietly(&p_alice(), &r_foo(), Operation::Describe));
     }
 
     #[test]

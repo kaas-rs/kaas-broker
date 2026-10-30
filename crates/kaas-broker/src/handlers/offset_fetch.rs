@@ -61,6 +61,7 @@ impl Handler for OffsetFetchHandler {
         let mgr = self.broker.coord_manager();
         let principal = principal_from(conn);
         let may_describe_topic = |topic: &str| self.allowed(&principal, Resource::topic(topic));
+        let may_list_topic = |topic: &str| self.listed(&principal, Resource::topic(topic));
 
         let resp = if version >= 8 {
             let mut groups_resp =
@@ -79,6 +80,7 @@ impl Handler for OffsetFetchHandler {
                     &g.group_id,
                     g.topics.as_deref(),
                     &may_describe_topic,
+                    &may_list_topic,
                 );
                 groups_resp.push(offset_fetch::OffsetFetchGroupResponse {
                     group_id: g.group_id.clone(),
@@ -116,6 +118,7 @@ impl Handler for OffsetFetchHandler {
                 &req.group_id,
                 req.topics.as_deref(),
                 &may_describe_topic,
+                &may_list_topic,
             );
             offset_fetch::Response {
                 throttle_time_ms: 0,
@@ -136,20 +139,31 @@ impl OffsetFetchHandler {
             .authorizer
             .authorize(principal, &resource, Operation::Describe)
     }
+
+    /// [`Self::allowed`] for the all-topics form, which only filters, so
+    /// a topic left out is not a reported denial.
+    fn listed(&self, principal: &Principal, resource: Resource) -> bool {
+        self.broker
+            .authorizer
+            .authorize_quietly(principal, &resource, Operation::Describe)
+    }
 }
 
-/// One group's answer. `topics: None` is the all-topics form.
+/// One group's answer. `topics: None` is the all-topics form, which
+/// filters with `may_list_topic`; named topics go through
+/// `may_describe_topic` and answer 29 when denied.
 fn fetch_group(
     mgr: Option<&Arc<kaas_coordinator::Manager>>,
     group_id: &str,
     topics: Option<&[offset_fetch::OffsetFetchTopic]>,
     may_describe_topic: &dyn Fn(&str) -> bool,
+    may_list_topic: &dyn Fn(&str) -> bool,
 ) -> (Vec<offset_fetch::OffsetFetchTopicResponse>, i16) {
     let Some(topics) = topics else {
         return match mgr.and_then(|m| m.offset_fetch_all(group_id)) {
             None => (Vec::new(), ERR_NOT_COORDINATOR),
             Some((committed, metadata)) => (
-                committed_topics(&committed, may_describe_topic)
+                committed_topics(&committed, may_list_topic)
                     .iter()
                     .map(|t| committed_topic(t, &committed, &metadata))
                     .collect(),
@@ -202,7 +216,7 @@ fn fetch_group(
 /// Apache drops those from an all-topics answer rather than erroring.
 fn committed_topics(
     committed: &HashMap<String, i64>,
-    may_describe_topic: &dyn Fn(&str) -> bool,
+    may_list_topic: &dyn Fn(&str) -> bool,
 ) -> Vec<offset_fetch::OffsetFetchTopic> {
     let mut by_topic: BTreeMap<&str, Vec<i32>> = BTreeMap::new();
     for (topic, partition) in committed.keys().filter_map(|k| parse_offset_key(k)) {
@@ -210,7 +224,7 @@ fn committed_topics(
     }
     by_topic
         .into_iter()
-        .filter(|(topic, _)| may_describe_topic(topic))
+        .filter(|(topic, _)| may_list_topic(topic))
         .map(|(topic, mut partition_indexes)| {
             partition_indexes.sort_unstable();
             offset_fetch::OffsetFetchTopic {
