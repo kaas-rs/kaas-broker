@@ -21,9 +21,13 @@ which consumers rejoin and rebalance, which is exactly what an Apache
 coordinator move looks like to clients.
 Committed offsets are **durable** per-group JSON files at
 `/data/__cluster/__consumer_offsets/<groupID>.json` on the shared volume;
-the next coordinator reads the same file. The offsets file is lazily loaded into memory when a group
-first joins on a broker (`Manager::get_or_create`) — a caveat for
-manual-assignment consumers is noted under [OffsetFetch](#offsetfetch).
+the next coordinator reads the same file. The coordinator loads a group's file
+into memory the first time anything touches the group: a join, a fetch, a
+commit, a delete. A group that has been idle since the coordinator restarted
+or the group moved therefore still reads, commits and deletes against its
+on-disk offsets. A join reloads the file outright (`Manager::get_or_create`);
+any other first touch fills in only a group that isn't cached yet, so a
+racing commit is never overwritten by the older file.
 
 During the boot window before the coordinator `Manager` is installed,
 handlers return `NOT_COORDINATOR` / `COORDINATOR_NOT_AVAILABLE` so clients
@@ -38,7 +42,7 @@ learns where a group lives or whether it exists:
 | FindCoordinator | `Describe` (`Describe` on the transactional id for key type 1) | — | 30 / 53 |
 | JoinGroup, SyncGroup, Heartbeat, LeaveGroup | `Read` | — | 30 |
 | OffsetCommit | `Read` | `Read` | 30, or 29 per denied topic |
-| OffsetFetch | `Describe` | `Describe` | 30, or 29 per denied topic |
+| OffsetFetch | `Describe` | `Describe` | 30, or 29 per denied topic (left out of an all-topics fetch) |
 | DescribeGroups | `Describe` | — | 30 per group |
 | ListGroups | `Describe` per group, or `Describe` on the cluster for all | — | filtered, no error |
 | DeleteGroups | `Delete` | — | 30 per group |
@@ -62,7 +66,11 @@ cache and atomically rewrites `__consumer_offsets/<groupID>.json`
 (tmp + fsync + rename). The resulting group-level error code is stamped
 uniformly across every partition in the response. Per-partition
 `committed_metadata` strings round-trip; empty strings clear the
-entry and come back as the wire null sentinel.
+entry and come back as the wire null sentinel. The merge runs over the
+group's full offset map, loaded from its file first if this broker hasn't
+cached it: the rewrite replaces the whole file, so merging into an empty map
+used to erase every offset the commit didn't name. `--reset-offsets --topic a`
+on an idle group wiped the group's other topics.
 
 **Deviations from Apache 3.7**:
 
@@ -87,7 +95,7 @@ entry and come back as the wire null sentinel.
 
 **Verified by**: `crates/kaas-broker/tests/group_dispatch.rs` (full lifecycle
 round trip), `commit_then_fetch_roundtrips` / `commit_with_metadata_persists`
-in `offset_store.rs`, `scripts/kafka-consumer-groups.sh` (`--reset-offsets
+/ `a_cold_commit_keeps_the_offsets_it_did_not_name` in `offset_store.rs`, `scripts/kafka-consumer-groups.sh` (`--reset-offsets
 --execute` drives OffsetCommit), `scripts/kafka-console-consumer.sh`.
 
 ## OffsetFetch
@@ -99,29 +107,23 @@ Reads a group's committed positions back. Key 9.
 **Handling**: v1–v7 carry a single group; v8+ batches multiple groups in one
 request (`groups[]`), and the handler resolves each group independently —
 per-group `NOT_COORDINATOR` for groups owned elsewhere. Lookups read the
-coordinator's in-memory cache; partitions without a committed offset return
-the `-1` sentinel. Offsets staged by transactional producers via
+coordinator's in-memory cache, loaded from the group's file on first touch;
+partitions without a committed offset return the `-1` sentinel. A null topic
+list (v1–v7, or per group on v8) asks for every committed offset and gets one
+entry per partition the group has committed. This is how Kafka 4's AdminClient
+asks, so it is what `kafka-consumer-groups --describe` and `--shift-by` read.
+Offsets staged by transactional producers via
 [TxnOffsetCommit](transactions.md#txnoffsetcommit) live in a separate pending
 layer and are **invisible here until the transaction commits** — an aborted
 transaction's offsets are never observable.
 
 **Deviations from Apache 3.7**:
 
-- The "fetch everything" sentinel (null topics list) returns an **empty**
-  result instead of enumerating all committed offsets. Symptom:
-  `kafka-consumer-groups --describe` on a group with no active members shows
-  nothing even though offsets are on disk (noted in
-  `scripts/kafka-consumer-groups.sh`, which dropped its `--shift-by` scenario
-  because of it). Follow-up tracked in the handler.
 - `require_stable` (v7+, [KIP-447](../kip/kip-447.md)) is accepted and
   ignored. kaas never returns `UNSTABLE_OFFSET_COMMIT`; it returns the last
   durably-committed offset. Reads can never see dirty in-flight offsets
   (the pending layer guarantees that), but a caller asking to *wait out* an
   in-flight commit doesn't get the retriable error Apache would send.
-- Committed offsets are only loaded from disk when the group first **joins**
-  on this broker. A standalone manual-assignment consumer (`assign()` +
-  `commitSync`, no JoinGroup) that fetches after a coordinator change hits a
-  cold cache and gets `-1` until its next commit.
 - `committed_leader_epoch` is always `-1`.
 - Advertised floor is v1, not v0 (v0 was the ZooKeeper-era offsets path).
 
@@ -129,7 +131,12 @@ transaction's offsets are never observable.
 `crates/kaas-codec/src/api/offset_fetch.rs`,
 `crates/kaas-coordinator/src/offset_store.rs`.
 
-**Verified by**: `crates/kaas-broker/tests/group_dispatch.rs`,
+**Verified by**: `crates/kaas-broker/tests/group_dispatch.rs`
+(`null_topic_offset_fetch_lists_every_committed_partition_after_a_restart`),
+`offset_fetch_all_topics_leaves_out_undescribable_topics` in
+`crates/kaas-broker/tests/discovery_and_group_authz.rs`,
+`v8_null_topics_is_fetch_all` in the codec,
+`fetch_reads_a_group_never_materialised_here` /
 `pending_invisible_to_fetch_until_commit_pending` /
 `discard_pending_drops_unmaterialised_offsets` in `offset_store.rs`,
 `bins/kaas/tests/eos_v2.rs` (transactional offsets become visible only after
@@ -415,7 +422,8 @@ matching Apache.
 `crates/kaas-coordinator/src/manager.rs`.
 
 **Verified by**: `delete_group_non_empty_when_state_is_stable` /
-`delete_group_unknown_returns_group_id_not_found` in `manager.rs`,
+`delete_group_unknown_returns_group_id_not_found` /
+`delete_group_reaches_a_group_never_materialised_here` in `manager.rs`,
 `scripts/kafka-consumer-groups.sh` scenario 5 (`--delete` must succeed *and*
 the group must vanish from a subsequent `--list`).
 
@@ -452,6 +460,7 @@ DeleteGroups.
 `crates/kaas-codec/src/api/offset_delete.rs`,
 `crates/kaas-coordinator/src/offset_store.rs`.
 
-**Verified by**: `delete_partitions_removes_only_requested_keys` in
+**Verified by**: `delete_partitions_removes_only_requested_keys` /
+`delete_partitions_reaches_a_group_never_materialised_here` in
 `offset_store.rs`; the shell-tool path rides
 `scripts/kafka-consumer-groups.sh`.

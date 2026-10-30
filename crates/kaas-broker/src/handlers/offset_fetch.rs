@@ -5,28 +5,28 @@
 //! `(committed → i64, metadata → String)` pair per group; the
 //! handler joins them per the codec response layout.
 //!
-//! Apache's "fetch every committed offset" sentinel is a `None`
-//! topic list. The Phase-5 OffsetStore doesn't carry "every key"
-//! enumeration — the handler maps null-topics to an empty result
-//! rather than enumerating, matching the dev-mode `Broker::new`
-//! behaviour. The cluster path lands when the Manager grows a
-//! `local_offsets(group_id) -> Vec<FetchSpec>` accessor.
+//! A null topic list (v1–v7, or per group on v8+) is Apache's "fetch
+//! every committed offset": the answer lists each partition the group
+//! has an offset for, and nothing else. Kafka 4's AdminClient asks
+//! this way for `listConsumerGroupOffsets`, so it is what
+//! `kafka-consumer-groups --describe` sees.
 //!
 //! Authorization (gh #268), Apache's order: `Describe` on the group
 //! before coordinator routing — `GROUP_AUTHORIZATION_FAILED` (30) as
 //! the top-level error on v2–v7, per group on v8+, per partition on
 //! v1, which has no top-level field — then `Describe` on each topic,
 //! whose denied partitions answer `TOPIC_AUTHORIZATION_FAILED` (29)
-//! with no offset.
+//! with no offset. In the all-topics form a denied topic is left out
+//! instead, as Apache does.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use kaas_auth::{Operation, Principal, Resource};
 use kaas_codec::api::offset_fetch;
-use kaas_coordinator::{build_offset_key, FetchSpec};
+use kaas_coordinator::{build_offset_key, parse_offset_key, FetchSpec};
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
 
@@ -74,8 +74,12 @@ impl Handler for OffsetFetchHandler {
                     });
                     continue;
                 }
-                let (topics_resp, group_err) =
-                    fetch_group(mgr.as_ref(), &g.group_id, &g.topics, &may_describe_topic);
+                let (topics_resp, group_err) = fetch_group(
+                    mgr.as_ref(),
+                    &g.group_id,
+                    g.topics.as_deref(),
+                    &may_describe_topic,
+                );
                 groups_resp.push(offset_fetch::OffsetFetchGroupResponse {
                     group_id: g.group_id.clone(),
                     topics: topics_resp,
@@ -107,9 +111,12 @@ impl Handler for OffsetFetchHandler {
                 groups: Vec::new(),
             }
         } else {
-            let topics_in = req.topics.clone().unwrap_or_default();
-            let (topics_resp, group_err) =
-                fetch_group(mgr.as_ref(), &req.group_id, &topics_in, &may_describe_topic);
+            let (topics_resp, group_err) = fetch_group(
+                mgr.as_ref(),
+                &req.group_id,
+                req.topics.as_deref(),
+                &may_describe_topic,
+            );
             offset_fetch::Response {
                 throttle_time_ms: 0,
                 topics: topics_resp,
@@ -131,12 +138,25 @@ impl OffsetFetchHandler {
     }
 }
 
+/// One group's answer. `topics: None` is the all-topics form.
 fn fetch_group(
     mgr: Option<&Arc<kaas_coordinator::Manager>>,
     group_id: &str,
-    topics: &[offset_fetch::OffsetFetchTopic],
+    topics: Option<&[offset_fetch::OffsetFetchTopic]>,
     may_describe_topic: &dyn Fn(&str) -> bool,
 ) -> (Vec<offset_fetch::OffsetFetchTopicResponse>, i16) {
+    let Some(topics) = topics else {
+        return match mgr.and_then(|m| m.offset_fetch_all(group_id)) {
+            None => (Vec::new(), ERR_NOT_COORDINATOR),
+            Some((committed, metadata)) => (
+                committed_topics(&committed, may_describe_topic)
+                    .iter()
+                    .map(|t| committed_topic(t, &committed, &metadata))
+                    .collect(),
+                0,
+            ),
+        };
+    };
     let mgr = match mgr {
         None => {
             return (
@@ -175,6 +195,30 @@ fn fetch_group(
         })
         .collect();
     (topics_resp, 0)
+}
+
+/// The `(topic, partitions)` a group has committed offsets for, in a
+/// stable order, minus the topics the principal may not describe —
+/// Apache drops those from an all-topics answer rather than erroring.
+fn committed_topics(
+    committed: &HashMap<String, i64>,
+    may_describe_topic: &dyn Fn(&str) -> bool,
+) -> Vec<offset_fetch::OffsetFetchTopic> {
+    let mut by_topic: BTreeMap<&str, Vec<i32>> = BTreeMap::new();
+    for (topic, partition) in committed.keys().filter_map(|k| parse_offset_key(k)) {
+        by_topic.entry(topic).or_default().push(partition);
+    }
+    by_topic
+        .into_iter()
+        .filter(|(topic, _)| may_describe_topic(topic))
+        .map(|(topic, mut partition_indexes)| {
+            partition_indexes.sort_unstable();
+            offset_fetch::OffsetFetchTopic {
+                name: topic.to_owned(),
+                partition_indexes,
+            }
+        })
+        .collect()
 }
 
 fn committed_topic(

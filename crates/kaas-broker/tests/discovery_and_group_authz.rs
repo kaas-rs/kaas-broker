@@ -776,3 +776,39 @@ async fn cluster_describe_lists_every_group_but_describes_none() {
         ERR_GROUP_AUTHZ_FAILED
     );
 }
+
+/// The all-topics OffsetFetch (Kafka 4's `--describe`) filters like
+/// Metadata's list-all: topics the principal can't describe are left
+/// out, not answered with 29.
+#[tokio::test(start_paused = true)]
+async fn offset_fetch_all_topics_leaves_out_undescribable_topics() {
+    let c = cluster();
+    let alice = alice_joins_and_commits(&c).await;
+    let resp = offset_commit_as(&c, ALICE, &alice, &[("orders", 9)]).await;
+    assert_eq!(resp.topics[0].partitions[0].error_code, 0);
+
+    let req = offset_fetch::Request {
+        groups: vec![offset_fetch::OffsetFetchGroup {
+            group_id: GROUP.to_owned(),
+            topics: None,
+        }],
+        ..offset_fetch::Request::default()
+    };
+    let fetch_all = |user: &'static str| {
+        let c = &c;
+        let req = req.clone();
+        async move {
+            let mut body = BytesMut::new();
+            offset_fetch::encode_request(&mut body, &req, 8).unwrap();
+            let h = OffsetFetchHandler::new(c.broker.clone());
+            let group = offset_fetch::decode_response(&mut call(&h, user, 8, body).await, 8)
+                .unwrap()
+                .groups
+                .remove(0);
+            assert_eq!(group.error_code, 0, "{user}");
+            group.topics.into_iter().map(|t| t.name).collect::<Vec<_>>()
+        }
+    };
+    assert_eq!(fetch_all(ALICE).await, ["orders", "payments"]);
+    assert_eq!(fetch_all(CAROL).await, ["payments"]);
+}

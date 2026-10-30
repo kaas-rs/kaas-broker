@@ -251,3 +251,102 @@ async fn full_consumer_group_lifecycle_through_handlers() {
     assert_eq!(leave_resp.error_code, 0);
     assert_eq!(leave_resp.members[0].error_code, 0);
 }
+
+/// Kafka 4's `kafka-consumer-groups --describe` asks for a group's
+/// offsets with a null topic list. Run it the way the live cluster
+/// meets it: offsets committed, then the coordinator restarts and
+/// nobody rejoins (an idle group), so the cache starts cold.
+#[tokio::test]
+async fn null_topic_offset_fetch_lists_every_committed_partition_after_a_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let broker = broker_with_manager(tmp.path());
+    let commit = |topic: &str, partition: i32, offset: i64, meta: Option<&str>| {
+        offset_commit::OffsetCommitTopic {
+            name: topic.to_owned(),
+            partitions: vec![offset_commit::OffsetCommitPartition {
+                partition_index: partition,
+                committed_offset: offset,
+                committed_leader_epoch: -1,
+                committed_metadata: meta.map(str::to_owned),
+            }],
+        }
+    };
+    let oc_req = offset_commit::Request {
+        group_id: "g1".to_owned(),
+        generation_id: -1,
+        member_id: String::new(),
+        group_instance_id: None,
+        topics: vec![
+            commit("t2", 1, 3, None),
+            commit("t1", 2, 7, None),
+            commit("t1", 0, 42, Some("m")),
+        ],
+    };
+    let mut body = BytesMut::new();
+    offset_commit::encode_request(&mut body, &oc_req, 8).unwrap();
+    let resp_bytes = OffsetCommitHandler::new(broker)
+        .handle(&conn(), 8, body.freeze())
+        .await
+        .unwrap();
+    let oc_resp = offset_commit::decode_response(&mut resp_bytes.freeze(), 8).unwrap();
+    assert!(oc_resp
+        .topics
+        .iter()
+        .all(|t| t.partitions.iter().all(|p| p.error_code == 0)));
+
+    // A fresh broker over the same offsets directory: nothing cached.
+    let restarted = broker_with_manager(tmp.path());
+    let h = OffsetFetchHandler::new(restarted);
+    let want = |topics: &[offset_fetch::OffsetFetchTopicResponse]| {
+        let got: Vec<(String, i32, i64, Option<String>)> = topics
+            .iter()
+            .flat_map(|t| {
+                t.partitions.iter().map(|p| {
+                    assert_eq!(p.error_code, 0);
+                    (
+                        t.name.clone(),
+                        p.partition_index,
+                        p.committed_offset,
+                        p.metadata.clone(),
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(
+            got,
+            [
+                ("t1".to_owned(), 0, 42, Some("m".to_owned())),
+                ("t1".to_owned(), 2, 7, None),
+                ("t2".to_owned(), 1, 3, None),
+            ]
+        );
+    };
+
+    // v8, the version Kafka 4's AdminClient negotiates.
+    let req = offset_fetch::Request {
+        groups: vec![offset_fetch::OffsetFetchGroup {
+            group_id: "g1".to_owned(),
+            topics: None,
+        }],
+        ..offset_fetch::Request::default()
+    };
+    let mut body = BytesMut::new();
+    offset_fetch::encode_request(&mut body, &req, 8).unwrap();
+    let resp_bytes = h.handle(&conn(), 8, body.freeze()).await.unwrap();
+    let resp = offset_fetch::decode_response(&mut resp_bytes.freeze(), 8).unwrap();
+    assert_eq!(resp.groups[0].error_code, 0);
+    want(&resp.groups[0].topics);
+
+    // The single-group form carries the same null.
+    let req = offset_fetch::Request {
+        group_id: "g1".to_owned(),
+        topics: None,
+        ..offset_fetch::Request::default()
+    };
+    let mut body = BytesMut::new();
+    offset_fetch::encode_request(&mut body, &req, 5).unwrap();
+    let resp_bytes = h.handle(&conn(), 5, body.freeze()).await.unwrap();
+    let resp = offset_fetch::decode_response(&mut resp_bytes.freeze(), 5).unwrap();
+    assert_eq!(resp.error_code, 0);
+    want(&resp.topics);
+}

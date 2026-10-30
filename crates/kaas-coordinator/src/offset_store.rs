@@ -22,7 +22,10 @@
 //!
 //! 1. The visible cache + metadata maps backed by `<group>.json`.
 //!    `Commit` / `commit_with_metadata` writes here; `fetch` /
-//!    `fetch_metadata` reads here.
+//!    `fetch_metadata` reads here. A group's file is pulled in the
+//!    first time any of those touches it (`ensure_loaded`), not only
+//!    when the group joins: the cache is write-through, so for a cached
+//!    group it is the authority, and for an uncached one the file is.
 //! 2. The transactional **pending** layer keyed on `(group_id, pid)`
 //!    — `store_pending` stages, `commit_pending` materialises into
 //!    layer 1, `discard_pending` drops. Memory-only: an unfinished
@@ -55,6 +58,13 @@ pub struct FetchSpec {
 /// (gh #100).
 pub fn offset_key(topic: &str, partition: i32) -> String {
     format!("{topic}/{partition}")
+}
+
+/// Split an offset key back into `(topic, partition)`, from the right
+/// so a `/` in the topic can't shift the split.
+pub fn parse_offset_key(key: &str) -> Option<(&str, i32)> {
+    let (topic, partition) = key.rsplit_once('/')?;
+    Some((topic, partition.parse().ok()?))
 }
 
 /// Does the offset key `"<topic>/<partition>"` belong to `topic`?
@@ -275,6 +285,10 @@ impl OffsetStore {
         offsets: HashMap<String, i64>,
         metadata: HashMap<String, String>,
     ) -> io::Result<()> {
+        // The merge below rewrites the whole file from the cache entry,
+        // so an entry that doesn't hold the file yet would erase every
+        // offset this commit doesn't name.
+        self.ensure_loaded(group_id)?;
         let (merged_offsets, merged_meta, changed) = {
             let mut s = self.state.write();
             let mut changed = false;
@@ -362,6 +376,7 @@ impl OffsetStore {
     /// Committed offsets for the given `(topic, partitions[])` set.
     /// Returns `-1` for any partition without a committed offset.
     pub fn fetch(&self, group_id: &str, specs: &[FetchSpec]) -> HashMap<String, i64> {
+        self.ensure_loaded_for_read(group_id);
         let s = self.state.read();
         let group = s.cache.get(group_id);
         let mut out = HashMap::new();
@@ -379,6 +394,7 @@ impl OffsetStore {
     /// (gh #21). Keys missing from the returned map have no metadata
     /// — the wire null sentinel.
     pub fn fetch_metadata(&self, group_id: &str, specs: &[FetchSpec]) -> HashMap<String, String> {
+        self.ensure_loaded_for_read(group_id);
         let s = self.state.read();
         let group = match s.metadata.get(group_id) {
             None => return HashMap::new(),
@@ -394,6 +410,27 @@ impl OffsetStore {
             }
         }
         out
+    }
+
+    /// Every committed offset for `group_id`, with its metadata — the
+    /// OffsetFetch "all topics" form (a null topic list), which is how
+    /// Kafka 4's `kafka-consumer-groups --describe` asks.
+    pub fn fetch_all(&self, group_id: &str) -> (HashMap<String, i64>, HashMap<String, String>) {
+        self.ensure_loaded_for_read(group_id);
+        let s = self.state.read();
+        (
+            s.cache.get(group_id).cloned().unwrap_or_default(),
+            s.metadata.get(group_id).cloned().unwrap_or_default(),
+        )
+    }
+
+    /// Does `group_id` have committed offsets, cached or on disk? The
+    /// existence test DeleteGroups needs: a group whose only trace is
+    /// its file (idle since this broker became its coordinator) still
+    /// exists.
+    pub fn has_offsets(&self, group_id: &str) -> bool {
+        self.ensure_loaded_for_read(group_id);
+        self.has_group(group_id)
     }
 
     /// Does the in-memory cache have any offsets for `group_id`?
@@ -430,6 +467,7 @@ impl OffsetStore {
         keys: &[String],
     ) -> io::Result<HashMap<String, bool>> {
         let mut removed = HashMap::new();
+        self.ensure_loaded(group_id)?;
         let (snap_offsets, snap_meta) = {
             let mut s = self.state.write();
             let group = match s.cache.get_mut(group_id) {
@@ -550,6 +588,49 @@ impl OffsetStore {
         }
         self.write_group(group_id, offsets, metadata)?;
         Ok(doomed.len())
+    }
+
+    /// Pull `group_id`'s file into the cache unless it is cached already.
+    ///
+    /// `load` only runs when a group joins here, so a group this broker
+    /// coordinates but hasn't seen join since a restart or coordinator
+    /// move — an idle group, a manual-assignment consumer, an admin
+    /// tool — had no entry: fetches answered `-1`, and a commit merged
+    /// into an empty entry and rewrote the file from it.
+    ///
+    /// Fills an absent entry only, re-checked under the write lock, so
+    /// a commit racing the read is never overwritten by the older file:
+    /// the cache is write-through, so whatever is cached is at least as
+    /// new as the file. A missing file leaves the entry absent.
+    fn ensure_loaded(&self, group_id: &str) -> io::Result<()> {
+        if self.state.read().cache.contains_key(group_id) {
+            return Ok(());
+        }
+        let path = self.dir().join(format!("{group_id}.json"));
+        let data = match std::fs::read(&path) {
+            Ok(d) => d,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let (offsets, metadata) = decode_offsets_file(&data)?;
+        let mut s = self.state.write();
+        if !s.cache.contains_key(group_id) {
+            s.cache.insert(group_id.to_owned(), offsets);
+            if let Some(m) = metadata {
+                s.metadata.insert(group_id.to_owned(), m);
+            }
+        }
+        Ok(())
+    }
+
+    /// [`Self::ensure_loaded`] for the read paths, which answer from
+    /// whatever is cached if the file can't be read. Writers propagate
+    /// the error instead: rewriting a file they couldn't read would
+    /// erase it.
+    fn ensure_loaded_for_read(&self, group_id: &str) {
+        if let Err(err) = self.ensure_loaded(group_id) {
+            tracing::warn!(group = group_id, %err, "offsets: could not load group file");
+        }
     }
 
     /// Read a group's offsets from disk into the in-memory cache.
@@ -814,6 +895,88 @@ mod tests {
         assert_eq!(got.get("gone/0"), Some(&-1));
         assert_eq!(got.get("gone/1"), Some(&-1));
         assert_eq!(got.get("stays/0"), Some(&20));
+    }
+
+    /// A coordinator that hasn't seen the group join since a restart or
+    /// move must still read the committed offsets on disk, not `-1`.
+    #[test]
+    fn fetch_reads_a_group_never_materialised_here() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut md = HashMap::new();
+        md.insert(offset_key("t1", 0), "m".to_owned());
+        store(tmp.path())
+            .commit_with_metadata("g1", one("t1", 0, 7), md)
+            .unwrap();
+
+        let fresh = store(tmp.path());
+        let spec = [FetchSpec {
+            topic: "t1".to_owned(),
+            partitions: vec![0],
+        }];
+        assert_eq!(fresh.fetch("g1", &spec).get("t1/0"), Some(&7));
+        assert_eq!(
+            fresh
+                .fetch_metadata("g1", &spec)
+                .get("t1/0")
+                .map(String::as_str),
+            Some("m")
+        );
+    }
+
+    /// The data-loss half of the cold cache: a commit merged into an
+    /// empty entry and rewrote the file from it, erasing every offset
+    /// it didn't name — `kafka-consumer-groups --reset-offsets --topic a`
+    /// on an idle group wiped the group's offsets for every other topic.
+    #[test]
+    fn a_cold_commit_keeps_the_offsets_it_did_not_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut both = one("a", 0, 5);
+        both.extend(one("b", 0, 9));
+        store(tmp.path()).commit("g1", both).unwrap();
+
+        store(tmp.path()).commit("g1", one("a", 0, 1)).unwrap();
+
+        let after = store(tmp.path());
+        after.load("g1").unwrap();
+        let got = after.fetch(
+            "g1",
+            &[
+                FetchSpec {
+                    topic: "a".to_owned(),
+                    partitions: vec![0],
+                },
+                FetchSpec {
+                    topic: "b".to_owned(),
+                    partitions: vec![0],
+                },
+            ],
+        );
+        assert_eq!(got.get("a/0"), Some(&1), "the commit lands");
+        assert_eq!(got.get("b/0"), Some(&9), "the untouched topic survives");
+    }
+
+    #[test]
+    fn delete_partitions_reaches_a_group_never_materialised_here() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut both = one("a", 0, 5);
+        both.extend(one("b", 0, 9));
+        store(tmp.path()).commit("g1", both).unwrap();
+
+        let removed = store(tmp.path())
+            .delete_partitions("g1", &[offset_key("a", 0)])
+            .unwrap();
+        assert_eq!(removed.get("a/0"), Some(&true));
+
+        let after = store(tmp.path());
+        after.load("g1").unwrap();
+        let got = after.fetch(
+            "g1",
+            &[FetchSpec {
+                topic: "b".to_owned(),
+                partitions: vec![0],
+            }],
+        );
+        assert_eq!(got.get("b/0"), Some(&9));
     }
 
     /// The failure this whole fix exists for: the group has a file but

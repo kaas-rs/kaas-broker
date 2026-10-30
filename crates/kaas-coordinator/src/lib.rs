@@ -24,7 +24,7 @@ pub use manager::{
     TxnAssignmentSource,
 };
 pub use marker_queue::{marker_queue_dir, MarkerEntry, MarkerQueue, MARKER_QUEUE_DIR_NAME};
-pub use offset_store::{offset_key, FetchSpec, OffsetStore};
+pub use offset_store::{offset_key, parse_offset_key, FetchSpec, OffsetStore};
 pub use txn_state::{
     EndTxnOutcome, PendingMarkerDispatch, TxnAbortRecord, TxnEntry, TxnOffsetHook, TxnState,
     TxnStateError, TxnStateStore, TxnTopic, DEFAULT_NUM_SLOTS,

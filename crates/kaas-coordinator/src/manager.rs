@@ -433,6 +433,18 @@ impl Manager {
         ))
     }
 
+    /// Every committed offset + metadata for a group: OffsetFetch with
+    /// a null topic list. `None` ↔ "broker not coordinator".
+    pub fn offset_fetch_all(
+        &self,
+        group_id: &str,
+    ) -> Option<(HashMap<String, i64>, HashMap<String, String>)> {
+        if !self.is_coordinator(group_id) {
+            return None;
+        }
+        Some(self.offsets.fetch_all(group_id))
+    }
+
     /// Drop a group's offsets + state. Returns the group-level error
     /// code per Apache's contract: `0` (success), `16`
     /// (NOT_COORDINATOR), `67` (NON_EMPTY_GROUP — Stable /
@@ -445,7 +457,7 @@ impl Manager {
             return 16;
         }
         let has_state = self.groups.contains_key(group_id);
-        let has_disk = self.offsets.has_group(group_id);
+        let has_disk = self.offsets.has_offsets(group_id);
         if !has_state && !has_disk {
             return GROUP_ID_NOT_FOUND;
         }
@@ -819,5 +831,22 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let m = manager(tmp.path());
         assert_eq!(m.delete_group("never-existed"), 69);
+    }
+
+    /// A group idle since this broker became its coordinator exists
+    /// only as its offsets file. It was answered GROUP_ID_NOT_FOUND and
+    /// kept its file, because the existence check read the cache alone.
+    #[test]
+    fn delete_group_reaches_a_group_never_materialised_here() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut offsets = HashMap::new();
+        offsets.insert(crate::offset_key("t", 0), 5);
+        OffsetStore::new(tmp.path())
+            .commit("idle", offsets)
+            .unwrap();
+
+        let m = manager(tmp.path());
+        assert_eq!(m.delete_group("idle"), 0);
+        assert!(OffsetStore::new(tmp.path()).group_ids_on_disk().is_empty());
     }
 }

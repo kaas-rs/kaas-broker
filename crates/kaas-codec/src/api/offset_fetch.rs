@@ -70,7 +70,10 @@ pub struct OffsetFetchTopic {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OffsetFetchGroup {
     pub group_id: String,
-    pub topics: Vec<OffsetFetchTopic>,
+    /// `None` means "fetch every committed topic" — the form Kafka 4's
+    /// AdminClient sends for `listConsumerGroupOffsets` (and so
+    /// `kafka-consumer-groups --describe`).
+    pub topics: Option<Vec<OffsetFetchTopic>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -157,21 +160,28 @@ pub fn decode_request(buf: &mut Bytes, version: i16) -> Result<Request, CodecErr
         let ng = read_array_len(buf, flexible)?;
         for _ in 0..ng {
             let group_id = read_str(buf, true)?;
-            let mut topics = Vec::new();
-            let nt = read_array_len(buf, true)?;
-            for _ in 0..nt {
-                let name = read_str(buf, true)?;
-                let mut partition_indexes = Vec::new();
-                let np = read_array_len(buf, true)?;
-                for _ in 0..np {
-                    partition_indexes.push(read_i32(buf)?);
+            // Nullable, like the v1..=v7 list below: keep the null.
+            let topics = match crate::primitives::read_uvarint(buf)? {
+                0 => None,
+                n => {
+                    let nt = usize::try_from(n - 1).map_err(|_| CodecError::LengthOverflow)?;
+                    let mut topics = Vec::with_capacity(nt);
+                    for _ in 0..nt {
+                        let name = read_str(buf, true)?;
+                        let mut partition_indexes = Vec::new();
+                        let np = read_array_len(buf, true)?;
+                        for _ in 0..np {
+                            partition_indexes.push(read_i32(buf)?);
+                        }
+                        tagged::read(buf)?;
+                        topics.push(OffsetFetchTopic {
+                            name,
+                            partition_indexes,
+                        });
+                    }
+                    Some(topics)
                 }
-                tagged::read(buf)?;
-                topics.push(OffsetFetchTopic {
-                    name,
-                    partition_indexes,
-                });
-            }
+            };
             tagged::read(buf)?;
             req.groups.push(OffsetFetchGroup { group_id, topics });
         }
@@ -339,14 +349,19 @@ pub fn encode_request(buf: &mut BytesMut, req: &Request, version: i16) -> Result
         write_array_len(buf, req.groups.len(), true)?;
         for g in &req.groups {
             write_str(buf, &g.group_id, true)?;
-            write_array_len(buf, g.topics.len(), true)?;
-            for t in &g.topics {
-                write_str(buf, &t.name, true)?;
-                write_array_len(buf, t.partition_indexes.len(), true)?;
-                for &i in &t.partition_indexes {
-                    write_i32(buf, i);
+            match &g.topics {
+                None => crate::primitives::write_uvarint(buf, 0),
+                Some(topics) => {
+                    write_array_len(buf, topics.len(), true)?;
+                    for t in topics {
+                        write_str(buf, &t.name, true)?;
+                        write_array_len(buf, t.partition_indexes.len(), true)?;
+                        for &i in &t.partition_indexes {
+                            write_i32(buf, i);
+                        }
+                        tagged::write_empty(buf);
+                    }
                 }
-                tagged::write_empty(buf);
             }
             tagged::write_empty(buf);
         }
@@ -395,10 +410,10 @@ mod tests {
             Request {
                 groups: vec![OffsetFetchGroup {
                     group_id: "g1".to_owned(),
-                    topics: vec![OffsetFetchTopic {
+                    topics: Some(vec![OffsetFetchTopic {
                         name: "t1".to_owned(),
                         partition_indexes: vec![0, 1],
-                    }],
+                    }]),
                 }],
                 require_stable: true,
                 ..Request::default()
@@ -510,5 +525,28 @@ mod tests {
         let mut r = w.freeze();
         let got = decode_request(&mut r, 5).unwrap();
         assert_eq!(got.topics, None);
+    }
+
+    #[test]
+    fn v8_null_topics_is_fetch_all() {
+        // Kafka 4's `listConsumerGroupOffsets` sends this; collapsing
+        // the null to an empty list answered it with nothing.
+        let req = Request {
+            groups: vec![
+                OffsetFetchGroup {
+                    group_id: "all".to_owned(),
+                    topics: None,
+                },
+                OffsetFetchGroup {
+                    group_id: "none".to_owned(),
+                    topics: Some(Vec::new()),
+                },
+            ],
+            ..Request::default()
+        };
+        let mut w = BytesMut::new();
+        encode_request(&mut w, &req, 8).unwrap();
+        let got = decode_request(&mut w.freeze(), 8).unwrap();
+        assert_eq!(got.groups, req.groups);
     }
 }
