@@ -676,6 +676,47 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_takeover_does_not_reap_fresh_data() {
+        // gh #267, end to end: produce, graceful shutdown, fresh engine,
+        // take-over, one sweep at the 7-day default. The take-over rolls
+        // the adopted active segment closed before any append lands, and
+        // that roll used to stamp a largest timestamp of 0 — epoch 1970
+        // — so this very sweep reaped minutes-old data on every restart.
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            {
+                let e = engine_at(tmp.path().to_path_buf(), 1 << 30);
+                for _ in 0..3 {
+                    e.append("t", 0, 0, -1, build_batch(1, now_epoch_ms()))
+                        .await
+                        .unwrap();
+                }
+                e.relinquish_all().await.unwrap();
+            }
+            let e = engine_at(tmp.path().to_path_buf(), 1 << 30);
+            e.take_over("t", 0, 2).await.unwrap();
+            let p = e.partition("t", 0).unwrap();
+            assert_eq!(
+                p.closed_segment_max_timestamps().len(),
+                1,
+                "the take-over must roll the adopted segment closed, or this \
+                 test isn't exercising the path that reaped"
+            );
+
+            // Apache's (and kaas's advertised) retention.ms default.
+            let cleaner = RetentionCleaner::new(e.clone(), time_only(604_800_000));
+            assert_eq!(cleaner.run_once().await.unwrap(), 0);
+            assert_eq!(e.log_start_offset("t", 0).unwrap(), 0);
+            assert_eq!(e.high_watermark("t", 0).unwrap(), 3);
+            assert!(
+                !e.read("t", 0, 0, 1 << 20).await.unwrap().is_empty(),
+                "records written before the restart must still be readable"
+            );
+            e.relinquish_all().await.unwrap();
+        });
+    }
+
+    #[test]
     fn a_topics_segment_bytes_reaches_the_partition() {
         // Apache applies a topic's segment.bytes to its log. kaas wrote
         // the value to .config.json, echoed it back through

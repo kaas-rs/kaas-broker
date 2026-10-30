@@ -433,4 +433,52 @@ mod tests {
             source::DEFAULT_CONFIG
         );
     }
+
+    #[tokio::test]
+    async fn every_persisted_override_reports_dynamic_topic_config() {
+        // gh #236, per key: `override_value` maps `.config.json` fields
+        // to dotted names one by one, so a field missing there reports
+        // DEFAULT_CONFIG while the broker enforces the override. Every
+        // field is spelled out (no `..Default`) so a new one fails to
+        // compile here until it is covered.
+        let tmp = tempfile::tempdir().unwrap();
+        let engine = Arc::new(DiskStorageEngine::new(
+            Arc::new(RealFs),
+            tmp.path().to_path_buf(),
+            PartitionConfig::default(),
+        ));
+        let dir = engine.topic_dir("orders", 0);
+        std::fs::create_dir_all(&dir).unwrap();
+        kaas_storage::write_topic_config(
+            engine.fs(),
+            &dir,
+            &TopicConfigFile {
+                retention_ms: Some(600_000),
+                retention_bytes: Some(1_048_576),
+                segment_bytes: Some(16_777_216),
+                segment_ms: Some(3_600_000),
+                cleanup_policy: "compact".into(),
+                min_compaction_lag_ms: Some(5_000),
+                delete_retention_ms: Some(7_000),
+                flush_messages: Some(1),
+            },
+        )
+        .unwrap();
+
+        let configs = describe(broker_with(engine, "orders"), "orders").await;
+        for (key, want) in [
+            ("retention.ms", "600000"),
+            ("retention.bytes", "1048576"),
+            ("segment.bytes", "16777216"),
+            ("segment.ms", "3600000"),
+            ("cleanup.policy", "compact"),
+            ("min.compaction.lag.ms", "5000"),
+            ("delete.retention.ms", "7000"),
+            ("flush.messages", "1"),
+        ] {
+            let c = entry(&configs, key);
+            assert_eq!(c.value.as_deref(), Some(want), "{key}");
+            assert_eq!(c.config_source, source::DYNAMIC_TOPIC_CONFIG, "{key}");
+        }
+    }
 }

@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use kaas_operator_api::{Condition, KafkaTopic};
+use kaas_operator_api::{Condition, KafkaTopic, KafkaTopicConfig};
 use kaas_storage::TopicConfigFile;
 use kube::api::{Patch, PatchParams};
 use kube::runtime::controller::Action;
@@ -225,16 +225,7 @@ impl KafkaTopicReconciler {
         // 2. Write per-topic .config.json. The broker watches this
         // file and applies retention/segment/compaction knobs on
         // partition open.
-        let cfg = TopicConfigFile {
-            retention_ms: topic.spec.config.retention_ms,
-            retention_bytes: topic.spec.config.retention_bytes,
-            segment_bytes: topic.spec.config.segment_bytes,
-            segment_ms: topic.spec.config.segment_ms,
-            cleanup_policy: topic.spec.config.cleanup_policy.clone(),
-            min_compaction_lag_ms: topic.spec.config.min_compaction_lag_ms,
-            delete_retention_ms: topic.spec.config.delete_retention_ms,
-            flush_messages: topic.spec.config.flush_messages,
-        };
+        let cfg = topic_config_file(&topic.spec.config);
         for root in &involved_roots {
             kaas_storage::write_topic_config(&fs, &root.join(&topic_name), &cfg)?;
         }
@@ -458,6 +449,33 @@ pub fn error_policy(
     tracing::warn!(error = %err, "KafkaTopic reconcile failed");
     ctx.observer.bump_error();
     Action::requeue(Duration::from_secs(10))
+}
+
+/// The `.config.json` the broker reads for a topic's `spec.config`.
+/// Destructured without `..` so a new CRD config field fails to
+/// compile until it is mapped — a field dropped here is an override
+/// the API server stored and the broker never sees (gh #236).
+pub fn topic_config_file(cfg: &KafkaTopicConfig) -> TopicConfigFile {
+    let KafkaTopicConfig {
+        retention_ms,
+        retention_bytes,
+        segment_bytes,
+        segment_ms,
+        cleanup_policy,
+        min_compaction_lag_ms,
+        delete_retention_ms,
+        flush_messages,
+    } = cfg;
+    TopicConfigFile {
+        retention_ms: *retention_ms,
+        retention_bytes: *retention_bytes,
+        segment_bytes: *segment_bytes,
+        segment_ms: *segment_ms,
+        cleanup_policy: cleanup_policy.clone(),
+        min_compaction_lag_ms: *min_compaction_lag_ms,
+        delete_retention_ms: *delete_retention_ms,
+        flush_messages: *flush_messages,
+    }
 }
 
 /// Bonus helper for the `bins/kaas-operator` main: derive the
@@ -753,6 +771,37 @@ mod tests {
     fn regex_lite_v4() -> regex::Regex {
         regex::Regex::new("^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$")
             .unwrap()
+    }
+
+    #[test]
+    fn every_spec_config_field_reaches_config_json() {
+        // gh #236: an override the API server stored but the operator
+        // never writes to `.config.json` is never enforced, and
+        // DescribeConfigs reports it as the default.
+        let spec = KafkaTopicConfig {
+            retention_ms: Some(600_000),
+            retention_bytes: Some(1_048_576),
+            segment_bytes: Some(16_777_216),
+            segment_ms: Some(3_600_000),
+            cleanup_policy: "compact".into(),
+            min_compaction_lag_ms: Some(5_000),
+            delete_retention_ms: Some(7_000),
+            flush_messages: Some(1),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = kaas_storage::fs::RealFs::new();
+        kaas_storage::write_topic_config(&fs, tmp.path(), &topic_config_file(&spec)).unwrap();
+        let back = kaas_storage::read_topic_config(&fs, tmp.path())
+            .unwrap()
+            .expect(".config.json written");
+        assert_eq!(back.retention_ms, Some(600_000));
+        assert_eq!(back.retention_bytes, Some(1_048_576));
+        assert_eq!(back.segment_bytes, Some(16_777_216));
+        assert_eq!(back.segment_ms, Some(3_600_000));
+        assert_eq!(back.cleanup_policy, "compact");
+        assert_eq!(back.min_compaction_lag_ms, Some(5_000));
+        assert_eq!(back.delete_retention_ms, Some(7_000));
+        assert_eq!(back.flush_messages, Some(1));
     }
 
     #[test]

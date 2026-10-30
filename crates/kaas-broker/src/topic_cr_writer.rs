@@ -710,6 +710,51 @@ mod kube_impl {
                 Some(format!("kaas:kaas.rs/KafkaTopic:kaas/{meta_name}").as_str())
             );
         }
+
+        #[test]
+        fn every_accepted_config_key_survives_the_crd_schema() {
+            // gh #236's dangerous half: the API server prunes merge-patch
+            // fields the CRD doesn't declare, so a key mapped to a field
+            // the CRD lacks "succeeds" and stores nothing. A field serde
+            // drops on the way through `KafkaTopicConfig` is one the API
+            // server would prune.
+            use super::super::{ops_to_config_patch, ConfigOpKind, ConfigOpWithValue};
+            use kaas_operator_api::KafkaTopicConfig;
+            let pairs: Vec<(String, String)> = [
+                ("retention.ms", "600000"),
+                ("retention.bytes", "1048576"),
+                ("segment.bytes", "16777216"),
+                ("segment.ms", "3600000"),
+                ("cleanup.policy", "compact"),
+                ("min.compaction.lag.ms", "5000"),
+                ("delete.retention.ms", "7000"),
+                ("flush.messages", "1"),
+            ]
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect();
+
+            let spec = super::super::create_configs_to_spec(&pairs).expect("all accepted");
+            assert_eq!(spec.len(), pairs.len());
+            let cfg: KafkaTopicConfig =
+                serde_json::from_value(Value::Object(spec.clone())).expect("CRD shape");
+            assert_eq!(
+                serde_json::to_value(&cfg).unwrap(),
+                Value::Object(spec.clone()),
+                "a field the CRD doesn't declare was dropped"
+            );
+
+            // IncrementalAlterConfigs SETs build the same merge patch.
+            let ops: Vec<ConfigOpWithValue> = pairs
+                .iter()
+                .map(|(k, v)| ConfigOpWithValue {
+                    key: k.clone(),
+                    kind: ConfigOpKind::Set,
+                    value: Some(v.clone()),
+                })
+                .collect();
+            assert_eq!(ops_to_config_patch(&ops).unwrap(), spec);
+        }
     }
 }
 

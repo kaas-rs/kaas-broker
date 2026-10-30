@@ -1102,6 +1102,63 @@ mod tests {
         });
     }
 
+    /// gh #234, the boot-time arm: a restarted broker takes over before
+    /// its topic watch has delivered `status.volumeAssignments`, so a
+    /// partition correctly placed on a pool root resolves to the default
+    /// root. It must still serve the pool copy — this is the arm every
+    /// restart of a pool-backed cluster relies on.
+    #[test]
+    fn a_restart_before_placement_is_known_serves_the_pool_copy() {
+        use crate::engine::{LogDirInfo, PlacementResolver};
+        struct AssignBulk;
+        impl PlacementResolver for AssignBulk {
+            fn log_dir_of(&self, _topic: &str, _partition: i32) -> Option<String> {
+                Some("bulk".to_owned())
+            }
+        }
+        rt().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let default_root = tmp.path().join("data");
+            let bulk_root = tmp.path().join("bulk");
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let engine = || {
+                DiskStorageEngine::new(fs.clone(), default_root.clone(), PartitionConfig::default())
+                    .with_extra_log_dirs(vec![LogDirInfo {
+                        name: "bulk".to_owned(),
+                        path: bulk_root.clone(),
+                        default_eligible: true,
+                        cordoned: false,
+                        labels: Default::default(),
+                    }])
+            };
+
+            // Before the restart: placement known, data on the pool root.
+            {
+                let e = engine();
+                e.set_placement_resolver(Arc::new(AssignBulk));
+                e.create_partition("t", 0).await.unwrap();
+                e.append("t", 0, 0, -1, build_batch(3, 1_000))
+                    .await
+                    .unwrap();
+                e.relinquish_all().await.unwrap();
+            }
+            assert!(bulk_root.join("t/0/manifest.json").is_file());
+
+            // The restart: a fresh engine with no placement resolver yet.
+            let e = engine();
+            assert_eq!(e.take_over("t", 0, 2).await.unwrap(), 3);
+            assert!(
+                !e.read("t", 0, 0, 1 << 20).await.unwrap().is_empty(),
+                "records on the pool root must still be readable"
+            );
+            assert!(
+                !default_root.join("t/0").exists(),
+                "no empty shell may be created on the default root"
+            );
+            e.relinquish_all().await.unwrap();
+        });
+    }
+
     /// gh #221 phase 3: AlterReplicaLogDirs move — files land on the
     /// target root, the source path is returned for reclaim, and an
     /// unknown target is refused.
