@@ -98,12 +98,6 @@ pub fn segment_index_path(dir: &Path, base_offset: i64, epoch: i64) -> PathBuf {
     dir.join(format!("{stem}{INDEX_EXT}"))
 }
 
-/// Legacy pre-Phase-4 path with no epoch prefix. Kept for the
-/// migration-fixture tests; new writes always use [`segment_log_path`].
-pub fn legacy_segment_log_path(dir: &Path, base_offset: i64) -> PathBuf {
-    dir.join(format!("{base_offset:020}{LOG_EXT}"))
-}
-
 /// Recover `(base_offset, epoch)` from a stem (filename without `.log` /
 /// `.index` suffix). Accepts both layouts:
 ///
@@ -946,16 +940,6 @@ mod tests {
         assert_eq!(
             p.to_str().unwrap(),
             "/data/topic-a/0/00000005-00000000000000000123.index"
-        );
-    }
-
-    #[test]
-    fn legacy_log_path_has_no_epoch_prefix() {
-        let dir = Path::new("/data/topic-a/0");
-        let p = legacy_segment_log_path(dir, 999);
-        assert_eq!(
-            p.to_str().unwrap(),
-            "/data/topic-a/0/00000000000000000999.log"
         );
     }
 

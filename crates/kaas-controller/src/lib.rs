@@ -28,9 +28,6 @@ pub use kube_election::{
 pub use assignment_writer::{
     AssignmentLoop, AssignmentReason, BrokerSource, GroupSource, StaticSources, TopicSource,
 };
-pub use balancer::{
-    balance, balance_groups, group_hash, rendezvous_hash, rendezvous_pick, rendezvous_pick_group,
-    GroupSpec, TopicSpec,
-};
+pub use balancer::{balance, balance_groups, rendezvous_hash, GroupSpec, TopicSpec};
 pub use election::{LeaseElection, LocalElection};
 pub use heartbeat_server::{BrokerLiveness, HeartbeatServer, HeartbeatService};

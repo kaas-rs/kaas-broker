@@ -51,11 +51,6 @@ pub fn read_u8(buf: &mut Bytes) -> Result<u8, CodecError> {
     Ok(buf.get_u8())
 }
 
-pub fn read_u32(buf: &mut Bytes) -> Result<u32, CodecError> {
-    require(buf, 4)?;
-    Ok(buf.get_u32())
-}
-
 pub fn read_f64(buf: &mut Bytes) -> Result<f64, CodecError> {
     require(buf, 8)?;
     Ok(buf.get_f64())
@@ -76,12 +71,6 @@ pub fn write_i32(buf: &mut BytesMut, v: i32) {
 }
 pub fn write_i64(buf: &mut BytesMut, v: i64) {
     buf.put_i64(v);
-}
-pub fn write_u8(buf: &mut BytesMut, v: u8) {
-    buf.put_u8(v);
-}
-pub fn write_u32(buf: &mut BytesMut, v: u32) {
-    buf.put_u32(v);
 }
 pub fn write_f64(buf: &mut BytesMut, v: f64) {
     buf.put_f64(v);
@@ -127,21 +116,10 @@ pub fn write_uvarint(buf: &mut BytesMut, v: u64) {
     buf.put_u8(last);
 }
 
-/// ZigZag decode: `(u >> 1) ^ -(u & 1)`.
-fn zigzag_decode(u: u64) -> i64 {
-    let v = (u >> 1) ^ (u & 1).wrapping_neg();
-    // u64 → i64 bit-reinterpret without `as`.
-    i64::from_le_bytes(v.to_le_bytes())
-}
-
 /// ZigZag encode: `(n << 1) ^ (n >> 63)`.
 fn zigzag_encode(n: i64) -> u64 {
     let encoded = n.wrapping_shl(1) ^ (n >> 63);
     u64::from_le_bytes(encoded.to_le_bytes())
-}
-
-pub fn read_varint(buf: &mut Bytes) -> Result<i64, CodecError> {
-    Ok(zigzag_decode(read_uvarint(buf)?))
 }
 
 pub fn write_varint(buf: &mut BytesMut, v: i64) {
@@ -351,10 +329,6 @@ pub fn read_raw(buf: &mut Bytes, n: usize) -> Result<Bytes, CodecError> {
     Ok(buf.copy_to_bytes(n))
 }
 
-pub fn write_raw(buf: &mut BytesMut, b: &[u8]) {
-    buf.put_slice(b);
-}
-
 pub fn read_uuid(buf: &mut Bytes) -> Result<[u8; 16], CodecError> {
     require(buf, 16)?;
     let mut out = [0u8; 16];
@@ -403,27 +377,6 @@ pub fn write_compact_array_len(buf: &mut BytesMut, count: usize) -> Result<(), C
 }
 
 // ---------------------------------------------------------------------------
-// reserve + fixup (used for total_length + CRC slots after a forward pass)
-// ---------------------------------------------------------------------------
-
-/// Reserve a 4-byte slot in `buf` and return its byte offset. Pair with
-/// [`fixup_i32`] once the value is known.
-pub fn reserve_i32(buf: &mut BytesMut) -> usize {
-    let pos = buf.len();
-    buf.put_u32(0);
-    pos
-}
-
-/// Overwrite the i32 at byte offset `pos` with `v`. Panics if `pos + 4` is
-/// out of range — the only way to hit this is a usage bug (calling fixup
-/// after the buffer was truncated).
-pub fn fixup_i32(buf: &mut BytesMut, pos: usize, v: i32) {
-    let bytes = v.to_be_bytes();
-    let slot = &mut buf[pos..pos + 4];
-    slot.copy_from_slice(&bytes);
-}
-
-// ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
 
@@ -436,6 +389,17 @@ mod tests {
         let mut buf = BytesMut::new();
         f(&mut buf);
         buf.freeze()
+    }
+
+    /// Inverse of [`write_varint`]. Nothing on the request path decodes
+    /// a signed varint (they only appear inside RecordBatches, which stay
+    /// byte-opaque), so the decoder lives here as the round-trip oracle.
+    fn read_varint(buf: &mut Bytes) -> Result<i64, CodecError> {
+        let u = read_uvarint(buf)?;
+        // ZigZag decode: `(u >> 1) ^ -(u & 1)`, then a u64 → i64
+        // bit-reinterpret without `as`.
+        let v = (u >> 1) ^ (u & 1).wrapping_neg();
+        Ok(i64::from_le_bytes(v.to_le_bytes()))
     }
 
     #[test]
@@ -588,17 +552,6 @@ mod tests {
         let bad: &[u8] = &[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x02];
         let mut b = Bytes::copy_from_slice(bad);
         assert_eq!(read_uvarint(&mut b), Err(CodecError::InvalidUvarint));
-    }
-
-    #[test]
-    fn reserve_fixup() {
-        let mut w = BytesMut::new();
-        let slot = reserve_i32(&mut w);
-        write_i32(&mut w, 42);
-        fixup_i32(&mut w, slot, 999);
-        let mut r = w.freeze();
-        assert_eq!(read_i32(&mut r).unwrap(), 999);
-        assert_eq!(read_i32(&mut r).unwrap(), 42);
     }
 
     // -- proptests -----------------------------------------------------------

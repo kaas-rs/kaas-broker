@@ -4,8 +4,8 @@
 //! protect that:
 //!
 //! - **Record decode** — no code path may parse an individual record out of
-//!   a RecordBatch. The closest the codec gets is the 61-byte header walker
-//!   in [`crate::recordbatch_count`].
+//!   a RecordBatch. The closest the codec gets is CRC verification over the
+//!   opaque batch bytes in [`crate::crc`].
 //! - **Batch re-encode** — no code path may rebuild a RecordBatch from
 //!   decoded fields. Storage stores the wire bytes as-is; the response path
 //!   emits them as-is.

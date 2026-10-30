@@ -183,7 +183,7 @@ pub struct KafkaTopicStatus {
 impl KafkaTopic {
     /// On-wire Kafka topic name. Returns `spec.topic_name` when set,
     /// otherwise `metadata.name`. Callers in the broker
-    /// (TopicWatcher) and operator (KafkaTopicReconciler) MUST use
+    /// (`run_topic_watch`) and operator (KafkaTopicReconciler) MUST use
     /// this accessor — see the gh #86 note in the module-level
     /// docs.
     pub fn effective_topic_name(&self) -> &str {

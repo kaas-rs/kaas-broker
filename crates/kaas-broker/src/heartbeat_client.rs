@@ -140,11 +140,6 @@ impl HeartbeatClient {
         }
     }
 
-    /// Is a stream currently open?
-    pub fn is_connected(&self) -> bool {
-        self.outbox.lock().is_some()
-    }
-
     fn record_received(&self) {
         let ms = self
             .reference_instant
@@ -321,9 +316,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fresh_client_is_not_connected() {
+    fn fresh_client_has_received_nothing() {
         let c = HeartbeatClient::new("kaas-0");
-        assert!(!c.is_connected());
         assert_eq!(c.last_received(), None);
     }
 

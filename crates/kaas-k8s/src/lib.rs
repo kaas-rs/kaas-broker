@@ -9,10 +9,7 @@
 //!   headless `Service`. Pure state; the kube-bound pump consumes
 //!   `EndpointSlice` events and calls into `apply_slice` /
 //!   `delete_slice`.
-//! - [`topic_watcher`] — `KafkaTopic` CR cache + divergence
-//!   detector. Same shape: pure state, kube pump feeds
-//!   observations in.
-//! - [`readiness`] — `ReadinessGate` trait + `NoopReadiness` stub.
+//! - [`readiness`] — the `kaas.rs/PartitionsReady` condition name.
 //!
 //! Kube-bound watchers live behind the `kube-watchers` feature
 //! (default). The real pump implementations are the workstream E
@@ -23,12 +20,10 @@
 pub mod endpoints;
 pub mod identity;
 pub mod readiness;
-pub mod topic_watcher;
 
 #[cfg(feature = "kube-watchers")]
 pub mod kube_watchers;
 
 pub use endpoints::{BrokerEndpoint, BrokerRegistry, EndpointSliceData, EndpointSliceEntry};
 pub use identity::{parse_ordinal, BrokerIdentity, DnsConfig, IdentityError};
-pub use readiness::{NoopReadiness, ReadinessError, ReadinessGate, READINESS_CONDITION};
-pub use topic_watcher::{TopicEvent, TopicObservation, TopicWatcher};
+pub use readiness::READINESS_CONDITION;

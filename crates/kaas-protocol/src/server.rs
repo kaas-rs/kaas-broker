@@ -119,13 +119,7 @@ impl Server {
     /// `:0` port before driving traffic.
     pub async fn bind(self) -> io::Result<(BoundServer, Arc<Dispatcher>)> {
         let bound = self.bind_all().await?;
-        Ok((
-            BoundServer {
-                listeners: bound,
-                max_frame_bytes: self.cfg.max_frame_bytes,
-            },
-            self.dispatcher,
-        ))
+        Ok((BoundServer { listeners: bound }, self.dispatcher))
     }
 
     async fn bind_all(&self) -> io::Result<Vec<BoundListener>> {
@@ -192,7 +186,6 @@ impl std::fmt::Debug for BoundListener {
 
 pub struct BoundServer {
     listeners: Vec<BoundListener>,
-    max_frame_bytes: usize,
 }
 
 impl std::fmt::Debug for BoundServer {
@@ -200,7 +193,6 @@ impl std::fmt::Debug for BoundServer {
         let names: Vec<&str> = self.listeners.iter().map(|bl| bl.name.as_str()).collect();
         f.debug_struct("BoundServer")
             .field("listeners", &names)
-            .field("max_frame_bytes", &self.max_frame_bytes)
             .finish()
     }
 }
@@ -215,10 +207,6 @@ impl BoundServer {
             .iter()
             .filter_map(|bl| bl.listener.local_addr().ok().map(|a| (bl.name.clone(), a)))
             .collect()
-    }
-
-    pub fn max_frame_bytes(&self) -> usize {
-        self.max_frame_bytes
     }
 
     /// Run accept loops until `cancel` fires. Consumes self.

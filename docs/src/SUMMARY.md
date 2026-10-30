@@ -75,7 +75,6 @@
   - [kaas-observability](code-tour/kaas-observability.md)
   - [kaas-operator-api](code-tour/kaas-operator-api.md)
   - [kaas-operator-controllers](code-tour/kaas-operator-controllers.md)
-  - [kaas-test-harness](code-tour/kaas-test-harness.md)
   - [kaas (broker binary)](code-tour/bin-kaas.md)
   - [kaas-operator (operator binary)](code-tour/bin-kaas-operator.md)
 

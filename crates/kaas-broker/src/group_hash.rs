@@ -52,18 +52,6 @@ pub fn coordinator_slot(key: &str, num_brokers: usize) -> usize {
     usize::try_from(h % n).unwrap_or(0)
 }
 
-/// Convenience wrapper. See
-/// [`coordinator_slot`] for the invariants.
-pub fn group_coordinator_slot(group_id: &str, num_brokers: usize) -> usize {
-    coordinator_slot(group_id, num_brokers)
-}
-
-/// Convenience wrapper. See
-/// [`coordinator_slot`] for the invariants.
-pub fn txn_coordinator_slot(transactional_id: &str, num_brokers: usize) -> usize {
-    coordinator_slot(transactional_id, num_brokers)
-}
-
 /// "Preferred broker; fall back through the alive subset
 /// deterministically" — the shared decision used by
 /// `pick_group_coordinator` and `pick_txn_coordinator`.

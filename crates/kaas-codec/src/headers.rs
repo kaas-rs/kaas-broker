@@ -91,20 +91,6 @@ pub fn encode_request_header(
     Ok(())
 }
 
-pub fn decode_response_header(
-    buf: &mut Bytes,
-    version: HeaderVersion,
-) -> Result<ResponseHeader, CodecError> {
-    let correlation_id = read_i32(buf)?;
-    // Response headers only ever go up to V1. Treat V2 the same as V1 to
-    // keep the function total — we never pass V2 from the registry, but
-    // the type system can't prove that here without a second enum.
-    if !matches!(version, HeaderVersion::V0) {
-        tagged::read(buf)?;
-    }
-    Ok(ResponseHeader { correlation_id })
-}
-
 pub fn encode_response_header(buf: &mut BytesMut, hdr: &ResponseHeader, version: HeaderVersion) {
     write_i32(buf, hdr.correlation_id);
     if !matches!(version, HeaderVersion::V0) {
@@ -184,10 +170,11 @@ mod tests {
         };
         let mut w = BytesMut::new();
         encode_response_header(&mut w, &hdr, HeaderVersion::V0);
-        assert_eq!(w.len(), 4, "v0 response header is just the correlation id");
-        let mut r = w.freeze();
-        let got = decode_response_header(&mut r, HeaderVersion::V0).unwrap();
-        assert_eq!(got, hdr);
+        assert_eq!(
+            &w[..],
+            &1234i32.to_be_bytes(),
+            "v0 response header is just the correlation id"
+        );
     }
 
     #[test]
@@ -195,9 +182,10 @@ mod tests {
         let hdr = ResponseHeader { correlation_id: -1 };
         let mut w = BytesMut::new();
         encode_response_header(&mut w, &hdr, HeaderVersion::V1);
-        assert_eq!(w.len(), 5, "v1 response header is corr_id + uvarint(0)");
-        let mut r = w.freeze();
-        let got = decode_response_header(&mut r, HeaderVersion::V1).unwrap();
-        assert_eq!(got, hdr);
+        assert_eq!(
+            &w[..],
+            &[0xff, 0xff, 0xff, 0xff, 0x00],
+            "v1 response header is corr_id + uvarint(0)"
+        );
     }
 }

@@ -6,13 +6,12 @@ license.workspace      = true
 repository.workspace   = true
 rust-version.workspace = true
 publish      = false
-description  = "Broker-side K8s helpers: BrokerRegistry, TopicWatcher, ReadinessUpdater."
+description  = "Broker-side K8s helpers: BrokerRegistry, identity, kube watchers, readiness patching."
 
 [lints]
 workspace = true
 
 [dependencies]
-async-trait    = { workspace = true }
 chrono         = { workspace = true }
 parking_lot    = { workspace = true }
 serde          = { workspace = true }
@@ -26,8 +25,8 @@ tokio-util     = { workspace = true }
 tracing        = { workspace = true }
 
 # kube wiring — feature-gated so a dev binary without kube creds
-# still links. The trait surfaces ([`ReadinessGate`], etc.) ship
-# unconditionally.
+# still links. The pure-state cores (`BrokerRegistry`, identity)
+# ship unconditionally.
 futures        = { workspace = true, optional = true }
 k8s-openapi     = { workspace = true, optional = true }
 kube            = { workspace = true, optional = true }

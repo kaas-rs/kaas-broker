@@ -19,9 +19,9 @@ pub use group::{
     JoinedMember, MemberSnapshot, ProtocolMetadata, SyncAssignment, SyncOutcome, SyncRequest,
 };
 pub use manager::{
-    build_fetch_specs, build_offset_key, BrokerEndpoint, BrokerId, BrokerLookup,
-    CoordinatorResolution, FnLookup, GroupAssignmentSource, LeaveOutcome, LocalGroupSource,
-    LocalTxnSource, Manager, TxnAssignmentSource,
+    build_offset_key, BrokerEndpoint, BrokerId, BrokerLookup, CoordinatorResolution, FnLookup,
+    GroupAssignmentSource, LeaveOutcome, LocalGroupSource, LocalTxnSource, Manager,
+    TxnAssignmentSource,
 };
 pub use marker_queue::{marker_queue_dir, MarkerEntry, MarkerQueue, MARKER_QUEUE_DIR_NAME};
 pub use offset_store::{offset_key, FetchSpec, OffsetStore};

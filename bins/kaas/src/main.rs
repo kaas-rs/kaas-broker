@@ -24,7 +24,6 @@
 
 mod cluster;
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -567,7 +566,6 @@ async fn main() -> Result<()> {
     let health_cfg = kaas_observability::health::HealthConfig {
         broker_id: format!("kaas-{}", cli.broker_id),
         listeners: cli.listeners.iter().map(|l| l.name.clone()).collect(),
-        tls: None,
         // Live runtime fields (controller identity, partitions_led,
         // heartbeat/assignment ages). Reads broker.coordinator() per
         // request, so wiring order vs cluster bring-up doesn't
@@ -1383,13 +1381,6 @@ async fn wait_for_shutdown_signal() -> Result<()> {
         _ = int.recv()  => info!("SIGINT received"),
     }
     Ok(())
-}
-
-// HashMap import is unused in some builds — silence its dead-import
-// warning by referencing the type once.
-#[allow(dead_code)]
-fn _silence_unused_hashmap() -> HashMap<u8, u8> {
-    HashMap::new()
 }
 
 /// Leadership gate for the retention cleaner (gh #250).

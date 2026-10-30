@@ -4,9 +4,9 @@
 //! --alter --partitions N` into a PATCH on `KafkaTopic.spec.partitions`
 //! via the installed [`TopicCRWriter`]. The operator then reconciles
 //! the new partition count, creating the new directory entries on the
-//! shared PVC; the broker observes them via its existing
-//! `TopicWatcher` and serves the additional partitions on the next
-//! Metadata request.
+//! shared PVC; the broker observes them via its existing topic
+//! watch (`run_topic_watch`) and serves the additional partitions on
+//! the next Metadata request.
 //!
 //! Authorization: `Operation::Alter` on the topic resource.
 //!

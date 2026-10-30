@@ -62,9 +62,4 @@ impl ConnState {
             session_deadline: None,
         }
     }
-
-    pub fn with_tls(mut self, is_tls: bool) -> Self {
-        self.is_tls = is_tls;
-        self
-    }
 }

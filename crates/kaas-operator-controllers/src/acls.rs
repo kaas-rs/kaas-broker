@@ -14,7 +14,7 @@
 //! the boundary so the public surface stays Strimzi-shape while the
 //! broker side keeps the existing case-sensitive matcher.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use kaas_operator_api::{KafkaUser, KafkaUserAcl};
 use kube::{api::ListParams, Api, Client};
@@ -55,12 +55,6 @@ pub struct AclResource {
     pub kind: String,
     pub name: String,
     pub pattern_type: String,
-}
-
-/// `<cluster_dir>/acls.json`. Takes the cluster-state dir itself
-/// (gh #221 phase 1 — see `credentials_path`).
-pub fn acls_path(cluster_dir: &Path) -> PathBuf {
-    cluster_dir.join("acls.json")
 }
 
 /// List every `KafkaUser` CR in `namespace` and rebuild `acls.json`
@@ -139,20 +133,6 @@ pub fn acl_to_entry(principal: &str, acl: &KafkaUserAcl) -> AclEntry {
     }
 }
 
-/// Read `acls.json` (returns empty `{version: 1, acls: []}` when
-/// the file is absent). Useful for tests + sweep-style assertions.
-pub fn read_acl_file(cluster_dir: &Path) -> Result<AclFile, ControllerError> {
-    let path = acls_path(cluster_dir);
-    match std::fs::read(&path) {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes)?),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AclFile {
-            version: 1,
-            acls: Vec::new(),
-        }),
-        Err(e) => Err(ControllerError::Io(e)),
-    }
-}
-
 /// Atomic write of `acls.json`. Stamps `version = 1`.
 pub fn write_acl_file(cluster_dir: &Path, file: &AclFile) -> Result<(), ControllerError> {
     let cluster_dir = cluster_dir.to_path_buf();
@@ -225,15 +205,8 @@ mod tests {
             }],
         };
         write_acl_file(tmp.path(), &f).unwrap();
-        let back = read_acl_file(tmp.path()).unwrap();
+        let bytes = std::fs::read(tmp.path().join("acls.json")).unwrap();
+        let back: AclFile = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back, f);
-    }
-
-    #[test]
-    fn read_acl_file_absent_returns_empty() {
-        let tmp = tempfile::tempdir().unwrap();
-        let f = read_acl_file(tmp.path()).unwrap();
-        assert_eq!(f.version, 1);
-        assert!(f.acls.is_empty());
     }
 }

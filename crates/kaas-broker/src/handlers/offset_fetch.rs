@@ -12,7 +12,6 @@
 //! behaviour. The cluster path lands when the Manager grows a
 //! `local_offsets(group_id) -> Vec<FetchSpec>` accessor.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -149,9 +148,3 @@ fn empty_topics(
         })
         .collect()
 }
-
-// HashMap import retained so callers can extend with custom maps
-// (mainly for tests). Silences the "unused import" warning under
-// future iterations.
-#[allow(dead_code)]
-fn _silence_unused_hashmap(_h: HashMap<i32, i32>) {}

@@ -1239,7 +1239,7 @@ pub(crate) async fn run_controller(
     // up before the first recompute; the 2 s broker-set watcher
     // still handles stragglers.
     {
-        let want = registry.all().iter().filter(|b| b.ready).count();
+        let want = registry.ready_count();
         let grace_end = tokio::time::Instant::now() + Duration::from_secs(7);
         while heart_srv.connected_brokers().len() < want {
             if leader_token.is_cancelled() || tokio::time::Instant::now() >= grace_end {
@@ -1416,9 +1416,9 @@ impl kaas_observability::GaugeSource for RuntimeGaugeSource {
 
 /// Wire the `TopicRegistry` behind `TopicSource` so the assignment
 /// loop always sees the current-catalog snapshot, not a boot-time
-/// one. Fresh `KafkaTopic` CRs propagate: `TopicWatcher::Apply` →
-/// `TopicRegistry::insert` → `AssignmentLoop` picks it up on the
-/// next tick.
+/// one. Fresh `KafkaTopic` CRs propagate: `run_topic_watch`'s apply
+/// callback → `TopicRegistry::insert` → `AssignmentLoop` picks it up
+/// on the next tick.
 struct LiveTopicSource {
     registry: Arc<TopicRegistry>,
 }

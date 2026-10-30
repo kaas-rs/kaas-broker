@@ -44,8 +44,7 @@ There is **no `Record` struct in kaas** — deliberately. RecordBatch
 payloads flow through the codec as opaque bytes: a zero-copy slice of
 the request frame on the way in, the same bytes off disk on the way out.
 The only code that reads past the fixed v2 batch header is CRC
-verification (CRC32C over opaque input) and a batch-header walker that
-counts records without decoding them.
+verification (CRC32C over opaque input).
 
 Consequences worth internalizing:
 
@@ -87,9 +86,7 @@ Everything wire-level lives in `crates/kaas-codec`:
 - `crates/kaas-codec/src/tagged.rs` — the KIP-482 tagged-field envelope;
   `crates/kaas-codec/src/primitives.rs` — compact strings, arrays, and
   the other wire primitives.
-- `crates/kaas-codec/src/crc.rs` — CRC32C over opaque batch bytes;
-  `crates/kaas-codec/src/recordbatch_count.rs` — the batch-header
-  walker.
+- `crates/kaas-codec/src/crc.rs` — CRC32C over opaque batch bytes.
 - `crates/kaas-codec/src/api/` — one request/response module per API;
   `crates/kaas-codec/src/api/registry.rs` — the `ApiSpec` table that
   drives both the ApiVersions response and the generated matrix.

@@ -22,7 +22,6 @@ pub mod errors;
 pub mod frame;
 pub mod headers;
 pub mod primitives;
-pub mod recordbatch_count;
 pub mod tagged;
 pub mod tripwires;
 

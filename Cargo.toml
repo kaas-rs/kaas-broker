@@ -12,7 +12,6 @@ members = [
     "crates/kaas-observability",
     "crates/kaas-operator-api",
     "crates/kaas-operator-controllers",
-    "crates/kaas-test-harness",
     "bins/kaas",
     "bins/kaas-operator",
     "xtask",
@@ -116,7 +115,6 @@ kaas-k8s                  = { path = "crates/kaas-k8s" }
 kaas-observability        = { path = "crates/kaas-observability" }
 kaas-operator-api         = { path = "crates/kaas-operator-api" }
 kaas-operator-controllers = { path = "crates/kaas-operator-controllers" }
-kaas-test-harness         = { path = "crates/kaas-test-harness" }
 
 [workspace.lints.clippy]
 unwrap_used              = "deny"

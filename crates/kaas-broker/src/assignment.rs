@@ -12,8 +12,6 @@
 //!
 //! [`Coordinator`]: crate::coordinator::Coordinator
 
-use std::path::{Path, PathBuf};
-
 use serde::{Deserialize, Serialize};
 
 /// Health of one broker, as recorded by the controller.
@@ -89,10 +87,6 @@ impl Assignment {
     /// directory layout puts it at
     /// `<data_dir>/__cluster/assignment.json`.
     pub const FILE_NAME: &'static str = "assignment.json";
-
-    pub fn path_in(data_dir: &Path) -> PathBuf {
-        data_dir.join("__cluster").join(Self::FILE_NAME)
-    }
 
     /// `(brokers, alive)` views: the full ordered set of brokers
     /// and a map from broker id → alive (only `Alive` health counts).

@@ -9,14 +9,9 @@
 //! ## Trait + impls
 //!
 //! The trait lives at the top level so handlers can take an
-//! `Arc<dyn TopicCRWriter>` without depending on `kube`. Two impls:
-//!
-//! - [`KubeTopicCRWriter`] (feature `cr-writer`): real kube-backed
-//!   `Patch::Merge` against `Api<KafkaTopic>`.
-//! - [`NoopTopicCRWriter`] (always available): the handler returns
-//!   `Forbidden` so the wire response is
-//!   `CLUSTER_AUTHORIZATION_FAILED` (31). Used in dev mode and
-//!   tests.
+//! `Arc<dyn TopicCRWriter>` without depending on `kube`. The real
+//! impl is [`KubeTopicCRWriter`] (feature `cr-writer`): kube-backed
+//! `Patch::Merge` against `Api<KafkaTopic>`.
 //!
 //! ## Op surface
 //!
@@ -406,56 +401,6 @@ fn is_rfc1123_subdomain(s: &str) -> bool {
                     .chars()
                     .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
         })
-}
-
-/// Dev-mode writer: every operation returns `Forbidden` so the
-/// handler maps to `CLUSTER_AUTHORIZATION_FAILED` (31). The
-/// `bins/kaas` main wires this when `MY_POD_NAME` is unset (no
-/// kube client to dispatch against).
-#[derive(Debug, Default)]
-pub struct NoopTopicCRWriter;
-
-#[async_trait]
-impl TopicCRWriter for NoopTopicCRWriter {
-    async fn create_topic(
-        &self,
-        _name: &str,
-        _num_partitions: i32,
-        _configs: &[(String, String)],
-    ) -> Result<(), TopicWriteError> {
-        Err(TopicWriteError::Forbidden(
-            "broker is not running in cluster mode".into(),
-        ))
-    }
-    async fn expand_topic(&self, _name: &str, _new_count: i32) -> Result<(), TopicWriteError> {
-        Err(TopicWriteError::Forbidden(
-            "broker is not running in cluster mode".into(),
-        ))
-    }
-    async fn update_topic_config(
-        &self,
-        _name: &str,
-        _ops: &[ConfigOpWithValue],
-    ) -> Result<(), TopicWriteError> {
-        Err(TopicWriteError::Forbidden(
-            "broker is not running in cluster mode".into(),
-        ))
-    }
-    async fn delete_topic(&self, _name: &str) -> Result<(), TopicWriteError> {
-        Err(TopicWriteError::Forbidden(
-            "broker is not running in cluster mode".into(),
-        ))
-    }
-    async fn set_partition_log_dir(
-        &self,
-        _name: &str,
-        _partition: i32,
-        _log_dir: &str,
-    ) -> Result<(), TopicWriteError> {
-        Err(TopicWriteError::Forbidden(
-            "broker is not running in cluster mode".into(),
-        ))
-    }
 }
 
 // --- kube-backed impl ------------------------------------------------
@@ -895,24 +840,5 @@ mod tests {
         }])
         .unwrap_err();
         assert!(matches!(err, TopicWriteError::InvalidConfig(_)));
-    }
-
-    #[tokio::test]
-    async fn noop_writer_returns_forbidden() {
-        let w = NoopTopicCRWriter;
-        let err = w.expand_topic("x", 4).await.unwrap_err();
-        assert!(matches!(err, TopicWriteError::Forbidden(_)));
-        let err = w
-            .update_topic_config(
-                "x",
-                &[ConfigOpWithValue {
-                    key: "retention.ms".into(),
-                    kind: ConfigOpKind::Set,
-                    value: Some("1000".into()),
-                }],
-            )
-            .await
-            .unwrap_err();
-        assert!(matches!(err, TopicWriteError::Forbidden(_)));
     }
 }

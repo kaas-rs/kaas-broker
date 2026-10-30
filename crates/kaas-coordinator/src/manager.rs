@@ -571,16 +571,6 @@ pub struct LeaveOutcome {
     pub members: Vec<(String, i16)>,
 }
 
-/// Cleanup helper used by handlers that build `Vec<FetchSpec>` from
-/// a codec request: returns the canonical `topic/partition` string
-/// keyed by the same `offset_key` callers commit with.
-pub fn build_fetch_specs(topics: impl IntoIterator<Item = (String, Vec<i32>)>) -> Vec<FetchSpec> {
-    topics
-        .into_iter()
-        .map(|(topic, partitions)| FetchSpec { topic, partitions })
-        .collect()
-}
-
 /// Compatibility re-export so handler code can build offset_key
 /// strings from `(topic, partition)` without a deep import path.
 pub use crate::offset_store::offset_key as build_offset_key;

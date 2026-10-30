@@ -1,6 +1,6 @@
 # Workspace layout & crate dependency graph
 
-Twelve library crates, two binaries, and an xtask runner — who depends on whom, and why the layering looks the way it does.
+Eleven library crates, two binaries, and an xtask runner — who depends on whom, and why the layering looks the way it does.
 
 The workspace root carries `Cargo.toml`, `rust-toolchain.toml` (pinned
 toolchain, auto-installed by rustup), `proto/` (the heartbeat gRPC schema),
@@ -30,9 +30,8 @@ is a deliberate reading order, following the wire inward:
 ([kaas-auth](kaas-auth.md), [kaas-k8s](kaas-k8s.md),
 [kaas-observability](kaas-observability.md)), the operator pair
 ([kaas-operator-api](kaas-operator-api.md),
-[kaas-operator-controllers](kaas-operator-controllers.md)),
-[kaas-test-harness](kaas-test-harness.md), and finally the two binaries
-that plug every seam together ([kaas](bin-kaas.md) and
+[kaas-operator-controllers](kaas-operator-controllers.md)), and finally
+the two binaries that plug every seam together ([kaas](bin-kaas.md) and
 [kaas-operator](bin-kaas-operator.md)).
 
 ## Crate dependency graph
@@ -95,13 +94,10 @@ flowchart LR
     opctl --> storage
 ```
 
-Two crates are left off the diagram to keep it readable:
-
-- **`kaas-observability`** is depended on by every crate above except
-  `kaas-codec` and `kaas-operator-api` (and by both bins); its own single
-  dependency is `kaas-codec`, for the byte-opacity tripwire counters.
-- **`kaas-test-harness`** depends on nothing in the workspace and nothing
-  depends on it — it is still an empty placeholder crate.
+One crate is left off the diagram to keep it readable:
+**`kaas-observability`** is depended on by every crate above except
+`kaas-codec` and `kaas-operator-api` (and by both bins); its own single
+dependency is `kaas-codec`, for the byte-opacity tripwire counters.
 
 > This graph is hand-maintained (checked against `Cargo.toml` on 2026-08-11).
 > Auto-generating it from `cargo metadata` is a possible future

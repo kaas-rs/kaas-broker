@@ -15,9 +15,8 @@ per API under `src/api/`, and `src/api/registry.rs` — the `ApiSpec` table.
 **The invariant callers must hold**: RecordBatch payloads are byte-opaque.
 There is no `Record` struct in this crate, and none may be added — batch
 bytes travel as `Option<bytes::Bytes>`, and the only code reading past the
-fixed v2 header is CRC verification and the batch-header walker
-(`recordbatch_count.rs`). Any future violation must bump the counters in
-`tripwires.rs`, which tests assert are zero. The full rationale is in
+fixed v2 header is CRC verification (`crc.rs`). Any future violation must
+bump the counters in `tripwires.rs`, which tests assert are zero. The full rationale is in
 [Wire protocol & framing](../compat/wire-protocol.md).
 
 **The registry is load-bearing**: `src/api/registry.rs::ALL` (40 entries,

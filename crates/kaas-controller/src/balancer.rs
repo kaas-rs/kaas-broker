@@ -72,46 +72,6 @@ pub fn rendezvous_hash(topic: &str, partition: i32, broker: &str) -> u64 {
     h.finish()
 }
 
-/// `XXH64(group_id || 0x00 || broker)`. No partition dimension —
-/// groups are single coordinated units.
-pub fn group_hash(group_id: &str, broker: &str) -> u64 {
-    let mut h = twox_hash::XxHash64::with_seed(0);
-    h.write(group_id.as_bytes());
-    h.write(&[0]);
-    h.write(broker.as_bytes());
-    h.finish()
-}
-
-/// Highest-random-weight pick over the broker set for one
-/// `(topic, partition)`.
-pub fn rendezvous_pick(topic: &str, partition: i32, brokers: &[String]) -> Option<String> {
-    let mut best: Option<(u64, &str)> = None;
-    for b in brokers {
-        let h = rendezvous_hash(topic, partition, b);
-        match best {
-            None => best = Some((h, b)),
-            Some((bh, _)) if h > bh => best = Some((h, b)),
-            _ => {}
-        }
-    }
-    best.map(|(_, b)| b.to_owned())
-}
-
-/// Highest-random-weight pick for one `group_id`. Same shape as
-/// [`rendezvous_pick`] with the group-keyed hash.
-pub fn rendezvous_pick_group(group_id: &str, brokers: &[String]) -> Option<String> {
-    let mut best: Option<(u64, &str)> = None;
-    for b in brokers {
-        let h = group_hash(group_id, b);
-        match best {
-            None => best = Some((h, b)),
-            Some((bh, _)) if h > bh => best = Some((h, b)),
-            _ => {}
-        }
-    }
-    best.map(|(_, b)| b.to_owned())
-}
-
 /// Working tuple the smoother mutates in place. Internal.
 #[derive(Debug, Clone)]
 struct PartitionSlot {
@@ -710,21 +670,6 @@ mod tests {
         }];
         let parts = balance(None, &[], &topics, &HashMap::new());
         assert!(parts.is_empty());
-    }
-
-    #[test]
-    fn rendezvous_is_deterministic_for_fixed_inputs() {
-        let b = brokers(3);
-        let a = rendezvous_pick("t1", 0, &b);
-        let b_again = rendezvous_pick("t1", 0, &b);
-        assert_eq!(a, b_again);
-    }
-
-    #[test]
-    fn rendezvous_pick_returns_one_of_the_brokers() {
-        let b = brokers(3);
-        let pick = rendezvous_pick("t1", 0, &b).unwrap();
-        assert!(b.contains(&pick));
     }
 
     #[test]

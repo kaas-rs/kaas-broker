@@ -60,23 +60,12 @@ pub trait RuntimeState: Send + Sync {
     }
 }
 
-/// TLS listener readiness snapshot (populated when an external
-/// listener is bound).
-#[derive(Debug, Clone, Serialize)]
-pub struct TlsInfo {
-    pub enabled: bool,
-    #[serde(rename = "external_host", skip_serializing_if = "String::is_empty")]
-    pub external_host: String,
-}
-
 #[derive(Debug, Serialize)]
 struct HealthState {
     status: &'static str,
     #[serde(skip_serializing_if = "String::is_empty")]
     broker_id: String,
     listeners: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tls: Option<TlsInfo>,
 
     is_controller: bool,
     #[serde(skip_serializing_if = "String::is_empty")]
@@ -121,7 +110,6 @@ fn is_false(v: &bool) -> bool {
 pub struct HealthConfig {
     pub broker_id: String,
     pub listeners: Vec<String>,
-    pub tls: Option<TlsInfo>,
     pub source: Option<Arc<dyn RuntimeState>>,
     /// gh #208: when true, `/readyz` additionally requires partition
     /// takeover to be complete (`source.serving()`). Dev / single-node
@@ -134,7 +122,6 @@ impl std::fmt::Debug for HealthConfig {
         f.debug_struct("HealthConfig")
             .field("broker_id", &self.broker_id)
             .field("listeners", &self.listeners)
-            .field("tls", &self.tls)
             .field(
                 "source",
                 &self.source.as_ref().map(|_| "<dyn RuntimeState>"),
@@ -157,7 +144,6 @@ async fn healthz(State(cfg): State<HealthConfig>) -> impl IntoResponse {
         status: "ok",
         broker_id: cfg.broker_id.clone(),
         listeners: cfg.listeners.clone(),
-        tls: cfg.tls.clone(),
         is_controller: false,
         controller_id: String::new(),
         controller_epoch: 0,
@@ -390,7 +376,6 @@ mod tests {
         let cfg = HealthConfig {
             broker_id: "kaas-0".to_string(),
             listeners: vec!["plain".to_string()],
-            tls: None,
             source: None,
             cluster_mode: false,
         };
@@ -398,7 +383,6 @@ mod tests {
             status: "ok",
             broker_id: cfg.broker_id.clone(),
             listeners: cfg.listeners.clone(),
-            tls: None,
             is_controller: false,
             controller_id: String::new(),
             controller_epoch: 0,
@@ -466,7 +450,6 @@ mod tests {
         HealthConfig {
             broker_id: "kaas-0".to_string(),
             listeners: vec!["plain".to_string()],
-            tls: None,
             source: Some(Arc::new(FakeState { serving })),
             cluster_mode,
         }

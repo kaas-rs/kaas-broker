@@ -1526,7 +1526,6 @@ dependencies = [
 name = "kaas-k8s"
 version = "0.0.0"
 dependencies = [
- "async-trait",
  "chrono",
  "futures",
  "k8s-openapi",
@@ -1672,10 +1671,6 @@ dependencies = [
  "tokio",
  "tracing",
 ]
-
-[[package]]
-name = "kaas-test-harness"
-version = "0.0.0"
 
 [[package]]
 name = "kqueue"

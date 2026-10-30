@@ -36,8 +36,8 @@ use tokio_stream::{Stream, StreamExt};
 use tonic::{Request, Response, Status, Streaming};
 use tracing::debug;
 
-/// Default 1 s ping cadence.
-const DEFAULT_PING_INTERVAL: Duration = Duration::from_secs(1);
+/// 1 s ping cadence.
+const PING_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Per-direction mpsc buffer size. 4 slots is enough for one
 /// `ASSIGNMENT_CHANGED` + a few PINGs in flight. Slow consumers drop their push and pick
@@ -92,7 +92,6 @@ impl std::fmt::Debug for ClientState {
 
 #[derive(Debug)]
 pub struct HeartbeatServer {
-    ping_interval: Duration,
     /// Most-recently-pushed assignment version. Re-sent to fresh
     /// connections so a broker reconnecting catches up immediately.
     pending_version: Mutex<u64>,
@@ -102,22 +101,9 @@ pub struct HeartbeatServer {
 impl HeartbeatServer {
     pub fn new() -> Arc<Self> {
         Arc::new(Self {
-            ping_interval: DEFAULT_PING_INTERVAL,
             pending_version: Mutex::new(0),
             clients: Mutex::new(HashMap::new()),
         })
-    }
-
-    /// Override the ping cadence (test hook).
-    pub fn with_ping_interval(mut self: Arc<Self>, d: Duration) -> Arc<Self> {
-        // Arc::get_mut works only when this Arc is unique. The
-        // typical wiring is `let s = HeartbeatServer::new(); let s
-        // = s.with_ping_interval(...);` immediately after
-        // construction.
-        if let Some(inner) = Arc::get_mut(&mut self) {
-            inner.ping_interval = d;
-        }
-        self
     }
 
     /// Broadcast `ASSIGNMENT_CHANGED(version)` to every connected
@@ -199,16 +185,6 @@ impl HeartbeatServer {
             }
         }
         seen.into_iter().collect()
-    }
-
-    /// Wall-clock (ms since epoch) of the most recent BrokerStatus
-    /// from `broker_id`. `None` when the broker is not currently
-    /// connected.
-    pub fn broker_last_seen(&self, broker_id: &str) -> Option<i64> {
-        self.clients
-            .lock()
-            .get(broker_id)
-            .map(|c| c.lock().last_seen_ms)
     }
 }
 
@@ -313,11 +289,10 @@ impl ControllerHeartbeat for HeartbeatService {
         });
 
         // Send loop — fan in mpsc commands + a periodic PING.
-        let ping_interval = self.0.ping_interval;
         let state_send = state.clone();
         let outbound = async_stream::stream! {
             let mut rx = ReceiverStream::new(rx);
-            let mut tick = tokio::time::interval(ping_interval);
+            let mut tick = tokio::time::interval(PING_INTERVAL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tokio::select! {
@@ -355,7 +330,6 @@ mod tests {
         let s = HeartbeatServer::new();
         assert!(s.connected_brokers().is_empty());
         assert!(s.active_groups().is_empty());
-        assert_eq!(s.broker_last_seen("kaas-0"), None);
     }
 
     #[test]

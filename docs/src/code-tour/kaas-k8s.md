@@ -1,6 +1,6 @@
 # kaas-k8s
 
-Broker-side Kubernetes helpers: peer-endpoint watching, pod identity, the topic watcher, and the partitions-ready readiness gate.
+Broker-side Kubernetes helpers: peer-endpoint watching, pod identity, the topic watch, and the partitions-ready readiness gate.
 
 Every module follows the same two-layer split: a **pure-state core** that
 tests exercise directly, and a **kube-bound pump** (behind the default
@@ -10,8 +10,8 @@ tests exercise directly, and a **kube-bound pump** (behind the default
 the StatefulSet pod name; no kube dependency), `endpoints.rs`
 (`BrokerRegistry` over the headless Service's EndpointSlices — the broker's
 live view of its peers, feeding FindCoordinator and Metadata),
-`topic_watcher.rs` (a pure-state `KafkaTopic` cache + divergence detector),
-`readiness.rs` (the `kaas.rs/PartitionsReady` pod readiness gate),
+`readiness.rs` (the `kaas.rs/PartitionsReady` condition name the readiness
+patch and the chart's `readinessGate` share),
 `kube_watchers.rs` (the pumps: lease watch, endpoint watch, topic watch,
 readiness patching).
 
@@ -23,9 +23,8 @@ incarnation side-map for the stale-dir gate), and the pump takes an
 `on_synced` callback fired on the first completed relist. The delete
 callback closes FDs and purges state immediately (`engine.abandon_topic`,
 gh #219; `purge_topic_offsets`, gh #240) rather than waiting for the
-assignment recompute. What remains **not wired in** is the standalone
-`topic_watcher::TopicWatcher` cache with its `deletionTimestamp`-immediate
-delete events — and Metadata still serves all-zero topic IDs
+assignment recompute. What remains **not wired in** is the TopicID on the
+wire: Metadata still serves all-zero topic IDs
 ([KIP-516](../compat/kip/kip-516.md)).
 
 **The pump is self-healing, and has to be** (gh #202). Two properties, both

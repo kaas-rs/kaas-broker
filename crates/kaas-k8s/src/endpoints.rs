@@ -76,17 +76,11 @@ struct Inner {
     slice_of: HashMap<i32, String>,
 }
 
-/// Callback type fired on every registry change. Receives a fresh
-/// snapshot sorted by `node_id`. Boxed for object safety so the
-/// kube watcher can hand in arbitrary closures.
-pub type OnChangeCallback = Box<dyn Fn(&[BrokerEndpoint]) + Send + Sync + 'static>;
-
 /// Live broker endpoint map. The owning broker always appears at
 /// `self.node_id`; peers come and go with `EndpointSlice` events.
 pub struct BrokerRegistry {
     self_endpoint: BrokerEndpoint,
     dns: DnsConfig,
-    on_change: parking_lot::Mutex<Option<OnChangeCallback>>,
     inner: RwLock<Inner>,
 }
 
@@ -107,27 +101,11 @@ impl BrokerRegistry {
         Self {
             self_endpoint,
             dns,
-            on_change: parking_lot::Mutex::new(None),
             inner: RwLock::new(Inner {
                 brokers,
                 slice_of: HashMap::new(),
             }),
         }
-    }
-
-    /// Register the on-change callback. Replaces any prior
-    /// registration — there's at most one subscriber (the
-    /// dispatcher or the metadata handler).
-    pub fn on_change<F>(&self, f: F)
-    where
-        F: Fn(&[BrokerEndpoint]) + Send + Sync + 'static,
-    {
-        *self.on_change.lock() = Some(Box::new(f));
-    }
-
-    /// Owning broker's endpoint.
-    pub fn self_endpoint(&self) -> BrokerEndpoint {
-        self.self_endpoint.clone()
     }
 
     /// All **registered** endpoints sorted by `node_id`, ready and
@@ -140,11 +118,6 @@ impl BrokerRegistry {
         out
     }
 
-    /// Number of registered brokers (ready + fenced).
-    pub fn count(&self) -> usize {
-        self.inner.read().brokers.len()
-    }
-
     /// Number of registered brokers currently ready to serve.
     pub fn ready_count(&self) -> usize {
         self.inner
@@ -153,16 +126,6 @@ impl BrokerRegistry {
             .values()
             .filter(|b| b.ready)
             .count()
-    }
-
-    /// Manual upsert — used by tests + local-dev binaries that
-    /// don't run the kube watcher.
-    pub fn upsert(&self, endpoint: BrokerEndpoint) {
-        {
-            let mut inner = self.inner.write();
-            inner.brokers.insert(endpoint.node_id, endpoint);
-        }
-        self.fire_on_change();
     }
 
     /// Apply an `Added` / `Modified` `EndpointSlice` event.
@@ -188,77 +151,63 @@ impl BrokerRegistry {
     /// self-sustaining death spiral.)
     pub fn apply_slice(&self, slice: &EndpointSliceData) {
         let port = slice.kafka_port.unwrap_or(self.self_endpoint.port);
-        {
-            let mut inner = self.inner.write();
-            let mut seen: Vec<i32> = Vec::with_capacity(slice.entries.len());
-            for ep in &slice.entries {
-                let Some(ordinal) = parse_ordinal(&ep.hostname) else {
-                    continue;
-                };
-                if ordinal == self.self_endpoint.node_id {
-                    continue;
-                }
-                seen.push(ordinal);
-                // gh #128: advertise the headless-DNS FQDN when
-                // available; fall back to the raw address for
-                // tests / dev where `DnsConfig` is empty.
-                let host = if !self.dns.headless_service.is_empty()
-                    && !self.dns.pod_name_pattern.is_empty()
-                {
+        let mut inner = self.inner.write();
+        let mut seen: Vec<i32> = Vec::with_capacity(slice.entries.len());
+        for ep in &slice.entries {
+            let Some(ordinal) = parse_ordinal(&ep.hostname) else {
+                continue;
+            };
+            if ordinal == self.self_endpoint.node_id {
+                continue;
+            }
+            seen.push(ordinal);
+            // gh #128: advertise the headless-DNS FQDN when
+            // available; fall back to the raw address for
+            // tests / dev where `DnsConfig` is empty.
+            let host =
+                if !self.dns.headless_service.is_empty() && !self.dns.pod_name_pattern.is_empty() {
                     self.dns.fqdn(ordinal)
                 } else {
                     ep.address.clone()
                 };
-                inner.brokers.insert(
-                    ordinal,
-                    BrokerEndpoint {
-                        node_id: ordinal,
-                        host,
-                        port,
-                        ready: ep.ready,
-                    },
-                );
-                inner.slice_of.insert(ordinal, slice.name.clone());
-            }
-            // Deregister ordinals this slice owned but no longer
-            // lists. Scoped by owning slice — see `slice_of`.
-            let dropped: Vec<i32> = inner
-                .slice_of
-                .iter()
-                .filter(|(ordinal, owner)| owner.as_str() == slice.name && !seen.contains(ordinal))
-                .map(|(ordinal, _)| *ordinal)
-                .collect();
-            for ordinal in dropped {
-                inner.brokers.remove(&ordinal);
-                inner.slice_of.remove(&ordinal);
-            }
+            inner.brokers.insert(
+                ordinal,
+                BrokerEndpoint {
+                    node_id: ordinal,
+                    host,
+                    port,
+                    ready: ep.ready,
+                },
+            );
+            inner.slice_of.insert(ordinal, slice.name.clone());
         }
-        self.fire_on_change();
+        // Deregister ordinals this slice owned but no longer
+        // lists. Scoped by owning slice — see `slice_of`.
+        let dropped: Vec<i32> = inner
+            .slice_of
+            .iter()
+            .filter(|(ordinal, owner)| owner.as_str() == slice.name && !seen.contains(ordinal))
+            .map(|(ordinal, _)| *ordinal)
+            .collect();
+        for ordinal in dropped {
+            inner.brokers.remove(&ordinal);
+            inner.slice_of.remove(&ordinal);
+        }
     }
 
     /// Apply a `Deleted` `EndpointSlice` event. Every entry's
     /// ordinal is deregistered — a deleted slice means those
     /// endpoints are gone, not fenced.
     pub fn delete_slice(&self, slice: &EndpointSliceData) {
-        {
-            let mut inner = self.inner.write();
-            for ep in &slice.entries {
-                if let Some(ordinal) = parse_ordinal(&ep.hostname) {
-                    // Same self-pin as apply_slice.
-                    if ordinal != self.self_endpoint.node_id {
-                        inner.brokers.remove(&ordinal);
-                        inner.slice_of.remove(&ordinal);
-                    }
+        let mut inner = self.inner.write();
+        for ep in &slice.entries {
+            if let Some(ordinal) = parse_ordinal(&ep.hostname) {
+                // Same self-pin as apply_slice.
+                if ordinal != self.self_endpoint.node_id {
+                    inner.brokers.remove(&ordinal);
+                    inner.slice_of.remove(&ordinal);
                 }
             }
-        }
-        self.fire_on_change();
-    }
-
-    fn fire_on_change(&self) {
-        let snapshot = self.all();
-        if let Some(cb) = self.on_change.lock().as_ref() {
-            cb(&snapshot);
         }
     }
 }
@@ -308,7 +257,7 @@ mod tests {
     #[test]
     fn fresh_registry_has_self() {
         let r = BrokerRegistry::new(self_ep(), dns());
-        assert_eq!(r.count(), 1);
+        assert_eq!(r.all().len(), 1);
         assert_eq!(r.all()[0], self_ep());
     }
 
@@ -340,11 +289,11 @@ mod tests {
     fn not_ready_entries_are_kept_as_fenced() {
         let r = BrokerRegistry::new(self_ep(), dns());
         r.apply_slice(&slice_with(vec![entry("kaas-1", "10.0.0.5", true)]));
-        assert_eq!((r.count(), r.ready_count()), (2, 2));
+        assert_eq!((r.all().len(), r.ready_count()), (2, 2));
 
         r.apply_slice(&slice_with(vec![entry("kaas-1", "10.0.0.5", false)]));
         assert_eq!(
-            (r.count(), r.ready_count()),
+            (r.all().len(), r.ready_count()),
             (2, 1),
             "still registered, no longer ready"
         );
@@ -356,7 +305,7 @@ mod tests {
 
         // ...and it comes back ready without a re-add.
         r.apply_slice(&slice_with(vec![entry("kaas-1", "10.0.0.5", true)]));
-        assert_eq!((r.count(), r.ready_count()), (2, 2));
+        assert_eq!((r.all().len(), r.ready_count()), (2, 2));
     }
 
     /// The other half of the same contract: an ordinal that vanishes
@@ -370,11 +319,11 @@ mod tests {
             entry("kaas-1", "10.0.0.5", true),
             entry("kaas-2", "10.0.0.6", true),
         ]));
-        assert_eq!(r.count(), 3);
+        assert_eq!(r.all().len(), 3);
 
         // Scale 3 -> 2: kaas-2 leaves the slice entirely.
         r.apply_slice(&slice_with(vec![entry("kaas-1", "10.0.0.5", true)]));
-        assert_eq!(r.count(), 2);
+        assert_eq!(r.all().len(), 2);
         assert!(r.all().iter().all(|e| e.node_id != 2));
     }
 
@@ -393,14 +342,14 @@ mod tests {
             "shard-b",
             vec![entry("kaas-2", "10.0.0.6", true)],
         ));
-        assert_eq!(r.count(), 3);
+        assert_eq!(r.all().len(), 3);
 
         // An unrelated update to shard-a must not touch kaas-2.
         r.apply_slice(&named_slice(
             "shard-a",
             vec![entry("kaas-1", "10.0.0.5", false)],
         ));
-        assert_eq!(r.count(), 3);
+        assert_eq!(r.all().len(), 3);
         assert!(r.all().iter().any(|e| e.node_id == 2 && e.ready));
     }
 
@@ -433,7 +382,7 @@ mod tests {
             address: "10.0.0.5".to_owned(),
             ready: true,
         }]));
-        assert_eq!(r.count(), 1);
+        assert_eq!(r.all().len(), 1);
     }
 
     #[test]
@@ -456,29 +405,6 @@ mod tests {
     }
 
     #[test]
-    fn on_change_fires_with_sorted_snapshot() {
-        let r = BrokerRegistry::new(self_ep(), dns());
-        let observed = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<i32>::new()));
-        let observed_c = observed.clone();
-        r.on_change(move |all| {
-            *observed_c.lock() = all.iter().map(|e| e.node_id).collect();
-        });
-        r.apply_slice(&slice_with(vec![
-            EndpointSliceEntry {
-                hostname: "kaas-2".to_owned(),
-                address: "10.0.0.6".to_owned(),
-                ready: true,
-            },
-            EndpointSliceEntry {
-                hostname: "kaas-1".to_owned(),
-                address: "10.0.0.5".to_owned(),
-                ready: true,
-            },
-        ]));
-        assert_eq!(*observed.lock(), vec![0, 1, 2]);
-    }
-
-    #[test]
     fn unparseable_hostnames_are_skipped() {
         let r = BrokerRegistry::new(self_ep(), dns());
         r.apply_slice(&slice_with(vec![EndpointSliceEntry {
@@ -486,6 +412,6 @@ mod tests {
             address: "10.0.0.7".to_owned(),
             ready: true,
         }]));
-        assert_eq!(r.count(), 1);
+        assert_eq!(r.all().len(), 1);
     }
 }

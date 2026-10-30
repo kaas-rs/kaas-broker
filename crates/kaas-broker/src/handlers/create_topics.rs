@@ -5,8 +5,8 @@
 //! installed [`TopicCRWriter`]. The operator then reconciles the
 //! CR, creating the topic's on-disk partition directories on the
 //! shared PVC; the broker observes the new KafkaTopic via its
-//! existing `TopicWatcher` and serves Produce/Fetch against it on
-//! subsequent requests.
+//! existing topic watch (`run_topic_watch`) and serves Produce/Fetch
+//! against it on subsequent requests.
 //!
 //! Authorization: `Operation::Create` on the topic resource.
 //!

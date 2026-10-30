@@ -29,7 +29,7 @@ pub use byteopacity::{bump_codec_batch_reencode, bump_codec_record_decode};
 pub use gauges::{set_gauge_source, GaugeSource, LogDirCapacityGauge, PartitionGauge};
 pub use health::{
     health_router, is_draining, main_alive, mark_draining, ready, record_main_tick, set_ready,
-    RuntimeState, TlsInfo,
+    RuntimeState,
 };
 pub use k8s_api::record_k8s_call;
 pub use metrics::{global, new_metrics, set_global, Metrics};

@@ -45,10 +45,9 @@ pub use coordinator::{
     is_serving, partition_key, Coordinator, HeartbeatSource, LeaseEpochSource, LocalHeartbeat,
     LocalLeaseEpoch,
 };
-pub use fence_watcher::{FenceWatcher, ProducerEpochFencer, DEFAULT_POLL as FENCE_POLL_DEFAULT};
+pub use fence_watcher::{FenceWatcher, ProducerEpochFencer};
 pub use group_hash::{
-    coordinator_slot, group_coordinator_slot, pick_coordinator, pick_group_coordinator,
-    pick_txn_coordinator, txn_coordinator_slot,
+    coordinator_slot, pick_coordinator, pick_group_coordinator, pick_txn_coordinator,
 };
 pub use group_takeover::GroupTakeoverDriver;
 pub use handlers::{
@@ -66,9 +65,7 @@ pub use handlers::{
 };
 pub use heartbeat_client::{CommandHandler, HeartbeatClient, TargetResolver};
 pub use local_lease::LocalLeaseManager;
-pub use marker_watcher::{
-    ApplyOutcome, MarkerApplier, MarkerWatcher, DEFAULT_POLL as MARKER_POLL_DEFAULT,
-};
+pub use marker_watcher::{ApplyOutcome, MarkerApplier, MarkerWatcher};
 pub use producer_id::{ProducerIdAllocator, PID_BLOCK, PID_STRIDE, PRODUCER_ID_DIR};
 pub use self_fence::{is_heartbeat_fresh, DEFAULT_HEARTBEAT_TIMEOUT};
 pub use takeover::TakeoverDriver;
@@ -76,7 +73,7 @@ pub use takeover::TakeoverDriver;
 pub use topic_cr_writer::KubeTopicCRWriter;
 pub use topic_cr_writer::{
     config_key_to_json_field, config_value_to_json, ConfigOp, ConfigOpKind, ConfigOpWithValue,
-    NoopTopicCRWriter, TopicCRWriter, TopicWriteError,
+    TopicCRWriter, TopicWriteError,
 };
 pub use topic_registry::{ConfigError as TopicConfigError, TopicMeta, TopicRegistry};
 #[cfg(feature = "cr-writer")]

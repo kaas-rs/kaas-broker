@@ -144,13 +144,6 @@ impl Dispatcher {
         self.slots[idx] = Some(HandlerSlot { handler, min, max });
     }
 
-    pub fn is_registered(&self, api_key: i16) -> bool {
-        usize::try_from(api_key)
-            .ok()
-            .and_then(|i| self.slots.get(i))
-            .is_some_and(Option::is_some)
-    }
-
     /// Dispatch one request. Always returns `(body, header_version)` —
     /// errors land in the body as a wire error_code (the
     /// error-response pattern). Truly fatal conditions (panic, etc.)
@@ -376,14 +369,5 @@ mod tests {
         let (body, _) = d.dispatch(&conn(), header(18, 99), Bytes::new()).await;
         // Echoed version is the clamped max (4).
         assert_eq!(&body[..2], &4i16.to_be_bytes());
-    }
-
-    #[tokio::test]
-    async fn is_registered_reports_membership() {
-        let mut d = Dispatcher::new();
-        d.register(0, 3, 9, Arc::new(EchoHandler));
-        assert!(d.is_registered(0));
-        assert!(!d.is_registered(1));
-        assert!(!d.is_registered(-1));
     }
 }
