@@ -45,7 +45,7 @@ cargo xtask docs                                         # mdbook build docs (--
 - `docker` — buildx of `bins/kaas/Dockerfile` and `bins/kaas-operator/Dockerfile`, no push.
 - `helm` — `helm lint deploy/helm/kaas` + `helm template`.
 
-`.github/workflows/docker-publish.yml` is tag-triggered: it builds the broker + operator images from `bins/*/Dockerfile`, pushes them to `ghcr.io/kaas-rs/kaas-broker[-preview]` / `kaas-broker-operator[-preview]`, and pushes the Helm chart to `oci://ghcr.io/kaas-rs/charts/kaas-broker`.
+`.github/workflows/docker-publish.yml` is tag-triggered: it builds the broker + operator images from `bins/*/Dockerfile`, pushes them to `ghcr.io/kaas-rs/kaas-broker[-preview]` / `kaas-broker-operator[-preview]`, pushes the Helm chart to `oci://ghcr.io/kaas-rs/charts/kaas-broker`, then creates the GitHub Release — titled and described from the **annotated tag message** (a lightweight tag falls back to the commit message), so write the tag message as release notes.
 
 **CRD drift** — if you edit anything under `crates/kaas-operator-api/`, run `cargo xtask gen-crds` and commit both `deploy/crds/` and `deploy/helm/kaas/crds/`. The `rust` CI job fails on drift.
 

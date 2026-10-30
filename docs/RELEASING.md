@@ -2,7 +2,8 @@
 
 Releases are tag-driven. Pushing a semver tag to `main` triggers the
 `release` workflow (`.github/workflows/docker-publish.yml`), which builds and
-publishes the broker image, the operator image, and the Helm chart to GHCR.
+publishes the broker image, the operator image, and the Helm chart to GHCR,
+then creates the matching GitHub Release.
 
 Every `v*` tag builds the broker and operator from `bins/*/Dockerfile`
 and publishes to `kaas-broker[-preview]` / `kaas-broker-operator[-preview]`. The
@@ -88,6 +89,14 @@ Pre-release tags (`v*-*`) publish to:
 Stable tags (no pre-release suffix) publish to the un-suffixed names
 (`kaas-broker`, `kaas-broker-operator`). No stable tag has been cut yet.
 
+Once all three are pushed, the workflow creates a **GitHub Release** for the
+tag (marked pre-release for `v*-*` tags). Its title and notes come from the
+**tag message**: the first line is the title (a leading `vX.Y.Z-preview:` or
+`vX.Y.Z-preview —` is stripped, the tag name is prepended), the rest is the
+notes, and an artifact list is appended. A lightweight tag falls back to the
+tagged commit's message, so use an annotated tag. A tag that already has a
+Release is left alone, so re-running the workflow is safe.
+
 Images are built `linux/amd64` only.
 
 ## Cutting a release
@@ -98,9 +107,14 @@ Images are built `linux/amd64` only.
    git tag -l 'v*' | sort -V | tail -n1
    ```
    Bump the patch (`v0.1.3-preview` → `v0.1.4-preview`).
-3. Tag the tip of `main` and push the tag:
+3. Tag the tip of `main` with an annotated tag and push it. The message
+   becomes the GitHub Release: a short first line, then what changed and
+   whether CRDs changed (in-place roll vs. fresh deploy, see the policy
+   above).
    ```bash
-   git tag v0.1.4-preview
+   git tag -a v0.1.4-preview -m "v0.1.4-preview: <one-line headline>
+
+   <what changed>. CRDs unchanged, so it rolls in place from v0.1.3-preview."
    git push origin v0.1.4-preview
    ```
    The release workflow runs automatically on the tag push; no manual
@@ -112,6 +126,8 @@ Images are built `linux/amd64` only.
    # images (any registry-aware tool works)
    docker buildx imagetools inspect \
      ghcr.io/kaas-rs/kaas-broker-preview:0.1.4-preview
+   # GitHub Release
+   gh release view v0.1.4-preview
    ```
 
 The `Chart.yaml` `version`/`appVersion` fields are overridden by the CI
@@ -130,6 +146,7 @@ fix; do not delete or move the broken tag.
   defined in the `k3s-cluster` repo under `apps/arc-runners`). It needs the
   DinD sidecar for `docker buildx`.
 - Image and chart pushes use the workflow's `GITHUB_TOKEN` with
-  `packages: write`; no PATs required.
+  `packages: write`, and the GitHub Release step uses it with
+  `contents: write`; no PATs required.
 - Cosign signing was removed (commits `54bcf9e`, `60e1810`); released
   artifacts are not signed today.

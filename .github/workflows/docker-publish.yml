@@ -17,7 +17,7 @@ jobs:
     runs-on: arc-runner-set
     environment: release
     permissions:
-      contents: read
+      contents: write   # the GitHub Release created by the last step
       packages: write
     env:
       # docker/build-push-action@v7 uploads buildx "build records" as Actions
@@ -109,3 +109,79 @@ jobs:
             -p "${{ secrets.GITHUB_TOKEN }}"
           helm push "kaas-broker-${CHART_VERSION}.tgz" \
             "oci://ghcr.io/${OWNER}/charts"
+
+      # Last, so a Release only appears once every artifact it lists is
+      # published. Title + notes come from the tag message (the commit
+      # message for a lightweight tag), read over the API rather than from
+      # the checkout: actions/checkout fetches a tag as lightweight, which
+      # drops the annotation. Skips a tag that already has a Release, so a
+      # re-run doesn't fail.
+      - name: Create GitHub Release
+        uses: actions/github-script@v9
+        env:
+          BROKER_IMAGE: ${{ steps.names.outputs.broker_image }}:${{ steps.names.outputs.image_tag }}
+          OPERATOR_IMAGE: ${{ steps.names.outputs.operator_image }}:${{ steps.names.outputs.image_tag }}
+          CHART: oci://ghcr.io/${{ steps.names.outputs.owner }}/charts/kaas-broker
+          CHART_VERSION: ${{ steps.names.outputs.image_tag }}
+        with:
+          script: |
+            const tag = context.ref.replace(/^refs\/tags\//, '');
+            const { owner, repo } = context.repo;
+            try {
+              await github.rest.repos.getReleaseByTag({ owner, repo, tag });
+              core.info(`${tag} already has a Release; nothing to do`);
+              return;
+            } catch (e) {
+              if (e.status !== 404) throw e;
+            }
+
+            const { data: ref } = await github.rest.git.getRef({ owner, repo, ref: `tags/${tag}` });
+            const { data: obj } = ref.object.type === 'tag'
+              ? await github.rest.git.getTag({ owner, repo, tag_sha: ref.object.sha })
+              : await github.rest.git.getCommit({ owner, repo, commit_sha: ref.object.sha });
+            const [first, ...rest] = obj.message.replace(/\r/g, '').trim().split('\n');
+
+            // "v1.2.3: foo", "v1.2.3 — foo", "kaas v1.2.3 - foo" → "foo".
+            const esc = tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const subject = first.replace(new RegExp(`^(kaas )?${esc}\\s*[:—-]?\\s*`), '').trim();
+
+            // GitHub renders a single newline as a line break, so re-join
+            // hard-wrapped paragraphs and list items; headings, quotes,
+            // tables, indented and fenced blocks keep their lines.
+            const own = /^(\s|[-*+>#|`]|\d+[.)]\s)/;   // starts its own line
+            const ends = /^([#|`])/;                    // nothing joins onto it
+            const item = /^\s*([-*+]|\d+[.)])\s/;       // list item
+            const out = [];
+            let fenced = false;
+            for (const line of rest) {
+              if (/^(Co-Authored-By|Signed-off-by):/i.test(line)) continue;
+              if (line.startsWith('```')) fenced = !fenced;
+              const prev = out.length ? out[out.length - 1] : '';
+              if (!fenced && /^\s+\S/.test(line) && item.test(prev) && !item.test(line)) {
+                out[out.length - 1] = `${prev} ${line.trim()}`;
+              } else if (!fenced && line.trim() && prev.trim() && !own.test(line) && !ends.test(prev)) {
+                out[out.length - 1] = `${prev} ${line}`;
+              } else {
+                out.push(line);
+              }
+            }
+            const notes = out.join('\n').trim();
+
+            const env = process.env;
+            const artifacts = [
+              '**Artifacts**',
+              '',
+              `- \`${env.BROKER_IMAGE}\``,
+              `- \`${env.OPERATOR_IMAGE}\``,
+              `- \`${env.CHART}\` version \`${env.CHART_VERSION}\``,
+            ].join('\n');
+
+            const { data: rel } = await github.rest.repos.createRelease({
+              owner,
+              repo,
+              tag_name: tag,
+              name: subject ? `${tag} — ${subject}` : tag,
+              body: notes ? `${notes}\n\n${artifacts}` : artifacts,
+              prerelease: tag.includes('-'),
+            });
+            core.info(`created ${rel.html_url}`);

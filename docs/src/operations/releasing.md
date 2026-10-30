@@ -15,6 +15,9 @@ artifacts to GHCR:
 - the operator image — `ghcr.io/kaas-rs/kaas-broker-operator[-preview]`
 - the Helm chart — `oci://ghcr.io/kaas-rs/charts/kaas-broker`
 
+and then creates the tag's GitHub Release, titled and described from the
+annotated tag message.
+
 Pre-release tags (anything containing `-`, like `v0.3.1-preview`) get the
 `-preview` image-name suffix automatically; the chart's image helpers
 derive the same suffix from the tag, so the chart default always points at
