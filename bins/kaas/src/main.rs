@@ -178,17 +178,14 @@ async fn main() -> Result<()> {
 
     let cli = Cli::from_env().context("parsing KAAS_* env")?;
 
-    // Bring up OTel BEFORE the first tracing event so the OTel layer
-    // sees every subsequent span. Bootstrap installs the global
-    // MeterProvider + TracerProvider and populates the Metrics
-    // registry; install_tracing then routes tracing macros through
-    // the freshly-built tracer.
+    // Logs first, so bootstrap's own line ("observability:
+    // initialised") is not dropped for want of a subscriber.
+    let log_format = std::env::var("KAAS_LOG_FORMAT").unwrap_or_else(|_| "json".into());
+    kaas_observability::install_tracing(&cli.log_level, &log_format);
     let obs_cancel = CancellationToken::new();
     let providers = kaas_observability::bootstrap("kaas", obs_cancel.clone())
         .await
         .context("initialising observability")?;
-    let log_format = std::env::var("KAAS_LOG_FORMAT").unwrap_or_else(|_| "json".into());
-    kaas_observability::install_tracing(&cli.log_level, &log_format, providers.tracer.clone());
 
     info!(
         broker_id = cli.broker_id,
@@ -726,8 +723,8 @@ async fn main() -> Result<()> {
         warn!(%err, "engine drain reported error");
     }
 
-    // Flush pending OTLP pushes + span exports before the process
-    // dies. Best-effort — errors go to stderr but don't fail exit.
+    // Flush pending OTLP pushes before the process dies.
+    // Best-effort — errors go to stderr but don't fail exit.
     if let Err(err) = providers.shutdown() {
         warn!(%err, "observability shutdown reported error");
     }

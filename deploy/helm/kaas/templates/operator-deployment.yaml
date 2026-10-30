@@ -46,14 +46,6 @@ spec:
             - name: KAAS_METRIC_EXPORT_INTERVAL
               value: {{ .Values.observability.otlp.metrics.exportInterval | quote }}
             {{- end }}
-            {{- if .Values.observability.otlp.traces.enabled }}
-            - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: {{ .Values.observability.otlp.traces.endpoint | quote }}
-            {{- /* OTEL_EXPORTER_OTLP_INSECURE was dropped (gh #257):
-                 plaintext vs TLS is inferred from the URI scheme. */}}
-            - name: OTEL_TRACES_SAMPLER_ARG
-              value: "{{ .Values.observability.otlp.traces.samplerRatio }}"
-            {{- end }}
           ports:
             - name: metrics
               containerPort: 8080

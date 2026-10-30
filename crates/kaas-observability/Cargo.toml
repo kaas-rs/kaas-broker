@@ -6,7 +6,7 @@ license.workspace      = true
 repository.workspace   = true
 rust-version.workspace = true
 publish      = false
-description  = "OTLP metrics + tracing, /healthz, tripwires."
+description  = "OTLP metrics, log setup, /healthz, tripwires."
 
 [lints]
 workspace = true
@@ -26,7 +26,6 @@ anyhow                = { workspace = true }
 kaas-codec              = { workspace = true }
 tracing               = { workspace = true }
 tracing-subscriber    = { workspace = true }
-tracing-opentelemetry = { workspace = true }
 opentelemetry         = { workspace = true }
 opentelemetry-otlp    = { workspace = true }
 opentelemetry_sdk     = { workspace = true }

@@ -15,8 +15,8 @@
 //! - `KAAS_LOG_FORMAT`          — `json` or `text`
 //! - `METRICS_BIND_ADDRESS`       — `:8080` (axum metrics endpoint)
 //! - `HEALTH_PROBE_BIND_ADDRESS`  — `:8081` (healthz / readyz)
-//! - `OTEL_EXPORTER_OTLP_*`       — picked up by the OTel SDK via
-//!   `kaas_observability::bootstrap` (Phase 8).
+//! - `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_RESOURCE_ATTRIBUTES`,
+//!   `OTEL_SERVICE_NAME` — read by `kaas_observability::bootstrap`.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,11 +69,11 @@ async fn main() -> Result<()> {
     let log_level = env_or("KAAS_LOG_LEVEL", DEFAULT_LOG_LEVEL);
     let log_format = env_or("KAAS_LOG_FORMAT", DEFAULT_LOG_FORMAT);
 
+    kaas_observability::install_tracing(&log_level, &log_format);
     let obs_cancel = CancellationToken::new();
     let providers = kaas_observability::bootstrap("kaas-operator", obs_cancel.clone())
         .await
         .context("initialising observability")?;
-    kaas_observability::install_tracing(&log_level, &log_format, providers.tracer.clone());
 
     let data_dir = PathBuf::from(env_or("KAAS_DATA_DIR", DEFAULT_DATA_DIR));
     // gh #221 phase 1: cluster-wide state (credentials.json,

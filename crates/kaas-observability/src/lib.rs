@@ -1,9 +1,10 @@
-//! kaas-observability — OTLP metrics + tracing, /healthz, tripwires.
+//! kaas-observability — OTLP metrics, log setup, /healthz, tripwires.
 //!
 //! Central registry for every
 //! OTel instrument kaas emits; `bootstrap` wires OTLP push (metrics)
-//! and OTLP gRPC (traces) against the endpoints exposed by the chart via
-//! the standard `OTEL_EXPORTER_OTLP_*` env vars.
+//! against the endpoint the chart exposes via
+//! `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`. kaas exports no traces
+//! (gh #269).
 //!
 //! The `Metrics` struct is Arc-shared; call sites reach for it via
 //! [`metrics::global()`]. Before [`bootstrap`] runs, `global()` returns
@@ -36,17 +37,12 @@ pub use metrics::{global, new_metrics, set_global, Metrics};
 pub use topic_traffic::TopicTrafficMeter;
 pub use tracing::install_tracing;
 
-/// Errors returned by [`bootstrap`]. Anything downstream (metric
-/// exporter build failure, tracer build failure) folds into this
-/// enum — call sites in `bins/*` propagate via `anyhow`.
+/// Errors returned by [`bootstrap`] and [`Providers::shutdown`]. Call
+/// sites in `bins/*` propagate via `anyhow`.
 #[derive(Debug, thiserror::Error)]
 pub enum ObservabilityError {
     #[error("otlp metric exporter: {0}")]
     MetricExporter(String),
-    #[error("otlp trace exporter: {0}")]
-    TraceExporter(String),
     #[error("meter provider shutdown: {0}")]
     MeterShutdown(String),
-    #[error("tracer provider shutdown: {0}")]
-    TracerShutdown(String),
 }

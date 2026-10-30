@@ -321,9 +321,9 @@ autoscaling:
   targetConsumerLagMessages: 100000
 
 observability:
-  # OTLP push exporters. Each signal is gated independently — metrics push to
-  # Prometheus's native OTLP/HTTP receiver; traces push to an OTel Collector
-  # over OTLP/gRPC.
+  # OTLP push exporter. Metrics push to Prometheus's native OTLP/HTTP
+  # receiver. kaas exports no traces (gh #269): the old `traces` block wired
+  # an exporter that never had a span to send, so it was removed.
   otlp:
     metrics:
       enabled: false
@@ -338,18 +338,6 @@ observability:
       # decrease (e.g. "15s") for higher-resolution dashboards.
       # Accepts duration strings like "15s", "1m".
       exportInterval: "30s"
-    traces:
-      enabled: false
-      # host:port (gRPC); a scheme prefix is stripped automatically.
-      # Default targets a Tempo deployment at observability/tempo:4317.
-      # Switch to "otel-collector.observability.svc.cluster.local:4317"
-      # if you front Tempo with the OTel Collector.
-      endpoint: "tempo.observability.svc.cluster.local:4317"
-      # (gh #257: the old `insecure` toggle was dropped — the exporter
-      # infers plaintext vs TLS from the endpoint's URI scheme.)
-      # 0.0 = off; 1.0 = every trace. Production default 0.1; bump to
-      # 1.0 in dev / when actively debugging.
-      samplerRatio: 0.1
 
   logs:
     level: info        # debug|info|warn|error

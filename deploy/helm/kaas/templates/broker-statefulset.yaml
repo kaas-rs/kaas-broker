@@ -235,15 +235,6 @@ spec:
             - name: KAAS_METRIC_EXPORT_INTERVAL
               value: {{ .Values.observability.otlp.metrics.exportInterval | quote }}
             {{- end }}
-            {{- if .Values.observability.otlp.traces.enabled }}
-            - name: OTEL_EXPORTER_OTLP_ENDPOINT
-              value: {{ .Values.observability.otlp.traces.endpoint | quote }}
-            {{- /* OTEL_EXPORTER_OTLP_INSECURE was dropped (gh #257):
-                 the Rust exporter infers plaintext from the endpoint's
-                 URI scheme (http:// vs https://); the env was unread. */}}
-            - name: OTEL_TRACES_SAMPLER_ARG
-              value: "{{ .Values.observability.otlp.traces.samplerRatio }}"
-            {{- end }}
             {{- if .Values.admin.argocd.enabled }}
             - name: KAAS_ARGOCD_ENABLED
               # Explicit enable flag — the broker checks this first

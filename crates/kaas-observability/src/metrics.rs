@@ -42,7 +42,8 @@ pub struct Metrics {
     pub topic_traffic: Arc<TopicTrafficMeter>,
 
     /// Per-request handler latency histogram. Topic label intentionally
-    /// omitted to cap cardinality; topic lives in traces instead.
+    /// omitted to cap cardinality; per-topic volume is in
+    /// [`Self::topic_traffic`].
     pub request_latency: Histogram<f64>,
 
     // Storage.

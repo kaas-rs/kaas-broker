@@ -163,9 +163,6 @@ Details and the reasoning: [Kubernetes integration](../architecture/kubernetes.m
 | `otlp.metrics.enabled` | `false` | Push metrics (OTLP/HTTP) to Prometheus's native OTLP receiver (`--web.enable-otlp-receiver`). |
 | `otlp.metrics.endpoint` | `http://prometheus.observability...:9090/api/v1/otlp/v1/metrics` | Path must end in `/v1/metrics`. |
 | `otlp.metrics.exportInterval` | `"30s"` | Push cadence. The SDK's 60 s default leaves Grafana `rate([1m])` panels with one sample per window; 30 s guarantees two. Duration strings accepted. |
-| `otlp.traces.enabled` | `false` | Push traces (OTLP/gRPC) to Tempo or a Collector. |
-| `otlp.traces.endpoint` | `tempo.observability...:4317` | `host:port`; a scheme prefix is stripped, and plaintext-vs-TLS is inferred from it. |
-| `otlp.traces.samplerRatio` | `0.1` | `1.0` = every trace (dev/debugging). |
 | `logs.level` / `logs.format` | `info` / `json` | `debug…error`; `json` or `text`. |
 | `alerts.enabled` | `false` | Render a PrometheusRule with the load-bearing kaas alerts (byte-opacity tripwires, self-fence, stale assignments…). Needs Prometheus Operator. |
 | `alerts.additionalLabels` | `{}` | Merged into every rule (Alertmanager routing). |

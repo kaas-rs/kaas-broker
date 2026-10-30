@@ -1,12 +1,12 @@
 # Observability
 
-OTLP metrics and tracing pushed to Prometheus, and the `/healthz` endpoint's rich runtime state.
+OTLP metrics pushed to Prometheus, structured logs, and the `/healthz` endpoint's rich runtime state.
 
 Apache Kafka exposes its metrics as JMX MBeans, and most deployments
 bolt a Prometheus JMX exporter onto every broker to scrape them. kaas
-is OpenTelemetry-native instead: brokers **push** OTLP metrics straight
-to Prometheus's native OTLP receiver, emit OTel spans, and correlate
-every log line with the active trace — no sidecar, no exporter agent.
+pushes its metrics over OTLP instead: brokers send them straight to
+Prometheus's native OTLP receiver, with no sidecar and no exporter
+agent. kaas exports no traces; see [Logs and traces](#logs-and-traces).
 
 ## Bootstrap: push-mode OTLP
 
@@ -17,7 +17,6 @@ Helm chart):
   OTLP/HTTP (http/protobuf) to Prometheus's native OTLP receiver
   (`/api/v1/otlp/v1/metrics`). Prometheus speaks only http/protobuf on
   that path — exporting gRPC just gets an h2 GoAway.
-- `OTEL_EXPORTER_OTLP_ENDPOINT` — traces via OTLP/gRPC.
 - `KAAS_METRIC_EXPORT_INTERVAL` — a duration string (`30s`, `1m`);
   default `30s`. The SDK default of 60 s made `rate([1m])` panels see a
   single sample and gap.
@@ -31,10 +30,8 @@ Helm chart):
   identity above comes from the downward API and is what per-broker
   dashboards key on, so a conflicting `k8s.pod.name` or
   `service.instance.id` in `OTEL_RESOURCE_ATTRIBUTES` is overridden.
-- `OTEL_TRACES_SAMPLER_ARG` — trace sampling ratio in `[0, 1]`, default
-  0.1.
 
-With neither endpoint set the SDK still runs and exports go nowhere —
+With no endpoint set the SDK still runs and exports go nowhere —
 safe for tests and local dev. Before bootstrap runs, the global metrics
 handle is a no-op registry, so pre-boot code and tests can record
 without nil checks.
@@ -92,15 +89,20 @@ and the `KaasByteOpacityViolated` alert fires on non-zero.
 As of today no kaas code path calls these functions; the counters exist
 so the *first* violation is an alert, not an archaeology project.
 
-## Tracing
+## Logs and traces
 
-One global tracing stack is installed at boot: a filter honouring
-`KAAS_LOG_LEVEL`, a log formatter honouring `KAAS_LOG_FORMAT` (`json`
-or text), and an OTel layer that emits every span through the tracer
-from bootstrap. The correlation contract: every log line carries
-`trace_id` + `span_id` whenever a span is active, so a log grep pivots
-straight into the trace view. Span sampling defaults to 10% — set
-`OTEL_TRACES_SAMPLER_ARG=1.0` for a debugging session.
+One log subscriber is installed at boot: a filter honouring
+`KAAS_LOG_LEVEL` (the broker also honours `RUST_LOG`, which wins) and a
+formatter honouring `KAAS_LOG_FORMAT` (`json` or text). Logs go to
+stdout, for whatever node log collector the cluster runs.
+
+kaas exports no traces. Earlier releases wired an OTLP/gRPC span
+exporter and a sampler, but no code path ever opened a span, so they
+sent nothing; the pipeline and the chart's `observability.otlp.traces.*`
+values were removed (gh #269). Log lines carry no `trace_id` or
+`span_id` for the same reason. If request spans are added later, the
+OTLP exporter is backend-neutral, so they would not tie kaas to any one
+tracing backend.
 
 ## Implementation notes (for contributors)
 
@@ -108,7 +110,7 @@ straight into the trace view. Span sampling defaults to 10% — set
   (OTel SDK bring-up), `health.rs` (the axum `/healthz`/`/readyz`
   surface; the JSON view is the `RuntimeState` trait), `byteopacity.rs`
   (tripwire counters), `tracing.rs` (`install_tracing`, the
-  `tracing-subscriber` stack).
+  `tracing-subscriber` log stack).
 - Codec-side tripwire counterparts:
   `crates/kaas-codec/src/tripwires.rs`; CI assertion:
   `bins/kaas/tests/byte_opacity.rs`.

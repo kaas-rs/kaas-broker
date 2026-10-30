@@ -6,7 +6,6 @@
 //!   OTLP/HTTP (http/protobuf). Prometheus's native OTLP receiver
 //!   (`/api/v1/otlp/v1/metrics`) speaks only http/protobuf; exporting gRPC
 //!   here just gets an h2 GoAway from Prometheus.
-//! * `OTEL_EXPORTER_OTLP_ENDPOINT` — if set, push traces via OTLP/gRPC.
 //! * `KAAS_METRIC_EXPORT_INTERVAL` — duration string (`30s` etc.).
 //!   Default `30s` per gh #133 (SDK default is 60s → `rate([1m])`
 //!   panels see one sample and gap).
@@ -16,22 +15,23 @@
 //! * `OTEL_SERVICE_VERSION`, `MY_POD_NAME`, `KAAS_NAMESPACE` — folded
 //!   into resource attributes so Grafana can filter by broker /
 //!   namespace.
-//! * `OTEL_TRACES_SAMPLER_ARG` — float in [0, 1]; default `0.1`.
 //!
-//! With neither OTLP endpoint set the SDK still runs but every export
+//! kaas exports no traces (gh #269). It used to wire a span exporter
+//! and a sampler, but no code ever opened a span, so they shipped
+//! nothing.
+//!
+//! With no metrics endpoint set the SDK still runs but every export
 //! goes nowhere — safe for tests + local runs.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use opentelemetry::global;
-use opentelemetry::trace::TracerProvider as _;
 use opentelemetry::{Key, KeyValue};
-use opentelemetry_otlp::{MetricExporter, SpanExporter, WithExportConfig};
+use opentelemetry_otlp::{MetricExporter, WithExportConfig};
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::resource::{EnvResourceDetector, TelemetryResourceDetector};
 use opentelemetry_sdk::runtime;
-use opentelemetry_sdk::trace::{BatchSpanProcessor, Sampler, Tracer as SdkTracer, TracerProvider};
 use opentelemetry_sdk::Resource;
 use tokio_util::sync::CancellationToken;
 
@@ -40,51 +40,24 @@ use crate::metrics::{new_metrics, set_global, Metrics};
 use crate::otlp_push_observer::ObservedExporter;
 use crate::ObservabilityError;
 
-/// Handle to the initialised OTel SDK. Shutdown is idempotent-ish;
-/// calling twice is a no-op the second time.
+/// Handle to the initialised OTel SDK.
+#[derive(Debug)]
 pub struct Providers {
     pub meter_provider: SdkMeterProvider,
-    pub tracer_provider: Option<TracerProvider>,
     pub metrics: Arc<Metrics>,
-    pub tracer: SdkTracer,
     _cancel: CancellationToken,
 }
 
-impl std::fmt::Debug for Providers {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Providers")
-            .field("meter_provider", &self.meter_provider)
-            .field("has_tracer_provider", &self.tracer_provider.is_some())
-            .finish()
-    }
-}
-
 impl Providers {
-    /// Force-flush + shut down both providers with a per-call timeout.
-    /// Collects errors but continues — don't bail on the first failure.
+    /// Flush the last metric export and shut the meter provider down.
     pub fn shutdown(self) -> Result<(), ObservabilityError> {
-        let mut first_err = None;
-        if let Err(e) = self.meter_provider.shutdown() {
-            first_err.get_or_insert(ObservabilityError::MeterShutdown(e.to_string()));
-        }
-        if let Some(tp) = self.tracer_provider {
-            for res in tp.force_flush() {
-                if let Err(e) = res {
-                    first_err.get_or_insert(ObservabilityError::TracerShutdown(e.to_string()));
-                }
-            }
-            if let Err(e) = tp.shutdown() {
-                first_err.get_or_insert(ObservabilityError::TracerShutdown(e.to_string()));
-            }
-        }
-        match first_err {
-            Some(e) => Err(e),
-            None => Ok(()),
-        }
+        self.meter_provider
+            .shutdown()
+            .map_err(|e| ObservabilityError::MeterShutdown(e.to_string()))
     }
 }
 
-/// Set up the meter + tracer providers, install the global `Metrics`
+/// Set up the meter provider, install the global `Metrics`
 /// registry, and register the runtime gauges. Idempotent w.r.t. the
 /// OTel globals — safe to call once per process; subsequent calls
 /// stomp the previous provider.
@@ -98,7 +71,7 @@ pub async fn bootstrap(
     let resource = build_resource(service);
 
     // --- Meter provider ---
-    let mut mp_builder = SdkMeterProvider::builder().with_resource(resource.clone());
+    let mut mp_builder = SdkMeterProvider::builder().with_resource(resource);
     if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT") {
         if !endpoint.is_empty() {
             let raw = MetricExporter::builder()
@@ -140,44 +113,17 @@ pub async fn bootstrap(
         crate::byteopacity::bump_codec_batch_reencode,
     );
 
-    // --- Tracer provider ---
-    let mut tp_builder = TracerProvider::builder()
-        .with_resource(resource)
-        .with_sampler(build_sampler());
-    let mut has_trace_exporter = false;
-    if let Ok(endpoint) = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
-        if !endpoint.is_empty() {
-            let exporter = SpanExporter::builder()
-                .with_tonic()
-                .with_endpoint(ensure_scheme(&endpoint))
-                .build()
-                .map_err(|e| ObservabilityError::TraceExporter(e.to_string()))?;
-            let processor = BatchSpanProcessor::builder(exporter, runtime::Tokio).build();
-            tp_builder = tp_builder.with_span_processor(processor);
-            has_trace_exporter = true;
-        }
-    }
-    let tracer_provider = tp_builder.build();
-    global::set_tracer_provider(tracer_provider.clone());
-    // Take the concrete SDK Tracer (not BoxedTracer) so
-    // tracing-opentelemetry's `.with_tracer(...)` accepts it — the
-    // BoxedTracer wrapper doesn't implement PreSampledTracer.
-    let tracer = tracer_provider.tracer(service);
-
     ::tracing::info!(
         service,
         otlp_metrics = std::env::var("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
             .map(|s| !s.is_empty())
             .unwrap_or(false),
-        otlp_traces = has_trace_exporter,
         "observability: initialised"
     );
 
     Ok(Providers {
         meter_provider,
-        tracer_provider: Some(tracer_provider),
         metrics,
-        tracer,
         _cancel: cancel,
     })
 }
@@ -238,15 +184,6 @@ fn compose_resource(
         attrs.push(KeyValue::new("k8s.namespace.name", v));
     }
     detected.merge(&Resource::new(attrs))
-}
-
-fn build_sampler() -> Sampler {
-    let ratio = std::env::var("OTEL_TRACES_SAMPLER_ARG")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|f| (0.0..=1.0).contains(f))
-        .unwrap_or(0.1);
-    Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(ratio)))
 }
 
 /// Parse a short-form duration string (`"30s"`, `"500ms"`) into a
@@ -410,21 +347,12 @@ mod tests {
         assert_eq!(attr(&r, "telemetry.sdk.language").as_deref(), Some("rust"));
     }
 
-    #[test]
-    fn build_sampler_defaults_to_10pct() {
-        // Can't easily assert the ratio inside a Sampler enum without
-        // downcasting; just verify the call doesn't panic.
-        std::env::remove_var("OTEL_TRACES_SAMPLER_ARG");
-        let _ = build_sampler();
-    }
-
     #[tokio::test]
-    async fn bootstrap_without_endpoints_succeeds() {
+    async fn bootstrap_without_an_endpoint_succeeds() {
         std::env::remove_var("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT");
-        std::env::remove_var("OTEL_EXPORTER_OTLP_ENDPOINT");
         let providers = bootstrap("kaas-test", CancellationToken::new())
             .await
-            .expect("bootstrap should succeed with no OTLP endpoints");
+            .expect("bootstrap should succeed with no OTLP endpoint");
         providers.shutdown().unwrap();
     }
 }
