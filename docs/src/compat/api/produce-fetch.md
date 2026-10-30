@@ -153,18 +153,21 @@ timestamp is passed to the engine's `offset_for_timestamp`.
   ([non-goals](../non-goals.md)); on the wire they fall into the same
   `(-1, -1)` path as any other timestamp.
 - `leader_epoch` is always `0` in success responses.
-- No authorization or leadership gate: there is no topic Describe ACL check,
-  and no `Coordinator::owns` check — a non-leader broker answers from its
-  local engine view (typically offset `0`) instead of
+- No leadership gate: there is no `Coordinator::owns` check — a non-leader
+  broker answers from its local engine view (typically offset `0`) instead of
   `NOT_LEADER_OR_FOLLOWER`. Clients that route by Metadata leadership never
-  hit this in steady state.
+  hit this in steady state. Authorization does match Apache (gh #268):
+  `Describe` on the topic, checked before existence, so every partition of a
+  denied topic answers `TOPIC_AUTHORIZATION_FAILED` (29) whether or not the
+  topic exists.
 
 **Source**: `crates/kaas-broker/src/handlers/list_offsets.rs`,
 `crates/kaas-codec/src/api/list_offsets.rs`; the sentinel-returning engine
 lookup in `crates/kaas-storage/src/disk.rs`.
 
 **Verified by**: handler unit tests `latest_returns_high_watermark`,
-`earliest_returns_log_start_offset`, `unknown_topic_returns_3`. Shell suite:
+`earliest_returns_log_start_offset`, `unknown_topic_returns_3`,
+`topic_without_describe_returns_29_existing_or_not`. Shell suite:
 `scripts/kafka-get-offsets.sh` (exercises the `-2`/`-1` sentinels before and
 after producing — the paths clients actually use).
 
@@ -196,6 +199,13 @@ topics" contract); unknown requested topics get a per-topic
 `[leader]` — the truthful shape for a single-writer design with no
 replication ([non-goals](../non-goals.md)).
 
+**Authorization** (gh #268) is Apache's: `Describe` on each topic, checked
+before anything else about it. An all-topics request silently omits the
+topics the principal can't describe — `kafka-topics.sh --list` shows only
+what it may see — while a named topic answers `TOPIC_AUTHORIZATION_FAILED`
+(29) whether or not it exists, so the error code never confirms a name.
+Auto-creation's `Create` check runs only for a topic that passed `Describe`.
+
 **Deviations from Apache 3.7**:
 
 - **Topic IDs serve the all-zero sentinel on the wire.** The v10 `topic_id`
@@ -207,9 +217,11 @@ replication ([non-goals](../non-goals.md)).
   propagated to the Metadata response.
 - `leader_epoch` is always `0` (v7+ field) — clients that cache epochs for
   truncation detection get a constant.
-- `allow_auto_topic_creation` is decoded and ignored. There is no
-  auto-creation: topics exist when a `KafkaTopic` CR exists (authored
-  directly or via CreateTopics, which writes the CR).
+- Auto-creation (`auto.create.topics.enable`, chart
+  `autoCreateTopics.enabled`, gh #242) mints a `KafkaTopic` CR and answers
+  `LEADER_NOT_AVAILABLE` (5) until the operator materializes it. It needs
+  `Create` on the topic; Apache also accepts `Create` on the cluster, which
+  kaas does not consult.
 - `topic_authorized_operations` / `cluster_authorized_operations` are always
   `0`, even when the v8+ request flags ask for them — the ACL bitsets are
   not computed.
@@ -223,6 +235,11 @@ callback in `bins/kaas/src/main.rs`.
 
 **Verified by**: handler unit tests `per_listener_port_echoed_back`,
 `returns_self_as_only_broker_and_leader`, `empty_topic_list_returns_all_known`,
-`unknown_topic_returns_per_topic_error_3`;
+`unknown_topic_returns_per_topic_error_3`,
+`all_topics_omits_what_the_principal_cannot_describe`,
+`named_topic_without_describe_is_29_existing_or_not`,
+`auto_create_checks_describe_before_create`;
+`crates/kaas-broker/tests/discovery_and_group_authz.rs` (the gh #268
+live-cluster ACL, end to end);
 `produce_fetch_metadata_roundtrip` in `bins/kaas/tests/smoke.rs`. Shell
 suite: `scripts/kafka-topics.sh` (`--list` / `--describe` ride Metadata).

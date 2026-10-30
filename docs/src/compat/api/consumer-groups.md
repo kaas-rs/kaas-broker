@@ -29,6 +29,26 @@ During the boot window before the coordinator `Manager` is installed,
 handlers return `NOT_COORDINATOR` / `COORDINATOR_NOT_AVAILABLE` so clients
 retry — no request is silently dropped.
 
+**Authorization** (gh #268) follows Apache 3.7 under `authorization: simple`.
+The group check runs before coordinator routing, so a denied principal never
+learns where a group lives or whether it exists:
+
+| API | Group | Topic | On deny |
+|---|---|---|---|
+| FindCoordinator | `Describe` (`Describe` on the transactional id for key type 1) | — | 30 / 53 |
+| JoinGroup, SyncGroup, Heartbeat, LeaveGroup | `Read` | — | 30 |
+| OffsetCommit | `Read` | `Read` | 30, or 29 per denied topic |
+| OffsetFetch | `Describe` | `Describe` | 30, or 29 per denied topic |
+| DescribeGroups | `Describe` | — | 30 per group |
+| ListGroups | `Describe` per group, or `Describe` on the cluster for all | — | filtered, no error |
+| DeleteGroups | `Delete` | — | 30 per group |
+| OffsetDelete | `Delete` | `Read` | 30, or 29 per denied topic |
+
+As in Apache, an Allow for `Read`, `Write`, `Delete` or `Alter` also grants
+`Describe`, so a consumer holding only `Read` on its group passes the
+`Describe` checks. Verified end to end by
+`crates/kaas-broker/tests/discovery_and_group_authz.rs`.
+
 ## OffsetCommit
 
 Persists a group's consumed positions. Key 8.

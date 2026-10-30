@@ -11,6 +11,11 @@
 //! Where the missing gate has a side effect beyond the error code (an
 //! offset overwritten, a member evicted, a group deleted), the test
 //! also checks the state the denial should have protected.
+//!
+//! The other principals guard the fix from the opposite side. `carol`
+//! is a Strimzi-shaped consumer holding only `Read` grants, which work
+//! only through Apache's `Read` ⇒ `Describe` implication. `ops` and
+//! `auditor` exercise the per-topic and cluster-wide halves.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
@@ -49,12 +54,17 @@ const INITIAL_REBALANCE_DELAY: Duration = Duration::from_millis(3_100);
 
 const BOB: &str = "bob-mtls";
 const ALICE: &str = "alice";
+const CAROL: &str = "carol";
+const OPS: &str = "ops";
+const AUDITOR: &str = "auditor";
 const GROUP: &str = "payments-app";
 const ALICE_OFFSET: i64 = 42;
 
 /// `bob-mtls` is verbatim from the issue. `alice` is the other team:
 /// everything on topics and groups, so her setup keeps working once
-/// the handlers start asking.
+/// the handlers start asking. `carol` consumes `payments` in alice's
+/// group with `Read` alone; `ops` may delete the group's offsets for
+/// `payments` only; `auditor` holds `Describe` on the cluster.
 const ACLS: &str = r#"{"acls":[
     {"principal":"User:bob-mtls",
      "resource":{"type":"topic","name":"audit-log","patternType":"literal"},
@@ -64,7 +74,22 @@ const ACLS: &str = r#"{"acls":[
      "operations":["All"],"permission":"Allow"},
     {"principal":"User:alice",
      "resource":{"type":"group","name":"*","patternType":"literal"},
-     "operations":["All"],"permission":"Allow"}
+     "operations":["All"],"permission":"Allow"},
+    {"principal":"User:carol",
+     "resource":{"type":"topic","name":"payments","patternType":"literal"},
+     "operations":["Read"],"permission":"Allow"},
+    {"principal":"User:carol",
+     "resource":{"type":"group","name":"payments-app","patternType":"literal"},
+     "operations":["Read"],"permission":"Allow"},
+    {"principal":"User:ops",
+     "resource":{"type":"topic","name":"payments","patternType":"literal"},
+     "operations":["Read"],"permission":"Allow"},
+    {"principal":"User:ops",
+     "resource":{"type":"group","name":"payments-app","patternType":"literal"},
+     "operations":["Delete"],"permission":"Allow"},
+    {"principal":"User:auditor",
+     "resource":{"type":"cluster","name":"kafka-cluster","patternType":"literal"},
+     "operations":["Describe"],"permission":"Allow"}
 ]}"#;
 
 struct Cluster {
@@ -181,7 +206,7 @@ async fn alice_joins_and_commits(c: &Cluster) -> Member {
     let resp = sync_group::decode_response(&mut call(&h, ALICE, 4, body).await, 4).unwrap();
     assert_eq!(resp.error_code, 0, "alice's SyncGroup");
 
-    let resp = offset_commit_as(c, ALICE, &alice, ALICE_OFFSET).await;
+    let resp = offset_commit_as(c, ALICE, &alice, &[("payments", ALICE_OFFSET)]).await;
     assert_eq!(
         resp.topics[0].partitions[0].error_code, 0,
         "alice's OffsetCommit"
@@ -198,7 +223,11 @@ async fn alice_leaves(c: &Cluster, alice: &Member) {
 
 /// Alice's committed `payments/0`, read the way her own client would.
 async fn alices_offset(c: &Cluster) -> i64 {
-    let resp = offset_fetch_as(c, ALICE).await;
+    alices_offset_for(c, "payments").await
+}
+
+async fn alices_offset_for(c: &Cluster, topic: &str) -> i64 {
+    let resp = offset_fetch_as(c, ALICE, &[topic]).await;
     assert_eq!(resp.error_code, 0, "alice's OffsetFetch");
     resp.topics[0].partitions[0].committed_offset
 }
@@ -258,13 +287,18 @@ async fn list_offsets_as(c: &Cluster, user: &str, topic: &str) -> list_offsets::
     list_offsets::decode_response(&mut out, 6).unwrap()
 }
 
-async fn offset_fetch_as(c: &Cluster, user: &str) -> offset_fetch::Response {
+async fn offset_fetch_as(c: &Cluster, user: &str, topics: &[&str]) -> offset_fetch::Response {
     let req = offset_fetch::Request {
         group_id: GROUP.to_owned(),
-        topics: Some(vec![offset_fetch::OffsetFetchTopic {
-            name: "payments".to_owned(),
-            partition_indexes: vec![0],
-        }]),
+        topics: Some(
+            topics
+                .iter()
+                .map(|t| offset_fetch::OffsetFetchTopic {
+                    name: (*t).to_owned(),
+                    partition_indexes: vec![0],
+                })
+                .collect(),
+        ),
         groups: Vec::new(),
         require_stable: false,
     };
@@ -279,22 +313,25 @@ async fn offset_commit_as(
     c: &Cluster,
     user: &str,
     member: &Member,
-    offset: i64,
+    offsets: &[(&str, i64)],
 ) -> offset_commit::Response {
     let req = offset_commit::Request {
         group_id: GROUP.to_owned(),
         generation_id: member.generation,
         member_id: member.id.clone(),
         group_instance_id: None,
-        topics: vec![offset_commit::OffsetCommitTopic {
-            name: "payments".to_owned(),
-            partitions: vec![offset_commit::OffsetCommitPartition {
-                partition_index: 0,
-                committed_offset: offset,
-                committed_leader_epoch: -1,
-                committed_metadata: None,
-            }],
-        }],
+        topics: offsets
+            .iter()
+            .map(|(topic, offset)| offset_commit::OffsetCommitTopic {
+                name: (*topic).to_owned(),
+                partitions: vec![offset_commit::OffsetCommitPartition {
+                    partition_index: 0,
+                    committed_offset: *offset,
+                    committed_leader_epoch: -1,
+                    committed_metadata: None,
+                }],
+            })
+            .collect(),
     };
     let mut body = BytesMut::new();
     offset_commit::encode_request(&mut body, &req, 8).unwrap();
@@ -336,6 +373,47 @@ async fn leave_group_as(c: &Cluster, user: &str, member: &Member) -> leave_group
     let h = LeaveGroupHandler::new(c.broker.clone());
     let mut out = call(&h, user, 4, body).await;
     leave_group::decode_response(&mut out, 4).unwrap()
+}
+
+async fn describe_group_as(c: &Cluster, user: &str) -> describe_groups::DescribedGroup {
+    let req = describe_groups::Request {
+        groups: vec![GROUP.to_owned()],
+        include_authorized_operations: false,
+    };
+    let mut body = BytesMut::new();
+    describe_groups::encode_request(&mut body, &req, 5).unwrap();
+    let h = DescribeGroupsHandler::new(c.broker.clone());
+    let mut out = call(&h, user, 5, body).await;
+    describe_groups::decode_response(&mut out, 5)
+        .unwrap()
+        .groups
+        .remove(0)
+}
+
+async fn list_groups_as(c: &Cluster, user: &str) -> Vec<String> {
+    let mut body = BytesMut::new();
+    list_groups::encode_request(&mut body, &list_groups::Request::default(), 4).unwrap();
+    let h = ListGroupsHandler::new(c.broker.clone());
+    let resp = list_groups::decode_response(&mut call(&h, user, 4, body).await, 4).unwrap();
+    assert_eq!(resp.error_code, 0);
+    resp.groups.into_iter().map(|g| g.group_id).collect()
+}
+
+async fn offset_delete_as(c: &Cluster, user: &str, topics: &[&str]) -> offset_delete::Response {
+    let req = offset_delete::Request {
+        group_id: GROUP.to_owned(),
+        topics: topics
+            .iter()
+            .map(|t| offset_delete::OffsetDeleteTopic {
+                name: (*t).to_owned(),
+                partitions: vec![0],
+            })
+            .collect(),
+    };
+    let mut body = BytesMut::new();
+    offset_delete::encode_request(&mut body, &req, 0).unwrap();
+    let h = OffsetDeleteHandler::new(c.broker.clone());
+    offset_delete::decode_response(&mut call(&h, user, 0, body).await, 0).unwrap()
 }
 
 async fn heartbeat_as(c: &Cluster, user: &str, member: &Member) -> heartbeat::Response {
@@ -410,7 +488,7 @@ async fn offset_fetch_of_another_group_is_30() {
     let c = cluster();
     alice_joins_and_commits(&c).await;
 
-    let resp = offset_fetch_as(&c, BOB).await;
+    let resp = offset_fetch_as(&c, BOB, &["payments"]).await;
     assert_eq!(resp.error_code, ERR_GROUP_AUTHZ_FAILED);
     assert!(
         resp.topics
@@ -426,7 +504,7 @@ async fn offset_commit_into_another_group_is_30() {
     let c = cluster();
     let alice = alice_joins_and_commits(&c).await;
 
-    let resp = offset_commit_as(&c, BOB, &alice, 0).await;
+    let resp = offset_commit_as(&c, BOB, &alice, &[("payments", 0)]).await;
     assert_eq!(
         resp.topics[0].partitions[0].error_code,
         ERR_GROUP_AUTHZ_FAILED
@@ -539,19 +617,9 @@ async fn describe_another_group_is_30() {
     let c = cluster();
     alice_joins_and_commits(&c).await;
 
-    let req = describe_groups::Request {
-        groups: vec![GROUP.to_owned()],
-        include_authorized_operations: false,
-    };
-    let mut body = BytesMut::new();
-    describe_groups::encode_request(&mut body, &req, 5).unwrap();
-    let h = DescribeGroupsHandler::new(c.broker.clone());
-    let resp = describe_groups::decode_response(&mut call(&h, BOB, 5, body).await, 5).unwrap();
-    assert_eq!(resp.groups[0].error_code, ERR_GROUP_AUTHZ_FAILED);
-    assert!(
-        resp.groups[0].members.is_empty(),
-        "alice's membership leaked to bob"
-    );
+    let group = describe_group_as(&c, BOB).await;
+    assert_eq!(group.error_code, ERR_GROUP_AUTHZ_FAILED);
+    assert!(group.members.is_empty(), "alice's membership leaked to bob");
 }
 
 /// Without `Describe` on the cluster, Apache lists only the groups the
@@ -561,12 +629,7 @@ async fn list_groups_hides_groups_bob_may_not_describe() {
     let c = cluster();
     alice_joins_and_commits(&c).await;
 
-    let mut body = BytesMut::new();
-    list_groups::encode_request(&mut body, &list_groups::Request::default(), 4).unwrap();
-    let h = ListGroupsHandler::new(c.broker.clone());
-    let resp = list_groups::decode_response(&mut call(&h, BOB, 4, body).await, 4).unwrap();
-    assert_eq!(resp.error_code, 0);
-    let ids: Vec<&str> = resp.groups.iter().map(|g| g.group_id.as_str()).collect();
+    let ids = list_groups_as(&c, BOB).await;
     assert!(ids.is_empty(), "groups leaked to bob: {ids:?}");
 }
 
@@ -597,21 +660,119 @@ async fn offset_delete_in_another_group_is_30() {
     let alice = alice_joins_and_commits(&c).await;
     alice_leaves(&c, &alice).await;
 
-    let req = offset_delete::Request {
-        group_id: GROUP.to_owned(),
-        topics: vec![offset_delete::OffsetDeleteTopic {
-            name: "payments".to_owned(),
-            partitions: vec![0],
-        }],
-    };
-    let mut body = BytesMut::new();
-    offset_delete::encode_request(&mut body, &req, 0).unwrap();
-    let h = OffsetDeleteHandler::new(c.broker.clone());
-    let resp = offset_delete::decode_response(&mut call(&h, BOB, 0, body).await, 0).unwrap();
+    let resp = offset_delete_as(&c, BOB, &["payments"]).await;
     assert_eq!(resp.error_code, ERR_GROUP_AUTHZ_FAILED);
     assert_eq!(
         alices_offset(&c).await,
         ALICE_OFFSET,
         "bob deleted alice's committed offset"
+    );
+}
+
+// --- the fix must not over-deny --------------------------------------
+
+/// The common Strimzi consumer shape (the live `throttled-user` has
+/// it): `Read` on the topic and the group, no explicit `Describe`.
+/// Every `Describe` gate below passes only through Apache's
+/// `Read` ⇒ `Describe` implication.
+#[tokio::test(start_paused = true)]
+async fn a_read_only_consumer_still_discovers_and_fetches() {
+    let c = cluster();
+    alice_joins_and_commits(&c).await;
+
+    let resp = metadata_as(&c, CAROL, Some(&["payments"])).await;
+    assert_eq!(resp.topics[0].error_code, 0, "Metadata");
+    let resp = list_offsets_as(&c, CAROL, "payments").await;
+    assert_eq!(resp.topics[0].partitions[0].error_code, 0, "ListOffsets");
+    let resp = find_coordinator_as(&c, CAROL, GROUP, 0).await;
+    assert_eq!(resp.error_code, 0, "FindCoordinator");
+    let resp = offset_fetch_as(&c, CAROL, &["payments"]).await;
+    assert_eq!(resp.error_code, 0, "OffsetFetch");
+    assert_eq!(resp.topics[0].partitions[0].committed_offset, ALICE_OFFSET);
+    assert_eq!(
+        describe_group_as(&c, CAROL).await.error_code,
+        0,
+        "DescribeGroups"
+    );
+    assert_eq!(list_groups_as(&c, CAROL).await, [GROUP], "ListGroups");
+}
+
+/// Group access doesn't extend to topics: a commit or fetch for a
+/// topic carol can't `Read` / `Describe` is refused per topic while
+/// the rest of the request goes through.
+#[tokio::test(start_paused = true)]
+async fn offset_commit_and_fetch_deny_per_topic() {
+    let c = cluster();
+    let alice = alice_joins_and_commits(&c).await;
+
+    let resp = offset_commit_as(&c, CAROL, &alice, &[("payments", 50), ("orders", 7)]).await;
+    for t in &resp.topics {
+        let want = if t.name == "orders" {
+            ERR_TOPIC_AUTHZ_FAILED
+        } else {
+            0
+        };
+        assert_eq!(t.partitions[0].error_code, want, "commit {}", t.name);
+    }
+    assert_eq!(alices_offset(&c).await, 50, "the authorized topic commits");
+    assert_eq!(
+        alices_offset_for(&c, "orders").await,
+        -1,
+        "the denied topic must not commit"
+    );
+
+    let resp = offset_fetch_as(&c, CAROL, &["payments", "orders"]).await;
+    assert_eq!(resp.error_code, 0);
+    for t in &resp.topics {
+        let want = if t.name == "orders" {
+            ERR_TOPIC_AUTHZ_FAILED
+        } else {
+            0
+        };
+        assert_eq!(t.partitions[0].error_code, want, "fetch {}", t.name);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn offset_delete_denies_per_topic() {
+    let c = cluster();
+    let alice = alice_joins_and_commits(&c).await;
+    let resp = offset_commit_as(&c, ALICE, &alice, &[("orders", 9)]).await;
+    assert_eq!(resp.topics[0].partitions[0].error_code, 0);
+    alice_leaves(&c, &alice).await;
+
+    let resp = offset_delete_as(&c, OPS, &["payments", "orders"]).await;
+    assert_eq!(resp.error_code, 0);
+    for t in &resp.topics {
+        let want = if t.name == "orders" {
+            ERR_TOPIC_AUTHZ_FAILED
+        } else {
+            0
+        };
+        assert_eq!(t.partitions[0].error_code, want, "topic {}", t.name);
+    }
+    assert_eq!(
+        alices_offset(&c).await,
+        -1,
+        "the authorized topic is deleted"
+    );
+    assert_eq!(
+        alices_offset_for(&c, "orders").await,
+        9,
+        "the denied topic keeps its offset"
+    );
+}
+
+/// Apache's ListGroups shortcut: `Describe` on the cluster lists every
+/// group. It grants nothing on the groups themselves.
+#[tokio::test(start_paused = true)]
+async fn cluster_describe_lists_every_group_but_describes_none() {
+    let c = cluster();
+    alice_joins_and_commits(&c).await;
+
+    assert_eq!(list_groups_as(&c, AUDITOR).await, [GROUP]);
+    assert_eq!(
+        describe_group_as(&c, AUDITOR).await.error_code,
+        ERR_GROUP_AUTHZ_FAILED
     );
 }

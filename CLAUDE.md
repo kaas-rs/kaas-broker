@@ -85,6 +85,8 @@ The "controller" is **a broker that holds the `kaas-controller` Lease**, not a s
 - Computes partition + consumer-group assignments (`crates/kaas-controller/src/balancer.rs`, `assignment_writer.rs`).
 - Writes `/data/__cluster/assignment.json` on the shared RWX PVC. The file is epoch-prefixed by `leaseTransitions`; brokers reject writes with stale epochs (verified by `crates/kaas-controller/tests/stale_controller_race.rs`).
 
+**Every `kaas-controller` Lease write is GET → modify → `replace` carrying the read's `resourceVersion`** (`crates/kaas-controller/src/kube_election.rs`, the same as client-go's `LeaseLock.Update`) — takeover, renew, and release alike; the operator's leader election shares the code. A 409 means another writer got there first: takeover → lost the round, renew → transient (the next tick re-reads), release → leave it. Don't go back to a forced server-side apply: it has no precondition, so two candidates racing an expired Lease both won at the same `leaseTransitions`, and the broker fence (`controller_epoch < lease_epoch`) can't separate equal epochs. The compare-and-swap gives one winner per transition, not fencing — the epoch fences still do that. The tests' fake API server reads *before* its race barrier on purpose: waiting first let the first racer's write land before the second's read, so the race test passed against a last-writer-wins server.
+
 `assignment.json` is the **single source of truth for partition leadership** (gh #75 cleanup). The Metadata response, the produce/fetch ownership check, and `/healthz`'s `partitions_led` all source from it via the broker `Coordinator` (`crates/kaas-broker/src/coordinator.rs`). There is no per-partition Lease — only the singleton `kaas-controller` Lease used for cluster-wide controller election. The local-lease shim (`crates/kaas-broker/src/local_lease.rs`, always "yes, I lead") exists for dev mode only.
 
 The controller recomputes the assignment when:
@@ -222,6 +224,7 @@ Three orthogonal axes, Strimzi 1:1:
 
 - Authorizer — wired via `KAAS_AUTHORIZATION_TYPE` (`""` = none → allow-all; `simple` = ACL-based). `KAAS_SUPER_USERS` (comma-separated `User:foo,User:bar`) wraps the chosen authorizer in a super-user early-allow layer.
 - Quota checker — defaults to no-op; switches to real quotas when auth is enabled. Quotas fire **regardless of authorization** — they're orthogonal.
+- **ACL implication is Apache's** (`AclEngine::evaluate`, gh #268): an Allow on `Read`/`Write`/`Delete`/`Alter` also grants `Describe`, and `AlterConfigs` grants `DescribeConfigs`; Deny rules match only their exact op. Load-bearing: Metadata, ListOffsets, FindCoordinator, OffsetFetch, DescribeGroups and ListGroups check `Describe`, and a Strimzi consumer usually holds only `Read` on its group. Every handler checks the group/topic ACL **before** coordinator routing or existence lookups (an unauthorized principal must get 29/30, never `NOT_COORDINATOR` or `UNKNOWN_TOPIC_OR_PARTITION`), and all-topics Metadata / ListGroups **filter** instead of erroring. Deny-path tests live in `crates/kaas-broker/tests/discovery_and_group_authz.rs`.
 
 Produce/Fetch handlers route exclusively via the cluster-wide authorizer + quota checker — they don't reach back into the per-listener engine. This is what lets `plain` (anonymous) and `authed` (SCRAM) listeners share the same ACL/quota policy.
 

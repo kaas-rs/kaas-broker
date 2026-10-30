@@ -5,18 +5,26 @@
 //! returns per-member responses. With no coord manager installed,
 //! returns the top-level `NOT_COORDINATOR` (16) so the client
 //! retries via `FindCoordinator`.
+//!
+//! Authorization (gh #268): `Read` on the group, before coordinator
+//! routing. A denial is the top-level `GROUP_AUTHORIZATION_FAILED`
+//! (30) with no per-member results, as Apache's error response has.
+//! Ungated, any principal could evict any member it could name.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use kaas_auth::{Operation, Resource};
 use kaas_codec::api::leave_group;
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
 
+use super::principal_from;
 use crate::broker::Broker;
 
 const ERR_NOT_COORDINATOR: i16 = 16;
+const ERR_GROUP_AUTHZ_FAILED: i16 = 30;
 
 #[derive(Debug)]
 pub struct LeaveGroupHandler {
@@ -33,7 +41,7 @@ impl LeaveGroupHandler {
 impl Handler for LeaveGroupHandler {
     async fn handle(
         &self,
-        _conn: &Mutex<ConnState>,
+        conn: &Mutex<ConnState>,
         version: i16,
         body: Bytes,
     ) -> Result<BytesMut, HandlerError> {
@@ -49,7 +57,18 @@ impl Handler for LeaveGroupHandler {
             member_ids.push(m.member_id.clone());
         }
 
+        let authorized = self.broker.authorizer.authorize(
+            &principal_from(conn),
+            &Resource::group(&req.group_id),
+            Operation::Read,
+        );
+
         let resp = match self.broker.coord_manager() {
+            _ if !authorized => leave_group::Response {
+                throttle_time_ms: 0,
+                error_code: ERR_GROUP_AUTHZ_FAILED,
+                members: Vec::new(),
+            },
             None => leave_group::Response {
                 throttle_time_ms: 0,
                 error_code: ERR_NOT_COORDINATOR,

@@ -118,4 +118,16 @@ pub(crate) mod test_authz {
             r.name != self.0
         }
     }
+
+    /// Denies one operation everywhere, allows the rest — for gates
+    /// that check two operations in order (Metadata's `Describe`, then
+    /// `Create` on auto-create).
+    #[derive(Debug)]
+    pub struct DenyOpAuthorizer(pub Operation);
+
+    impl Authorizer for DenyOpAuthorizer {
+        fn authorize(&self, _p: &Principal, _r: &Resource, op: Operation) -> bool {
+            op != self.0
+        }
+    }
 }

@@ -200,6 +200,17 @@ as usual (see the [ACL & quota admin
 APIs](../compat/api/acls-quotas.md)). `KAAS_AUTH_DISABLED=true`
 switches the whole subsystem off for dev setups.
 
+**Evaluation matches Apache's `AclAuthorizer`.** Deny beats Allow, and no
+matching rule means deny. An Allow rule also grants the operations Apache
+implies from it: `Read`, `Write`, `Delete` and `Alter` each grant
+`Describe`, and `AlterConfigs` grants `DescribeConfigs`. A Deny rule
+matches only its own operation. The implication is what lets a consumer
+whose `KafkaUser` grants only `Read` on its group pass FindCoordinator's
+`Describe` check. Topic discovery and every consumer-group API are gated the
+way Apache gates them (gh #268): see the
+[consumer-group table](../compat/api/consumer-groups.md) and
+[Metadata](../compat/api/produce-fetch.md#metadata).
+
 **Authorization-only users (OAuth principals).** A `KafkaUser`'s
 `spec.authentication` is optional (gh #42). An OAUTHBEARER principal
 authenticates against the issuer, not against a stored credential, so

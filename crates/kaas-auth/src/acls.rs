@@ -1,7 +1,9 @@
 //! `acls.json` loader + ACL evaluation.
 //!
 //! Deny takes precedence over
-//! Allow; default is deny. Decisions are cached for 5 s keyed on
+//! Allow; default is deny. An Allow rule also grants the operations
+//! Apache implies from it (see [`implies`]); a Deny rule matches only
+//! its own operation. Decisions are cached for 5 s keyed on
 //! `(principal_name, resource_type, resource_name, op)` to keep the
 //! Produce/Fetch hot path off the rule walk.
 //!
@@ -197,17 +199,41 @@ impl AclEngine {
             if !matches_resource(r, resource) {
                 continue;
             }
-            if !r.operation_all && !r.operations.contains(&op) {
-                continue;
-            }
             if r.deny {
                 // Deny short-circuits immediately.
-                return false;
+                if r.operation_all || r.operations.contains(&op) {
+                    return false;
+                }
+                continue;
             }
-            allow = true;
+            if r.operation_all || r.operations.iter().any(|held| implies(*held, op)) {
+                allow = true;
+            }
         }
         allow
     }
+}
+
+/// Whether an Allow rule for `held` grants `requested`. Apache's ACL
+/// inheritance (`AclOperation`, `AclAuthorizer.allowAclExists`):
+/// `Read`, `Write`, `Delete` and `Alter` each imply `Describe`, and
+/// `AlterConfigs` implies `DescribeConfigs`. Only Allow rules widen
+/// this way; a Deny rule matches its own operation.
+///
+/// gh #268: the `Describe` gates on Metadata, FindCoordinator and
+/// OffsetFetch lean on this. A Strimzi consumer holding only `Read`
+/// on its group is the common shape, and without the implication it
+/// could not find its coordinator.
+fn implies(held: Operation, requested: Operation) -> bool {
+    held == requested
+        || match requested {
+            Operation::Describe => matches!(
+                held,
+                Operation::Read | Operation::Write | Operation::Delete | Operation::Alter
+            ),
+            Operation::DescribeConfigs => held == Operation::AlterConfigs,
+            _ => false,
+        }
 }
 
 impl Authorizer for AclEngine {
@@ -355,6 +381,53 @@ mod tests {
         ] {
             assert!(e.authorize(&alice(), &Resource::topic("foo"), op), "{op:?}");
         }
+    }
+
+    #[test]
+    fn allow_implies_describe_like_apache() {
+        // gh #268: Apache's ACL inheritance. A consumer group granted
+        // only `Read` must still pass FindCoordinator's `Describe`.
+        for held in ["Read", "Write", "Delete", "Alter"] {
+            let e = engine_with(&format!(
+                r#"{{"acls":[{{"principal":"User:alice",
+                    "resource":{{"type":"group","name":"g","patternType":"literal"}},
+                    "operations":["{held}"],"permission":"Allow"}}]}}"#
+            ));
+            assert!(
+                e.authorize(&alice(), &Resource::group("g"), Operation::Describe),
+                "{held} must imply Describe"
+            );
+        }
+        let e = engine_with(
+            r#"{"acls":[{"principal":"User:alice",
+                "resource":{"type":"topic","name":"foo","patternType":"literal"},
+                "operations":["AlterConfigs","Create"],"permission":"Allow"}]}"#,
+        );
+        assert!(e.authorize(
+            &alice(),
+            &Resource::topic("foo"),
+            Operation::DescribeConfigs
+        ));
+        // Neither of these is in Apache's implied set.
+        assert!(!e.authorize(&alice(), &Resource::topic("foo"), Operation::Describe));
+        assert!(!e.authorize(&alice(), &Resource::topic("foo"), Operation::Read));
+    }
+
+    #[test]
+    fn deny_is_not_widened_by_implication() {
+        // Apache matches a Deny rule on its exact operation: the
+        // Describe deny wins over the Read allow's implied Describe,
+        // and leaves Read itself alone.
+        let e = engine_with(
+            r#"{"acls":[
+                {"principal":"User:alice","resource":{"type":"topic","name":"foo","patternType":"literal"},
+                 "operations":["Read"],"permission":"Allow"},
+                {"principal":"User:alice","resource":{"type":"topic","name":"foo","patternType":"literal"},
+                 "operations":["Describe"],"permission":"Deny"}
+            ]}"#,
+        );
+        assert!(!e.authorize(&alice(), &Resource::topic("foo"), Operation::Describe));
+        assert!(e.authorize(&alice(), &Resource::topic("foo"), Operation::Read));
     }
 
     #[test]

@@ -6,20 +6,28 @@
 //! installed, returns `NOT_COORDINATOR` (16).
 //!
 //! [`Manager::join_group`]: kaas_coordinator::Manager::join_group
+//!
+//! Authorization (gh #268): `Read` on the group, before coordinator
+//! routing — `GROUP_AUTHORIZATION_FAILED` (30) otherwise. Ungated, any
+//! principal could force a rebalance on any group.
+//!
 //! [`JoinOutcome`]: kaas_coordinator::JoinOutcome
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use kaas_auth::{Operation, Resource};
 use kaas_codec::api::join_group;
 use kaas_coordinator::{JoinRequest, ProtocolMetadata};
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
 
+use super::principal_from;
 use crate::broker::Broker;
 
 const ERR_NOT_COORDINATOR: i16 = 16;
+const ERR_GROUP_AUTHZ_FAILED: i16 = 30;
 
 #[derive(Debug)]
 pub struct JoinGroupHandler {
@@ -49,18 +57,15 @@ impl Handler for JoinGroupHandler {
             .map(|p| p.name.clone())
             .unwrap_or_default();
 
+        let authorized = self.broker.authorizer.authorize(
+            &principal_from(conn),
+            &Resource::group(&req.group_id),
+            Operation::Read,
+        );
+
         let resp = match self.broker.coord_manager() {
-            None => join_group::Response {
-                throttle_time_ms: 0,
-                error_code: ERR_NOT_COORDINATOR,
-                generation_id: -1,
-                protocol_type: String::new(),
-                protocol_name: String::new(),
-                leader: String::new(),
-                skip_assignment: false,
-                member_id: req.member_id,
-                members: Vec::new(),
-            },
+            _ if !authorized => error_response(req.member_id, ERR_GROUP_AUTHZ_FAILED),
+            None => error_response(req.member_id, ERR_NOT_COORDINATOR),
             Some(mgr) => {
                 let cr = JoinRequest {
                     member_id: req.member_id,
@@ -105,5 +110,19 @@ impl Handler for JoinGroupHandler {
         let mut out = BytesMut::new();
         join_group::encode_response(&mut out, &resp, version)?;
         Ok(out)
+    }
+}
+
+fn error_response(member_id: String, error_code: i16) -> join_group::Response {
+    join_group::Response {
+        throttle_time_ms: 0,
+        error_code,
+        generation_id: -1,
+        protocol_type: String::new(),
+        protocol_name: String::new(),
+        leader: String::new(),
+        skip_assignment: false,
+        member_id,
+        members: Vec::new(),
     }
 }

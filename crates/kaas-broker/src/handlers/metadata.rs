@@ -38,6 +38,15 @@
 //! unknown-topic branch is unreachable. Apache carves the same case out
 //! explicitly via `!metadataRequest.isAllTopics`.
 //!
+//! ## Authorization (gh #268)
+//!
+//! `Describe` on each topic, checked before anything else about it —
+//! Apache's `handleTopicMetadataRequest` shape. An all-topics request
+//! silently drops the topics the principal can't describe; a named one
+//! answers `TOPIC_AUTHORIZATION_FAILED` (29) whether or not the topic
+//! exists, so the error code doesn't reveal existence. The auto-create
+//! `Create` check above only runs for a topic that passed `Describe`.
+//!
 //! [`TopicCRWriter`]: crate::topic_cr_writer::TopicCRWriter
 
 use std::sync::Arc;
@@ -201,7 +210,8 @@ impl Handler for MetadataHandler {
         // (Apache: an empty list means "all topics"). If non-empty,
         // return exactly the requested topics, with UNKNOWN_TOPIC_OR_PARTITION
         // for any that aren't in our registry.
-        let topic_names: Vec<String> = if req.topics.is_empty() {
+        let all_topics = req.topics.is_empty();
+        let topic_names: Vec<String> = if all_topics {
             self.broker
                 .topics
                 .all()
@@ -214,6 +224,18 @@ impl Handler for MetadataHandler {
 
         let mut topics = Vec::with_capacity(topic_names.len());
         for name in topic_names {
+            // gh #268: before the registry lookup, so an unauthorized
+            // principal learns nothing about existence.
+            if !self.broker.authorizer.authorize(
+                &principal,
+                &Resource::topic(&name),
+                Operation::Describe,
+            ) {
+                if !all_topics {
+                    topics.push(error_topic(name, ERR_TOPIC_AUTHZ_FAILED));
+                }
+                continue;
+            }
             match self.broker.topics.get(&name) {
                 Some(meta) => {
                     let mut partitions =
@@ -254,14 +276,7 @@ impl Handler for MetadataHandler {
                     } else {
                         ERR_UNKNOWN_TOPIC_OR_PARTITION
                     };
-                    topics.push(metadata::Topic {
-                        error_code,
-                        name,
-                        topic_id: [0; 16],
-                        is_internal: false,
-                        partitions: Vec::new(),
-                        topic_authorized_operations: 0,
-                    });
+                    topics.push(error_topic(name, error_code));
                 }
             }
         }
@@ -278,6 +293,18 @@ impl Handler for MetadataHandler {
         let mut out = BytesMut::new();
         metadata::encode_response(&mut out, &resp, version)?;
         Ok(out)
+    }
+}
+
+/// A topic entry that carries only an error: no partitions, nil id.
+fn error_topic(name: String, error_code: i16) -> metadata::Topic {
+    metadata::Topic {
+        error_code,
+        name,
+        topic_id: [0; 16],
+        is_internal: false,
+        partitions: Vec::new(),
+        topic_authorized_operations: 0,
     }
 }
 
@@ -555,28 +582,37 @@ mod tests {
         );
     }
 
+    fn broker_with_auth(
+        topics: Vec<(&str, i32)>,
+        auth: Arc<dyn kaas_auth::Authorizer>,
+    ) -> Arc<Broker> {
+        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let r = Arc::new(TopicRegistry::new());
+        for (n, p) in topics {
+            r.insert(TopicMeta {
+                name: n.to_owned(),
+                partition_count: p,
+                topic_id: [0; 16],
+            });
+        }
+        Arc::new(Broker::with_auth(
+            engine,
+            r,
+            "kaas-dev",
+            0,
+            auth,
+            Arc::new(kaas_auth::NoQuotaChecker),
+        ))
+    }
+
     #[tokio::test]
     async fn auto_create_honours_the_authorizer() {
         // Auto-creation is a create. If Metadata skipped the ACL check,
         // an unauthorized client could mint topics through it even
-        // though CreateTopics would refuse.
-        #[derive(Debug)]
-        struct DenyAll;
-        impl kaas_auth::Authorizer for DenyAll {
-            fn authorize(&self, _: &Principal, _: &Resource, _: Operation) -> bool {
-                false
-            }
-        }
-
-        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
-        let broker = Arc::new(Broker::with_auth(
-            engine,
-            Arc::new(TopicRegistry::new()),
-            "kaas-dev",
-            0,
-            Arc::new(DenyAll),
-            Arc::new(kaas_auth::NoQuotaChecker),
-        ));
+        // though CreateTopics would refuse. `Describe` is granted so
+        // the request reaches the `Create` check.
+        use crate::handlers::test_authz::DenyOpAuthorizer;
+        let broker = broker_with_auth(Vec::new(), Arc::new(DenyOpAuthorizer(Operation::Create)));
         let writer = Arc::new(RecordingWriter::default());
         broker.install_cr_writer(writer.clone());
         let h = MetadataHandler::new(broker, &listeners()).with_auto_create(true, 1);
@@ -586,6 +622,54 @@ mod tests {
             ERR_TOPIC_AUTHZ_FAILED
         );
         assert!(writer.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn auto_create_checks_describe_before_create() {
+        // gh #268: Apache answers 29 for an undescribable topic before
+        // the auto-create path is considered, even when `Create` would
+        // pass, so neither existence nor a CR write leaks.
+        use crate::handlers::test_authz::DenyOpAuthorizer;
+        let broker = broker_with_auth(Vec::new(), Arc::new(DenyOpAuthorizer(Operation::Describe)));
+        let writer = Arc::new(RecordingWriter::default());
+        broker.install_cr_writer(writer.clone());
+        let h = MetadataHandler::new(broker, &listeners()).with_auto_create(true, 1);
+
+        assert_eq!(
+            error_code_for(&h, "brand-new", true).await,
+            ERR_TOPIC_AUTHZ_FAILED
+        );
+        assert!(writer.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn all_topics_omits_what_the_principal_cannot_describe() {
+        // gh #268: a list-all filters silently; it must not error.
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        let broker = broker_with_auth(
+            vec![("a", 1), ("secret", 2)],
+            Arc::new(DenyNamedAuthorizer("secret")),
+        );
+        let h = MetadataHandler::new(broker, &listeners());
+        let out = h
+            .handle(&conn("internal"), 9, encode_request_v9(&[]))
+            .await
+            .unwrap();
+        let resp = metadata::decode_response(&mut out.freeze(), 9).unwrap();
+        let names: Vec<&str> = resp.topics.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["a"]);
+    }
+
+    #[tokio::test]
+    async fn named_topic_without_describe_is_29_existing_or_not() {
+        use crate::handlers::test_authz::DenyAllAuthorizer;
+        let broker = broker_with_auth(vec![("a", 1)], Arc::new(DenyAllAuthorizer));
+        let h = MetadataHandler::new(broker, &listeners());
+        assert_eq!(error_code_for(&h, "a", false).await, ERR_TOPIC_AUTHZ_FAILED);
+        assert_eq!(
+            error_code_for(&h, "nope", false).await,
+            ERR_TOPIC_AUTHZ_FAILED
+        );
     }
 
     #[tokio::test]

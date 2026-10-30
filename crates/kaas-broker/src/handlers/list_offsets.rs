@@ -9,14 +9,17 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use kaas_auth::{Operation, Resource};
 use kaas_codec::api::list_offsets;
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use kaas_storage::StorageError;
 use parking_lot::Mutex;
 
+use super::principal_from;
 use crate::broker::Broker;
 
 const ERR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+const ERR_TOPIC_AUTHZ_FAILED: i16 = 29;
 
 const TS_EARLIEST: i64 = -2;
 const TS_LATEST: i64 = -1;
@@ -36,18 +39,30 @@ impl ListOffsetsHandler {
 impl Handler for ListOffsetsHandler {
     async fn handle(
         &self,
-        _conn: &Mutex<ConnState>,
+        conn: &Mutex<ConnState>,
         version: i16,
         body: Bytes,
     ) -> Result<BytesMut, HandlerError> {
         let mut body = body;
         let req = list_offsets::decode_request(&mut body, version)?;
+        let principal = principal_from(conn);
 
         let mut topics = Vec::with_capacity(req.topics.len());
         for t in &req.topics {
+            // gh #268: `Describe` on the topic, ahead of the existence
+            // check so a denied principal can't probe for topic names.
+            let authorized = self.broker.authorizer.authorize(
+                &principal,
+                &Resource::topic(&t.name),
+                Operation::Describe,
+            );
             let mut parts = Vec::with_capacity(t.partitions.len());
             for p in &t.partitions {
-                parts.push(self.resolve_one(&t.name, p));
+                parts.push(if authorized {
+                    self.resolve_one(&t.name, p)
+                } else {
+                    error_partition(p.partition_index, ERR_TOPIC_AUTHZ_FAILED)
+                });
             }
             topics.push(list_offsets::TopicResponse {
                 name: t.name.clone(),
@@ -190,6 +205,36 @@ mod tests {
         let mut r = out.freeze();
         let resp = list_offsets::decode_response(&mut r, 6).unwrap();
         assert_eq!(resp.topics[0].partitions[0].offset, 0);
+    }
+
+    #[tokio::test]
+    async fn topic_without_describe_returns_29_existing_or_not() {
+        use crate::handlers::test_authz::DenyAllAuthorizer;
+        let topics = Arc::new(TopicRegistry::new());
+        topics.insert(TopicMeta {
+            name: "t".to_owned(),
+            partition_count: 1,
+            topic_id: [0; 16],
+        });
+        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let h = ListOffsetsHandler::new(Arc::new(Broker::with_auth(
+            engine,
+            topics,
+            "test",
+            0,
+            Arc::new(DenyAllAuthorizer),
+            Arc::new(kaas_auth::NoQuotaChecker),
+        )));
+        for topic in ["t", "other"] {
+            let out = h
+                .handle(&conn(), 6, encode_request_v6(topic, TS_LATEST))
+                .await
+                .unwrap();
+            let resp = list_offsets::decode_response(&mut out.freeze(), 6).unwrap();
+            let p = &resp.topics[0].partitions[0];
+            assert_eq!(p.error_code, ERR_TOPIC_AUTHZ_FAILED, "topic {topic}");
+            assert_eq!(p.offset, -1, "topic {topic}");
+        }
     }
 
     #[tokio::test]

@@ -4,19 +4,26 @@
 //! group's sync round. The Manager's sync future awaits the
 //! leader's delivery (or a rebalance cancel). No coord manager →
 //! `NOT_COORDINATOR` (16).
+//!
+//! Authorization (gh #268): `Read` on the group, before coordinator
+//! routing — `GROUP_AUTHORIZATION_FAILED` (30) otherwise. Ungated, a
+//! member id was enough to read another principal's assignment.
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use kaas_auth::{Operation, Resource};
 use kaas_codec::api::sync_group;
 use kaas_coordinator::{SyncAssignment, SyncRequest};
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
 
+use super::principal_from;
 use crate::broker::Broker;
 
 const ERR_NOT_COORDINATOR: i16 = 16;
+const ERR_GROUP_AUTHZ_FAILED: i16 = 30;
 
 #[derive(Debug)]
 pub struct SyncGroupHandler {
@@ -33,21 +40,22 @@ impl SyncGroupHandler {
 impl Handler for SyncGroupHandler {
     async fn handle(
         &self,
-        _conn: &Mutex<ConnState>,
+        conn: &Mutex<ConnState>,
         version: i16,
         body: Bytes,
     ) -> Result<BytesMut, HandlerError> {
         let mut body = body;
         let req = sync_group::decode_request(&mut body, version)?;
 
+        let authorized = self.broker.authorizer.authorize(
+            &principal_from(conn),
+            &Resource::group(&req.group_id),
+            Operation::Read,
+        );
+
         let resp = match self.broker.coord_manager() {
-            None => sync_group::Response {
-                throttle_time_ms: 0,
-                error_code: ERR_NOT_COORDINATOR,
-                protocol_type: String::new(),
-                protocol_name: String::new(),
-                assignment: Bytes::new(),
-            },
+            _ if !authorized => error_response(ERR_GROUP_AUTHZ_FAILED),
+            None => error_response(ERR_NOT_COORDINATOR),
             Some(mgr) => {
                 let cr = SyncRequest {
                     member_id: req.member_id,
@@ -83,5 +91,15 @@ impl Handler for SyncGroupHandler {
         let mut out = BytesMut::new();
         sync_group::encode_response(&mut out, &resp, version)?;
         Ok(out)
+    }
+}
+
+fn error_response(error_code: i16) -> sync_group::Response {
+    sync_group::Response {
+        throttle_time_ms: 0,
+        error_code,
+        protocol_type: String::new(),
+        protocol_name: String::new(),
+        assignment: Bytes::new(),
     }
 }

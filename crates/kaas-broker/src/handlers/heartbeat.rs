@@ -7,20 +7,26 @@
 //! `NOT_COORDINATOR` (16) so the client retries via
 //! `FindCoordinator`.
 //!
+//! Authorization (gh #268): `Read` on the group, before coordinator
+//! routing — `GROUP_AUTHORIZATION_FAILED` (30) otherwise.
+//!
 //! [`Manager::heartbeat`]: kaas_coordinator::Manager::heartbeat
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use kaas_auth::{Operation, Resource};
 use kaas_codec::api::heartbeat;
 use kaas_coordinator::HeartbeatRequest;
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
 
+use super::principal_from;
 use crate::broker::Broker;
 
 const ERR_NOT_COORDINATOR: i16 = 16;
+const ERR_GROUP_AUTHZ_FAILED: i16 = 30;
 
 #[derive(Debug)]
 pub struct HeartbeatHandler {
@@ -37,13 +43,19 @@ impl HeartbeatHandler {
 impl Handler for HeartbeatHandler {
     async fn handle(
         &self,
-        _conn: &Mutex<ConnState>,
+        conn: &Mutex<ConnState>,
         version: i16,
         body: Bytes,
     ) -> Result<BytesMut, HandlerError> {
         let mut body = body;
         let req = heartbeat::decode_request(&mut body, version)?;
+        let authorized = self.broker.authorizer.authorize(
+            &principal_from(conn),
+            &Resource::group(&req.group_id),
+            Operation::Read,
+        );
         let error_code = match self.broker.coord_manager() {
+            _ if !authorized => ERR_GROUP_AUTHZ_FAILED,
             None => ERR_NOT_COORDINATOR,
             Some(mgr) => mgr.heartbeat(
                 &req.group_id,
