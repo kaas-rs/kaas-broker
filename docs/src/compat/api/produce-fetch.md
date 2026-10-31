@@ -194,9 +194,13 @@ partition's `leader_id` is the assignment entry's broker ordinal, and
 `controller_id` is parsed from the assignment's controller identity
 ([Controller](../../architecture/controller.md)). Dev mode — and any partition
 missing from the assignment (fresh topic, recompute pending) — falls back to
-self. An empty request topic list returns every known topic (Apache's "all
-topics" contract); unknown requested topics get a per-topic
-`UNKNOWN_TOPIC_OR_PARTITION` (3). `replica_nodes` and `isr_nodes` are
+self. A null request topic list returns every known topic and an empty one
+returns none, only brokers and cluster info: Apache's contract from v1,
+where only v0 read an empty list as "all topics" (gh #274). Unknown
+requested topics get a per-topic `UNKNOWN_TOPIC_OR_PARTITION` (3). A v10
+entry with a null name or a non-zero topic id gets `INVALID_REQUEST` (42) for
+the whole request, as in Apache below v12, where lookup by id starts.
+`replica_nodes` and `isr_nodes` are
 `[leader]` — the truthful shape for a single-writer design with no
 replication ([non-goals](../non-goals.md)).
 

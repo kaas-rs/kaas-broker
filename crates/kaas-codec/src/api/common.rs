@@ -77,6 +77,50 @@ pub fn write_array_len(buf: &mut BytesMut, count: usize, flexible: bool) -> Resu
     }
 }
 
+/// Read a nullable array length prefix, switching on flexible. `None` ↔
+/// wire null (`-1`, or compact `0`). Use this wherever Apache's schema
+/// gives the array `nullableVersions` and null means something different
+/// from empty: [`read_array_len`] folds both into `0` (gh #274).
+pub fn read_nullable_array_len(
+    buf: &mut Bytes,
+    flexible: bool,
+) -> Result<Option<usize>, CodecError> {
+    let len = if flexible {
+        match primitives::read_uvarint(buf)? {
+            0 => return Ok(None),
+            n => n - 1,
+        }
+    } else {
+        match primitives::read_i32(buf)? {
+            n if n < 0 => return Ok(None),
+            n => u64::from(n.unsigned_abs()),
+        }
+    };
+    usize::try_from(len)
+        .map(Some)
+        .map_err(|_| CodecError::LengthOverflow)
+}
+
+/// Write a nullable array length prefix, switching on flexible. `None`
+/// writes wire null.
+pub fn write_nullable_array_len(
+    buf: &mut BytesMut,
+    count: Option<usize>,
+    flexible: bool,
+) -> Result<(), CodecError> {
+    match count {
+        Some(n) => write_array_len(buf, n, flexible),
+        None if flexible => {
+            primitives::write_uvarint(buf, 0);
+            Ok(())
+        }
+        None => {
+            primitives::write_i32(buf, -1);
+            Ok(())
+        }
+    }
+}
+
 /// Read nullable bytes, switching on flexible. Zero-copy view into
 /// the source buffer.
 pub fn read_nullable_bytes(buf: &mut Bytes, flexible: bool) -> Result<Option<Bytes>, CodecError> {

@@ -68,6 +68,7 @@ use crate::topic_cr_writer::TopicWriteError;
 const ERR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 const ERR_LEADER_NOT_AVAILABLE: i16 = 5;
 const ERR_TOPIC_AUTHZ_FAILED: i16 = 29;
+const ERR_INVALID_REQUEST: i16 = 42;
 
 /// Apache reserves the `__` prefix for internal topics
 /// (`__consumer_offsets`, `__transaction_state`). kaas has no such
@@ -169,6 +170,26 @@ impl Handler for MetadataHandler {
     ) -> Result<BytesMut, HandlerError> {
         let mut body = body;
         let req = metadata::decode_request(&mut body, version)?;
+
+        // gh #274: null asks for every topic, an empty list for none
+        // (brokers and cluster info only). That is Apache from v1; only
+        // v0, which kaas doesn't serve, read an empty list as "all".
+        let requested: Option<Vec<String>> = match req.topics {
+            None => None,
+            Some(topics) => {
+                // Lookup by topic id starts at v12. Below that Apache
+                // rejects a null name or a non-zero id before it looks at
+                // anything else, and kaas serves at most v10.
+                if topics
+                    .iter()
+                    .any(|t| t.name.is_none() || t.topic_id != metadata::NULL_TOPIC_ID)
+                {
+                    return invalid_request_response(topics, version);
+                }
+                Some(topics.into_iter().filter_map(|t| t.name).collect())
+            }
+        };
+
         let (listener_name, principal) = {
             let c = conn.lock();
             (
@@ -206,20 +227,18 @@ impl Handler for MetadataHandler {
         let coord = self.broker.coordinator();
         let controller_id = controller_id(&self.broker);
 
-        // If the request topic list is empty, return every known topic
-        // (Apache: an empty list means "all topics"). If non-empty,
-        // return exactly the requested topics, with UNKNOWN_TOPIC_OR_PARTITION
-        // for any that aren't in our registry.
-        let all_topics = req.topics.is_empty();
-        let topic_names: Vec<String> = if all_topics {
-            self.broker
+        // All topics, or exactly the requested ones with
+        // UNKNOWN_TOPIC_OR_PARTITION for any not in the registry.
+        let all_topics = requested.is_none();
+        let topic_names: Vec<String> = match requested {
+            None => self
+                .broker
                 .topics
                 .all()
                 .into_iter()
                 .map(|t| t.name)
-                .collect()
-        } else {
-            req.topics
+                .collect(),
+            Some(names) => names,
         };
 
         let mut topics = Vec::with_capacity(topic_names.len());
@@ -301,6 +320,32 @@ impl Handler for MetadataHandler {
     }
 }
 
+/// Apache's answer to a request it rejects (`MetadataRequest::getErrorResponse`):
+/// every requested topic echoed with `INVALID_REQUEST`, a null name as
+/// `""`, and no brokers, cluster id or controller.
+fn invalid_request_response(
+    topics: Vec<metadata::RequestTopic>,
+    version: i16,
+) -> Result<BytesMut, HandlerError> {
+    let resp = metadata::Response {
+        throttle_time_ms: 0,
+        brokers: Vec::new(),
+        cluster_id: None,
+        controller_id: -1,
+        topics: topics
+            .into_iter()
+            .map(|t| metadata::Topic {
+                topic_id: t.topic_id,
+                ..error_topic(t.name.unwrap_or_default(), ERR_INVALID_REQUEST)
+            })
+            .collect(),
+        cluster_authorized_operations: 0,
+    };
+    let mut out = BytesMut::new();
+    metadata::encode_response(&mut out, &resp, version)?;
+    Ok(out)
+}
+
 /// A topic entry that carries only an error: no partitions, nil id.
 fn error_topic(name: String, error_code: i16) -> metadata::Topic {
     metadata::Topic {
@@ -319,7 +364,7 @@ mod tests {
     use crate::cli::ListenerEntry;
     use crate::topic_cr_writer::TopicCRWriter;
     use crate::topic_registry::{TopicMeta, TopicRegistry};
-    use kaas_codec::api::common::{write_array_len, write_str};
+    use kaas_codec::api::common::{write_nullable_array_len, write_str};
     use kaas_codec::primitives::write_i8;
     use kaas_codec::tagged;
     use kaas_storage::{MemoryStorage, StorageEngine};
@@ -372,10 +417,19 @@ mod tests {
     }
 
     fn encode_request_v9_auto(topics: &[&str], allow_auto_create: bool) -> Bytes {
+        encode_request_v9_opt(Some(topics), allow_auto_create)
+    }
+
+    /// The all-topics request: a null list (gh #274).
+    fn encode_request_v9_all() -> Bytes {
+        encode_request_v9_opt(None, false)
+    }
+
+    fn encode_request_v9_opt(topics: Option<&[&str]>, allow_auto_create: bool) -> Bytes {
         let flexible = true; // v9 flexible
         let mut w = BytesMut::new();
-        write_array_len(&mut w, topics.len(), flexible).unwrap();
-        for n in topics {
+        write_nullable_array_len(&mut w, topics.map(<[_]>::len), flexible).unwrap();
+        for n in topics.unwrap_or_default() {
             write_str(&mut w, n, flexible).unwrap();
             tagged::write_empty(&mut w);
         }
@@ -657,7 +711,7 @@ mod tests {
         );
         let h = MetadataHandler::new(broker, &listeners());
         let out = h
-            .handle(&conn("internal"), 9, encode_request_v9(&[]))
+            .handle(&conn("internal"), 9, encode_request_v9_all())
             .await
             .unwrap();
         let resp = metadata::decode_response(&mut out.freeze(), 9).unwrap();
@@ -689,15 +743,83 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_topic_list_returns_all_known() {
+    async fn null_topic_list_returns_all_known() {
         let h = MetadataHandler::new(broker_with(vec![("a", 1), ("b", 2)]), &listeners());
-        let body = encode_request_v9(&[]);
-        let out = h.handle(&conn("internal"), 9, body).await.unwrap();
+        let out = h
+            .handle(&conn("internal"), 9, encode_request_v9_all())
+            .await
+            .unwrap();
         let mut r = out.freeze();
         let resp = metadata::decode_response(&mut r, 9).unwrap();
         assert_eq!(resp.topics.len(), 2);
         let names: Vec<&str> = resp.topics.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"a"));
         assert!(names.contains(&"b"));
+    }
+
+    #[tokio::test]
+    async fn empty_topic_list_returns_brokers_and_no_topics() {
+        // gh #274: Apache from v1. Empty meant "all" only at v0.
+        let h = MetadataHandler::new(broker_with(vec![("a", 1), ("b", 2)]), &listeners());
+        let out = h
+            .handle(&conn("internal"), 9, encode_request_v9(&[]))
+            .await
+            .unwrap();
+        let resp = metadata::decode_response(&mut out.freeze(), 9).unwrap();
+        assert!(resp.topics.is_empty(), "got {:?}", resp.topics);
+        assert_eq!(resp.brokers.len(), 1);
+        assert_eq!(resp.cluster_id.as_deref(), Some("kaas-dev"));
+    }
+
+    /// One v10 topic entry: `(topic_id, nullable name)`.
+    fn encode_request_v10(topic_id: [u8; 16], name: Option<&str>) -> Bytes {
+        use kaas_codec::api::common::write_nullable_str;
+        use kaas_codec::primitives::write_uuid;
+        let mut w = BytesMut::new();
+        write_nullable_array_len(&mut w, Some(1), true).unwrap();
+        write_uuid(&mut w, &topic_id);
+        write_nullable_str(&mut w, name, true).unwrap();
+        tagged::write_empty(&mut w);
+        write_i8(&mut w, 0); // allow_auto_topic_creation
+        write_i8(&mut w, 0); // include_cluster_authorized_operations
+        write_i8(&mut w, 0); // include_topic_authorized_operations
+        tagged::write_empty(&mut w);
+        w.freeze()
+    }
+
+    #[tokio::test]
+    async fn v10_rejects_a_topic_named_only_by_id() {
+        // gh #274: this used to drop the nameless entry and so answer
+        // with every topic. Apache rejects a null name or a non-zero id
+        // below v12 (lookup by id is v12+), echoing each entry.
+        let h = MetadataHandler::new(broker_with(vec![("a", 1)]), &listeners());
+        for (id, name) in [([0xab; 16], None), ([0xab; 16], Some("a")), ([0; 16], None)] {
+            let out = h
+                .handle(&conn("internal"), 10, encode_request_v10(id, name))
+                .await
+                .unwrap();
+            let resp = metadata::decode_response(&mut out.freeze(), 10).unwrap();
+            assert_eq!(resp.topics.len(), 1, "{name:?}");
+            assert_eq!(resp.topics[0].error_code, ERR_INVALID_REQUEST);
+            assert_eq!(resp.topics[0].name, name.unwrap_or_default());
+            assert_eq!(resp.topics[0].topic_id, id);
+            assert!(resp.brokers.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn v10_serves_a_named_topic_with_a_nil_id() {
+        let h = MetadataHandler::new(broker_with(vec![("a", 2)]), &listeners());
+        let out = h
+            .handle(
+                &conn("internal"),
+                10,
+                encode_request_v10([0; 16], Some("a")),
+            )
+            .await
+            .unwrap();
+        let resp = metadata::decode_response(&mut out.freeze(), 10).unwrap();
+        assert_eq!(resp.topics[0].error_code, 0);
+        assert_eq!(resp.topics[0].partitions.len(), 2);
     }
 }

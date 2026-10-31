@@ -22,12 +22,13 @@
 use bytes::BytesMut;
 
 use crate::api::common::{
-    read_array_len, read_nullable_str, read_str, write_array_len, write_nullable_str, write_str,
+    read_array_len, read_nullable_array_len, read_nullable_str, read_str, write_array_len,
+    write_nullable_str, write_str,
 };
 use crate::api::registry::ApiSpec;
 use crate::errors::CodecError;
 use crate::primitives::{
-    read_i16, read_i32, read_i8, read_raw, read_uuid, write_i16, write_i32, write_i8, write_uuid,
+    read_i16, read_i32, read_i8, read_uuid, write_i16, write_i32, write_i8, write_uuid,
 };
 use crate::tagged;
 use crate::Bytes;
@@ -48,17 +49,28 @@ pub const NULL_TOPIC_ID: [u8; 16] = [0; 16];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
-    /// Empty = "all topics" (legal request shape since v0). v10+ sends
-    /// each entry as `(topic_id, name)`; on v10 the codec preserves
-    /// the name (the operator's UUID is ignored on request — clients
-    /// send all-zero when only the name is known).
-    pub topics: Vec<String>,
+    /// `None` ↔ wire null = all topics. `Some(vec![])` asks for no
+    /// topics, only brokers and cluster info. That is Apache's contract
+    /// from v1, where the array became nullable; only v0, which kaas
+    /// doesn't serve, read an empty list as "all topics" (gh #274).
+    pub topics: Option<Vec<RequestTopic>>,
     /// v4+.
     pub allow_auto_topic_creation: bool,
     /// v8–v10. Removed in v11.
     pub include_cluster_authorized_operations: bool,
     /// v8+.
     pub include_topic_authorized_operations: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestTopic {
+    /// v10+. All-zero below v10, and from a client that knows only the
+    /// name. Lookup by id starts at v12, so at the versions kaas serves
+    /// Apache rejects a non-zero id with `INVALID_REQUEST`.
+    pub topic_id: [u8; 16],
+    /// `None` ↔ wire null, possible from v10. Apache rejects it below
+    /// v12 with `INVALID_REQUEST`.
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,24 +127,30 @@ pub struct Partition {
 pub fn decode_request(buf: &mut Bytes, version: i16) -> Result<Request, CodecError> {
     let flexible = version >= MIN_FLEXIBLE;
 
-    let topic_count = read_array_len(buf, flexible)?;
-    let mut topics = Vec::with_capacity(topic_count);
-    for _ in 0..topic_count {
-        let name = if flexible && version >= 10 {
-            // v10+ sends (topic_id, nullable name). Skip the UUID; we
-            // route by name in Phase 3.
-            let _ = read_raw(buf, 16)?;
-            read_nullable_str(buf, true)?.unwrap_or_default()
-        } else {
-            read_str(buf, flexible)?
-        };
-        if flexible {
-            tagged::read(buf)?;
+    let topics = match read_nullable_array_len(buf, flexible)? {
+        None => None,
+        Some(n) => {
+            let mut topics = Vec::with_capacity(n.min(1024));
+            for _ in 0..n {
+                let topic = if version >= 10 {
+                    RequestTopic {
+                        topic_id: read_uuid(buf)?,
+                        name: read_nullable_str(buf, true)?,
+                    }
+                } else {
+                    RequestTopic {
+                        topic_id: NULL_TOPIC_ID,
+                        name: Some(read_str(buf, flexible)?),
+                    }
+                };
+                if flexible {
+                    tagged::read(buf)?;
+                }
+                topics.push(topic);
+            }
+            Some(topics)
         }
-        if !name.is_empty() {
-            topics.push(name);
-        }
-    }
+    };
 
     // The field only exists in v4+. Apache's schema declares
     // `"default": "true"`, so a v0-v3 request means "auto-create
@@ -388,10 +406,23 @@ fn write_partition_array(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::common::write_nullable_array_len;
+
+    fn named(names: &[&str]) -> Option<Vec<RequestTopic>> {
+        Some(
+            names
+                .iter()
+                .map(|n| RequestTopic {
+                    topic_id: NULL_TOPIC_ID,
+                    name: Some((*n).to_owned()),
+                })
+                .collect(),
+        )
+    }
 
     fn sample_request(version: i16) -> Request {
         Request {
-            topics: vec!["events".to_owned(), "audit".to_owned()],
+            topics: named(&["events", "audit"]),
             // True at every version: v4+ round-trips the written byte,
             // v0-v3 has no field and decodes to the Apache default.
             allow_auto_topic_creation: true,
@@ -446,13 +477,14 @@ mod tests {
     fn encode_request(req: &Request, version: i16) -> BytesMut {
         let flexible = version >= MIN_FLEXIBLE;
         let mut w = BytesMut::new();
-        write_array_len(&mut w, req.topics.len(), flexible).unwrap();
-        for name in &req.topics {
-            if flexible && version >= 10 {
-                write_uuid(&mut w, &NULL_TOPIC_ID);
-                write_nullable_str(&mut w, Some(name.as_str()), true).unwrap();
+        let topics = req.topics.as_deref();
+        write_nullable_array_len(&mut w, topics.map(<[_]>::len), flexible).unwrap();
+        for t in topics.unwrap_or_default() {
+            if version >= 10 {
+                write_uuid(&mut w, &t.topic_id);
+                write_nullable_str(&mut w, t.name.as_deref(), true).unwrap();
             } else {
-                write_str(&mut w, name, flexible).unwrap();
+                write_str(&mut w, t.name.as_deref().unwrap(), flexible).unwrap();
             }
             if flexible {
                 tagged::write_empty(&mut w);
@@ -507,7 +539,7 @@ mod tests {
         // only gate for those clients.
         let w = encode_request(
             &Request {
-                topics: vec!["events".to_owned()],
+                topics: named(&["events"]),
                 allow_auto_topic_creation: false,
                 include_cluster_authorized_operations: false,
                 include_topic_authorized_operations: false,
@@ -522,7 +554,7 @@ mod tests {
         // v4+ clients that opt out must stay opted out.
         let w = encode_request(
             &Request {
-                topics: vec!["events".to_owned()],
+                topics: named(&["events"]),
                 allow_auto_topic_creation: false,
                 include_cluster_authorized_operations: false,
                 include_topic_authorized_operations: false,
@@ -541,8 +573,58 @@ mod tests {
         roundtrip_request(9);
     }
     #[test]
-    fn request_v10_topic_id_skipped_on_decode() {
+    fn request_v10_topic_id_roundtrip() {
         roundtrip_request(10);
+    }
+
+    // gh #274: null and empty are different requests from v1. These are
+    // hand-written bytes in the layout of Apache's MetadataRequest.json,
+    // not encoder output, so a bug the encoder and decoder share can't
+    // hide here (gh #272).
+
+    #[test]
+    fn request_v1_null_topics_is_all_topics() {
+        let mut b = Bytes::from_static(&[0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(decode_request(&mut b, 1).unwrap().topics, None);
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn request_v1_empty_topics_is_no_topics() {
+        let mut b = Bytes::from_static(&[0, 0, 0, 0]);
+        assert_eq!(decode_request(&mut b, 1).unwrap().topics, Some(vec![]));
+        assert!(b.is_empty());
+    }
+
+    #[test]
+    fn request_v9_compact_null_and_empty_differ() {
+        // topics, allow_auto_topic_creation, include_cluster_authorized_operations,
+        // include_topic_authorized_operations, request tagged fields.
+        let mut null = Bytes::from_static(&[0x00, 1, 0, 0, 0]);
+        assert_eq!(decode_request(&mut null, 9).unwrap().topics, None);
+        assert!(null.is_empty());
+        let mut empty = Bytes::from_static(&[0x01, 1, 0, 0, 0]);
+        assert_eq!(decode_request(&mut empty, 9).unwrap().topics, Some(vec![]));
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn request_v10_keeps_a_null_name_and_its_id() {
+        let mut raw = vec![0x02]; // one topic
+        raw.extend_from_slice(&[0xab; 16]); // topic_id
+        raw.push(0x00); // name: compact null
+        raw.push(0x00); // topic tagged fields
+        raw.extend_from_slice(&[1, 0, 0, 0]); // flags + request tagged fields
+        let mut b = Bytes::from(raw);
+        let got = decode_request(&mut b, 10).unwrap();
+        assert_eq!(
+            got.topics,
+            Some(vec![RequestTopic {
+                topic_id: [0xab; 16],
+                name: None,
+            }])
+        );
+        assert!(b.is_empty());
     }
 
     #[test]
