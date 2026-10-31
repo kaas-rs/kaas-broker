@@ -333,7 +333,6 @@ async fn main() -> Result<()> {
             Arc::new(parking_lot::Mutex::new(std::collections::HashSet::new()));
         let broker_migrate = broker.clone();
         let broker_delete = broker.clone();
-        let engine_delete = engine.clone();
         let notify_apply = topic_notify.clone();
         let notify_delete = topic_notify.clone();
         let watch_cancel = cancel.clone();
@@ -430,60 +429,15 @@ async fn main() -> Result<()> {
                 },
                 move |name| {
                     topics_delete.remove(name);
-                    // gh #219: drop the topic's partitions from the
-                    // engine *without persisting*. Leaving it to the
-                    // assignment recompute is too late on a
-                    // delete→recreate (Streams' `application-reset`
-                    // does exactly that): the recompute can coalesce
-                    // both events into no ownership change at all,
-                    // leaving the recreated topic served from the dead
-                    // one's in-memory state — and a relinquish landing
-                    // after the operator re-created the directory
-                    // writes the dead incarnation's manifest into it.
-                    // The spawn resolves in microseconds while the
-                    // recreate's take-over is gated behind an
-                    // assignment recompute + watch (~1 s), so the drop
-                    // lands first with a wide margin.
-                    let engine = engine_delete.clone();
-                    let broker_purge = broker_delete.clone();
+                    // Engine partitions (gh #219), committed group
+                    // offsets (gh #240) and traffic series (gh #261). The
+                    // spawn resolves in microseconds while a recreate's
+                    // take-over is gated behind an assignment recompute
+                    // + watch (~1 s), so the drop lands first with a
+                    // wide margin.
+                    let broker = broker_delete.clone();
                     let topic = name.to_string();
-                    tokio::spawn(async move {
-                        let dropped = engine.abandon_topic(&topic).await;
-                        if dropped > 0 {
-                            info!(topic, dropped, "topic deleted; dropped open partitions");
-                        }
-                        // gh #240: a deleted topic's committed group
-                        // offsets must go with it, the way Apache
-                        // tombstones them out of `__consumer_offsets`.
-                        // Left behind, a delete→recreate under the same
-                        // name (Streams' `application-reset` every run)
-                        // hands the new incarnation the dead one's
-                        // offsets; if the new log is shorter, the group
-                        // resumes past its end and idles forever with no
-                        // error on either side. The Manager is absent in
-                        // dev mode and for the brief window before the
-                        // cluster runtime installs it — no coordinated
-                        // groups exist then either.
-                        if let Some(mgr) = broker_purge.coord_manager() {
-                            let (purged, failed) = mgr.purge_topic_offsets(&topic);
-                            if purged > 0 {
-                                info!(
-                                    topic,
-                                    purged, "topic deleted; purged committed group offsets"
-                                );
-                            }
-                            if !failed.is_empty() {
-                                // Best-effort: the stale entries only
-                                // bite a group that resumes on a
-                                // recreated topic of the same name.
-                                warn!(
-                                    topic,
-                                    groups = failed.join(","),
-                                    "topic deleted; could not purge offsets for some groups"
-                                );
-                            }
-                        }
-                    });
+                    tokio::spawn(async move { broker.forget_deleted_topic(&topic).await });
                     notify_delete.notify(kaas_controller::AssignmentReason::TopicDeleted);
                 },
                 // gh #241: the first completed list makes the

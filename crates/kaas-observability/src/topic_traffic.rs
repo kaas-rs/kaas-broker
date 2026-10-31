@@ -53,10 +53,18 @@ impl TopicTrafficMeter {
             .or_insert_with(|| Arc::new(TopicCounters::default()));
     }
 
-    /// Drop the accumulator. Called on `KafkaTopic` CR delete so orphan
-    /// timeseries don't linger on the dashboard.
+    /// Drop the accumulator. Called on `KafkaTopic` CR delete
+    /// (`Broker::forget_deleted_topic`, gh #261) so orphan timeseries
+    /// don't linger on the dashboard.
     pub fn forget(&self, topic: &str) {
         self.counters.remove(topic);
+    }
+
+    /// Whether `topic` has an accumulator, i.e. emits a series at every
+    /// scrape. For assertions, like [`Self::produce_records`].
+    #[must_use]
+    pub fn tracks(&self, topic: &str) -> bool {
+        self.counters.contains_key(topic)
     }
 
     /// Hot-path from the Produce handler. Auto-touches the topic.

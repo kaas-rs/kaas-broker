@@ -400,6 +400,60 @@ impl Broker {
     pub fn quota_enforcer(&self) -> Option<Arc<QuotaEnforcer>> {
         self.quota_enforcer.read().clone()
     }
+
+    /// Drop everything this broker holds for a deleted topic. Called
+    /// from the topic watch's delete callback, after the topic has left
+    /// the registry, so no new request can touch it.
+    pub async fn forget_deleted_topic(&self, topic: &str) {
+        // gh #219: drop the topic's partitions from the engine
+        // *without persisting*. Leaving it to the assignment recompute
+        // is too late on a delete→recreate (Streams' `application-reset`
+        // does exactly that): the recompute can coalesce both events
+        // into no ownership change at all, leaving the recreated topic
+        // served from the dead one's in-memory state — and a relinquish
+        // landing after the operator re-created the directory writes the
+        // dead incarnation's manifest into it.
+        let dropped = self.engine.abandon_topic(topic).await;
+        if dropped > 0 {
+            tracing::info!(topic, dropped, "topic deleted; dropped open partitions");
+        }
+        // gh #240: a deleted topic's committed group offsets must go
+        // with it, the way Apache tombstones them out of
+        // `__consumer_offsets`. Left behind, a delete→recreate under the
+        // same name (Streams' `application-reset` every run) hands the
+        // new incarnation the dead one's offsets; if the new log is
+        // shorter, the group resumes past its end and idles forever with
+        // no error on either side. The Manager is absent in dev mode and
+        // for the brief window before the cluster runtime installs it —
+        // no coordinated groups exist then either.
+        if let Some(mgr) = self.coord_manager() {
+            let (purged, failed) = mgr.purge_topic_offsets(topic);
+            if purged > 0 {
+                tracing::info!(
+                    topic,
+                    purged,
+                    "topic deleted; purged committed group offsets"
+                );
+            }
+            if !failed.is_empty() {
+                // Best-effort: the stale entries only bite a group that
+                // resumes on a recreated topic of the same name.
+                tracing::warn!(
+                    topic,
+                    groups = failed.join(","),
+                    "topic deleted; could not purge offsets for some groups"
+                );
+            }
+        }
+        // gh #261: and its per-topic traffic counters, which otherwise
+        // emit a dead series for every topic ever deleted (Streams'
+        // reset churns through dozens), as Apache's
+        // BrokerTopicStats.removeMetrics does. After the abandon, so an
+        // append still in flight can't re-create the entry.
+        kaas_observability::metrics::global()
+            .topic_traffic
+            .forget(topic);
+    }
 }
 
 #[cfg(test)]
@@ -424,5 +478,25 @@ mod tests {
     fn first_producer_id_is_one() {
         let b = test_broker();
         assert_eq!(b.next_producer_id(), 1);
+    }
+
+    /// gh #261: a deleted topic's traffic counters are dropped, not left
+    /// to emit a dead series for the life of the process.
+    #[tokio::test]
+    async fn a_deleted_topic_stops_emitting_traffic_series() {
+        let b = test_broker();
+        let tt = kaas_observability::metrics::global().topic_traffic.clone();
+        // Unique names: the meter is process-global and tests run in
+        // parallel.
+        let (gone, kept) = ("gh261-deleted", "gh261-kept");
+        tt.record_produce(gone, 3, 300);
+        tt.record_produce(kept, 1, 100);
+        assert!(tt.tracks(gone));
+
+        b.forget_deleted_topic(gone).await;
+
+        assert!(!tt.tracks(gone), "the deleted topic's series must go");
+        assert!(tt.tracks(kept), "only the deleted topic's");
+        assert_eq!(tt.produce_records(gone), 0);
     }
 }

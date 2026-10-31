@@ -21,9 +21,10 @@ partitions, volume assignments (gh #221), the migrate-to annotation
 (gh #224), and `Status.TopicID` (gh #241 — fed into the `TopicRegistry`'s
 incarnation side-map for the stale-dir gate), and the pump takes an
 `on_synced` callback fired on the first completed relist. The delete
-callback closes FDs and purges state immediately (`engine.abandon_topic`,
-gh #219; `purge_topic_offsets`, gh #240) rather than waiting for the
-assignment recompute. What remains **not wired in** is the TopicID on the
+callback closes FDs and purges state immediately through
+`Broker::forget_deleted_topic` (`engine.abandon_topic`, gh #219;
+`purge_topic_offsets`, gh #240; the topic's traffic series, gh #261)
+rather than waiting for the assignment recompute. What remains **not wired in** is the TopicID on the
 wire: Metadata still serves all-zero topic IDs
 ([KIP-516](../compat/kip/kip-516.md)).
 
