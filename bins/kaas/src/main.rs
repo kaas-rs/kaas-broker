@@ -209,12 +209,6 @@ async fn main() -> Result<()> {
         cli.log_dirs.clone(),
         topics.clone(),
     )?;
-    if topics.is_empty() {
-        warn!(
-            "KAAS_TOPICS is empty — broker will serve metadata for zero topics. \
-             Set the env var to a JSON array, e.g. [{{\"name\":\"t1\",\"partitions\":1}}]"
-        );
-    }
 
     let auth = build_auth(&cli)?;
     let broker = Arc::new(Broker::with_auth(
@@ -268,6 +262,17 @@ async fn main() -> Result<()> {
     } else {
         None
     };
+
+    // KAAS_TOPICS is only a seed. With a kube client the KafkaTopic
+    // watch below is the topic source and the chart never sets the env
+    // var, so warning regardless fired on every healthy boot (gh #271).
+    if kube_client.is_none() && topics.is_empty() {
+        warn!(
+            "KAAS_TOPICS is empty and there is no KafkaTopic watch — broker will \
+             serve metadata for zero topics. Set the env var to a JSON array, \
+             e.g. [{{\"name\":\"t1\",\"partitions\":1}}]"
+        );
+    }
 
     // Topic-change trigger: watcher callbacks poke the controller's
     // AssignmentLoop (no-op unless this broker holds the Lease).

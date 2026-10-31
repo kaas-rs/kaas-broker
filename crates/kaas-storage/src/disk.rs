@@ -51,6 +51,15 @@ pub struct DiskStorageEngine {
     migrating: DashMap<(String, i32), ()>,
 }
 
+/// Where [`DiskStorageEngine::locate`] found a partition's data.
+struct Located {
+    /// The root that holds the partition, or will hold it if it is new.
+    root: PathBuf,
+    /// The root the placement record names, when the broker holds a
+    /// record and the data is somewhere else (gh #234).
+    placed_elsewhere: Option<PathBuf>,
+}
+
 impl std::fmt::Debug for DiskStorageEngine {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DiskStorageEngine")
@@ -140,23 +149,29 @@ impl DiskStorageEngine {
         }
     }
 
+    /// The log-dir name the placement record gives `(topic, partition)`.
+    /// `None` means this broker holds no record for it yet, which is not
+    /// the same as the default root: a recorded default placement is
+    /// `Some("default")`.
+    fn placement_of(&self, topic: &str, partition: i32) -> Option<String> {
+        self.placement
+            .read()
+            .as_ref()
+            .and_then(|r| r.log_dir_of(topic, partition))
+    }
+
+    /// Root directory of the log dir called `name`. Falls back to
+    /// `data_dir` on any miss.
+    fn root_named(&self, name: Option<&str>) -> PathBuf {
+        name.and_then(|n| self.extra_log_dirs.iter().find(|d| d.name == n))
+            .map(|d| d.path.clone())
+            .unwrap_or_else(|| self.data_dir.clone())
+    }
+
     /// Root directory hosting `(topic, partition)` under the current
     /// placement. Falls back to `data_dir` on any miss.
     fn log_dir_root(&self, topic: &str, partition: i32) -> PathBuf {
-        let name = self
-            .placement
-            .read()
-            .as_ref()
-            .and_then(|r| r.log_dir_of(topic, partition));
-        match name {
-            Some(n) => self
-                .extra_log_dirs
-                .iter()
-                .find(|d| d.name == n)
-                .map(|d| d.path.clone())
-                .unwrap_or_else(|| self.data_dir.clone()),
-            None => self.data_dir.clone(),
-        }
+        self.root_named(self.placement_of(topic, partition).as_deref())
     }
 
     /// Directory hosting `(topic, partition)`'s data — **where the data
@@ -178,9 +193,16 @@ impl DiskStorageEngine {
     ///    move copies the manifest to the target before the placement
     ///    record flips).
     /// 2. Otherwise, a *different* known root already holds a manifest
-    ///    for this partition → that root wins, loudly. Data never moves
+    ///    for this partition → that root wins. Data never moves
     ///    because a status record showed up late; only the explicit
     ///    migration path (`move_partition_to_log_dir`) relocates bytes.
+    ///    This warns only when the broker holds a placement record and
+    ///    it names another root. Without a record there is nothing to
+    ///    contradict, and that is every boot: the takeover runs off
+    ///    `assignment.json` before the topic watch has delivered
+    ///    `status.volumeAssignments`, so the fallback is the default
+    ///    root, and every pool-placed partition warned on every restart
+    ///    (gh #271).
     /// 3. No manifest anywhere → assigned root (fresh create).
     ///
     /// When several foreign roots hold manifests (shouldn't happen —
@@ -188,31 +210,52 @@ impl DiskStorageEngine {
     /// the default root wins if present, else the first pool root by
     /// declaration order: deterministic beats clever here.
     fn partition_dir(&self, topic: &str, partition: i32) -> PathBuf {
-        let assigned_root = self.log_dir_root(topic, partition);
-        let sub = |root: &Path| root.join(topic).join(partition.to_string());
-        let has_manifest = |root: &Path| self.fs.stat(&sub(root).join("manifest.json")).is_ok();
+        let found = self.locate(topic, partition);
+        if let Some(assigned) = &found.placed_elsewhere {
+            tracing::warn!(
+                topic,
+                partition,
+                assigned = %assigned.display(),
+                actual = %found.root.display(),
+                "partition data lives outside its assigned log dir; \
+                 serving from where the data is (gh #234) — use the \
+                 migration path to relocate it"
+            );
+        }
+        found.root.join(topic).join(partition.to_string())
+    }
+
+    /// The decision behind [`Self::partition_dir`], without the log line.
+    fn locate(&self, topic: &str, partition: i32) -> Located {
+        let placed = self.placement_of(topic, partition);
+        let assigned_root = self.root_named(placed.as_deref());
+        let has_manifest = |root: &Path| {
+            let manifest = root
+                .join(topic)
+                .join(partition.to_string())
+                .join("manifest.json");
+            self.fs.stat(&manifest).is_ok()
+        };
 
         if has_manifest(&assigned_root) {
-            return sub(&assigned_root);
+            return Located {
+                root: assigned_root,
+                placed_elsewhere: None,
+            };
         }
         let adopted = std::iter::once(self.data_dir.clone())
             .chain(self.extra_log_dirs.iter().map(|d| d.path.clone()))
             .filter(|root| *root != assigned_root)
             .find(|root| has_manifest(root));
         match adopted {
-            Some(root) => {
-                tracing::warn!(
-                    topic,
-                    partition,
-                    assigned = %assigned_root.display(),
-                    actual = %root.display(),
-                    "partition data lives outside its assigned log dir; \
-                     serving from where the data is (gh #234) — use the \
-                     migration path to relocate it"
-                );
-                sub(&root)
-            }
-            None => sub(&assigned_root),
+            Some(root) => Located {
+                root,
+                placed_elsewhere: placed.map(|_| assigned_root),
+            },
+            None => Located {
+                root: assigned_root,
+                placed_elsewhere: None,
+            },
         }
     }
 
@@ -533,12 +576,7 @@ impl StorageEngine for DiskStorageEngine {
     }
 
     fn partition_log_dir(&self, topic: &str, partition: i32) -> String {
-        let name = self
-            .placement
-            .read()
-            .as_ref()
-            .and_then(|r| r.log_dir_of(topic, partition));
-        match name {
+        match self.placement_of(topic, partition) {
             // An unknown name resolves to the default root (see
             // `log_dir_root`), so report it as such.
             Some(n) if self.extra_log_dirs.iter().any(|d| d.name == n) => n,
@@ -1093,6 +1131,9 @@ mod tests {
             // Reported log dir keeps naming the assignment (that is the
             // record's job); the data path is what must not move.
             assert_eq!(e.partition_log_dir("t", 0), "bulk");
+            // A known record that names another root: the one case the
+            // warning is for.
+            assert_eq!(e.locate("t", 0).placed_elsewhere, Some(bulk_root.clone()));
 
             // Phase 3: a genuinely fresh partition under the same
             // placement is created at its assigned root.
@@ -1106,7 +1147,8 @@ mod tests {
     /// its topic watch has delivered `status.volumeAssignments`, so a
     /// partition correctly placed on a pool root resolves to the default
     /// root. It must still serve the pool copy — this is the arm every
-    /// restart of a pool-backed cluster relies on.
+    /// restart of a pool-backed cluster relies on — and, with no record
+    /// to contradict, it must do so without a warning (gh #271).
     #[test]
     fn a_restart_before_placement_is_known_serves_the_pool_copy() {
         use crate::engine::{LogDirInfo, PlacementResolver};
@@ -1114,6 +1156,14 @@ mod tests {
         impl PlacementResolver for AssignBulk {
             fn log_dir_of(&self, _topic: &str, _partition: i32) -> Option<String> {
                 Some("bulk".to_owned())
+            }
+        }
+        /// The registry as it is at boot: installed, but the topic watch
+        /// hasn't listed yet.
+        struct NotYetKnown;
+        impl PlacementResolver for NotYetKnown {
+            fn log_dir_of(&self, _topic: &str, _partition: i32) -> Option<String> {
+                None
             }
         }
         rt().block_on(async {
@@ -1144,8 +1194,9 @@ mod tests {
             }
             assert!(bulk_root.join("t/0/manifest.json").is_file());
 
-            // The restart: a fresh engine with no placement resolver yet.
+            // The restart: a fresh engine whose resolver knows nothing yet.
             let e = engine();
+            e.set_placement_resolver(Arc::new(NotYetKnown));
             assert_eq!(e.take_over("t", 0, 2).await.unwrap(), 3);
             assert!(
                 !e.read("t", 0, 0, 1 << 20).await.unwrap().is_empty(),
@@ -1154,6 +1205,12 @@ mod tests {
             assert!(
                 !default_root.join("t/0").exists(),
                 "no empty shell may be created on the default root"
+            );
+            let found = e.locate("t", 0);
+            assert_eq!(found.root, bulk_root);
+            assert_eq!(
+                found.placed_elsewhere, None,
+                "no placement record yet, so nothing for the warning to report"
             );
             e.relinquish_all().await.unwrap();
         });
