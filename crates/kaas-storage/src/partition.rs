@@ -49,11 +49,15 @@ use crate::idempotence::{
     ProducerEntry,
 };
 use crate::manifest::{self, Manifest, ReadResult};
-use crate::producer_snapshot::{read_producer_snapshot, write_producer_snapshot};
-use crate::recovery_checkpoint::{self, RecoveryCheckpoint};
+use crate::producer_snapshot::{
+    read_producer_snapshot, write_producer_snapshot, PRODUCER_SNAPSHOT_FILENAME,
+};
+use crate::recovery_checkpoint::{self, RecoveryCheckpoint, RECOVERY_CHECKPOINT_FILENAME};
 use crate::segment::{self, parse_batch_offsets, ActiveSegment, SegmentMeta};
 use crate::txn_index::{AbortedTxn, AbortedTxnIndex, OpenTxnIndex};
-use crate::txn_index_snapshot::{read_txn_index_snapshot, write_txn_index_snapshot};
+use crate::txn_index_snapshot::{
+    read_txn_index_snapshot, write_txn_index_snapshot, TXN_INDEX_SNAPSHOT_FILENAME,
+};
 
 /// gh #recovery-checkpoint: the committer writes a fresh recovery
 /// checkpoint once the fsynced log has grown this far past the last one.
@@ -265,6 +269,7 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
         manifest::ManifestError::Json(e) => StorageError::Json(e),
         other => StorageError::Io(std::io::Error::other(other.to_string())),
     })?;
+    let manifest_present = !matches!(manifest_read, ReadResult::NotFound);
     let (epoch, hwm, log_start) = match manifest_read {
         ReadResult::Present(m) => (m.epoch, m.high_watermark, m.log_start_offset),
         ReadResult::Legacy(m) => (m.epoch, 0, 0),
@@ -274,15 +279,50 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
     // Load any existing segments.
     let mut closed = segment::list_segments(fs, dir)?;
 
+    // gh #229: a manifest with no segments behind it describes a log
+    // that is gone — a dead incarnation's relinquish landing in a
+    // recreated dir, a partial restore, a half-finished
+    // `remove_dir_all`. Basing the new segment at its HWM advertised
+    // offsets no record backs, silently. Start over at log start the way
+    // Apache does (`LogLoader` bases the new segment at the log-start
+    // checkpoint and the HWM clamps to the log end), and drop the files
+    // that describe the lost records: the snapshots would restore a
+    // dedupe window and open-txn entries for batches that no longer
+    // exist, and the recovery checkpoint would match the new segment as
+    // soon as it grew past `byte_pos`, seeding the next recovery from
+    // the dead log's HWM (gh #230). They go before the segment is
+    // created, so a crash in between re-takes this branch next open.
+    if closed.is_empty() && manifest_present {
+        if hwm > log_start {
+            tracing::warn!(
+                dir = %dir.display(),
+                manifest_high_watermark = hwm,
+                log_start,
+                "partition manifest claims records but no segments exist; \
+                 resetting to log start (gh #229)"
+            );
+        }
+        for name in [
+            PRODUCER_SNAPSHOT_FILENAME,
+            TXN_INDEX_SNAPSHOT_FILENAME,
+            RECOVERY_CHECKPOINT_FILENAME,
+        ] {
+            match fs.remove(&dir.join(name)) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                _ => {}
+            }
+        }
+    }
+
     // The active segment is the last one (highest base_offset);
-    // if none exist yet, create at offset 0 with our current
-    // epoch.
+    // if none exist yet, create at log start (0 for a fresh
+    // partition) with our current epoch.
     let mut active = if let Some(last) = closed.pop() {
         let mut a = ActiveSegment::open_meta_only(last);
         a.open_handles(fs)?;
         a
     } else {
-        ActiveSegment::create(fs, dir, hwm, epoch)?
+        ActiveSegment::create(fs, dir, log_start, epoch)?
     };
 
     // Recover the high-watermark by scanning the active segment
@@ -3170,6 +3210,128 @@ mod tests {
             assert_eq!(p2.high_watermark(), 5);
             assert_eq!(p2.log_start_offset(), 2);
             p2.close().await.unwrap();
+        });
+    }
+
+    /// gh #229: a manifest that outlived its segments — a dead
+    /// incarnation's relinquish landing in a recreated dir, a partial
+    /// restore, a half-finished `remove_dir_all` — describes a log that
+    /// no longer exists. Open used to base a fresh segment at the
+    /// manifest's HWM, so the partition advertised offsets it had no
+    /// records for and a consumer reading from the start got nothing.
+    /// Apache bases the new segment at log start and clamps the HWM to
+    /// the log end; the snapshots describing the lost records go too.
+    #[test]
+    fn a_manifest_that_outlived_its_segments_is_not_adopted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Partition::open(
+                fs.clone(),
+                "t".into(),
+                0,
+                dir.clone(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            p.append(0, -1, build_batch(2, 1_000)).await.unwrap();
+            // Left open, so the txn index and the producer snapshot both
+            // carry an entry for records that are about to vanish.
+            p.append(0, -1, build_txn_data_batch(42, 3)).await.unwrap();
+            p.delete_records(1).await.unwrap();
+            assert_eq!(p.high_watermark(), 5);
+            assert_eq!(p.last_stable_offset(), 2);
+            p.close().await.unwrap();
+
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(segment::LOG_EXT) || name.ends_with(segment::INDEX_EXT) {
+                    std::fs::remove_file(entry.path()).unwrap();
+                }
+            }
+
+            let p2 = Partition::open(fs, "t".into(), 0, dir.clone(), PartitionConfig::default())
+                .await
+                .unwrap();
+            assert_eq!(p2.log_start_offset(), 1);
+            assert_eq!(
+                p2.high_watermark(),
+                1,
+                "the HWM must not claim records the log no longer has"
+            );
+            assert_eq!(
+                p2.last_stable_offset(),
+                1,
+                "an open txn from the lost log must not hold the LSO above the HWM"
+            );
+            // The lost batch's sequence is not a duplicate any more: it
+            // is written, at the reset log end, not echoed from the
+            // dead dedupe window.
+            let base = p2.append(0, -1, build_txn_data_batch(42, 3)).await.unwrap();
+            assert_eq!(base, 1);
+            assert_eq!(p2.high_watermark(), 4);
+            p2.close().await.unwrap();
+        });
+    }
+
+    /// gh #229 / gh #230: the lost log's recovery checkpoint names
+    /// segment base 0 — and so does the segment the reset creates when
+    /// log start is 0. Once the new log reaches the checkpoint's
+    /// `byte_pos`, a crash recovery resumes there seeded with the dead
+    /// log's HWM; with nothing left to scan, the seed *is* the answer.
+    /// The reset has to take the checkpoint with it.
+    #[test]
+    fn a_reset_log_does_not_recover_from_the_lost_logs_checkpoint() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Partition::open(
+                fs.clone(),
+                "t".into(),
+                0,
+                dir.clone(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            // Same bytes per batch as below, three times the offsets.
+            for _ in 0..5 {
+                p.append(0, -1, build_batch(3, 1_000)).await.unwrap();
+            }
+            p.close().await.unwrap(); // checkpoint at EOF: HWM 15
+
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(segment::LOG_EXT) || name.ends_with(segment::INDEX_EXT) {
+                    std::fs::remove_file(entry.path()).unwrap();
+                }
+            }
+
+            let p2 = Partition::open(
+                fs.clone(),
+                "t".into(),
+                0,
+                dir.clone(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            // Same batch count, so the new log ends at the old `byte_pos`.
+            for _ in 0..5 {
+                p2.append(0, -1, build_batch(1, 1_000)).await.unwrap();
+            }
+            assert_eq!(p2.high_watermark(), 5);
+            // Crash: no close, so no fresh checkpoint papers over it.
+            drop(p2);
+
+            let p3 = Partition::open(fs, "t".into(), 0, dir.clone(), PartitionConfig::default())
+                .await
+                .unwrap();
+            assert_eq!(p3.high_watermark(), 5);
+            p3.close().await.unwrap();
         });
     }
 
