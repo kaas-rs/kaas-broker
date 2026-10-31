@@ -85,10 +85,20 @@ block allocator (below) and epoch 0, no coordinator gate. A non-empty `transacti
 hits the coordinator gate, then the state store: the first call for an
 id allocates a fresh PID at epoch 0; **every reconnect returns the same
 PID with `epoch + 1`** — fencing is the monotonic epoch, the KIP-98
-contract as amended by [KIP-360](../kip/kip-360.md). Epoch overflow at
-`i16::MAX` rotates to a fresh PID at epoch 0. The request's
+contract as amended by [KIP-360](../kip/kip-360.md). Epoch exhaustion at
+`i16::MAX - 1` rotates to a fresh PID at epoch 0. The request's
 `transaction_timeout_ms` is recorded on the entry as the reaper's
 deadline input.
+
+The v3+ `producer_id` / `producer_epoch` fields are validated as the
+caller's claimed identity, as in Apache: a half-set pair is
+`INVALID_REQUEST`; a claim that is neither the current epoch (bump) nor
+the one it was just bumped from (retry, same answer) is
+`PRODUCER_FENCED`. A rejoin that finds an `Ongoing` transaction aborts it
+first — ABORT markers at a bumped epoch — and answers
+`CONCURRENT_TRANSACTIONS`; one that finds `Prepare*` answers
+`CONCURRENT_TRANSACTIONS` until the markers land. Details on the
+[KIP-360](../kip/kip-360.md) page.
 
 After every `epoch > 0` bump the handler fences the old session twice
 over: an in-process walk advances the PID's epoch and clears its dedupe
@@ -101,16 +111,6 @@ epoch 0, and a one-shot warning that the rejoin fence is disabled.
 
 **Deviations from Apache 3.7**:
 
-- The v3+ request fields `producer_id` / `producer_epoch` (KIP-360) are
-  decoded but ignored. Apache validates the caller's current epoch and
-  fences stale producers with `PRODUCER_FENCED`; kaas bumps the epoch
-  for any caller — a zombie that re-calls `InitProducerId` is handed a
-  new valid epoch instead of an error (each rejoin fences the *other*
-  session, so mutual fencing still converges, but not Apache's answer).
-- A rejoin during an `Ongoing` transaction does not abort it. Apache
-  aborts the in-flight transaction first (answering
-  `CONCURRENT_TRANSACTIONS` until done); kaas bumps the epoch and leaves
-  the entry `Ongoing` for the timeout reaper to sweep.
 - `transaction_timeout_ms` is not validated against a
   `transaction.max.timeout.ms` ceiling (Apache rejects oversized values
   with `INVALID_TRANSACTION_TIMEOUT`); kaas records whatever is sent.

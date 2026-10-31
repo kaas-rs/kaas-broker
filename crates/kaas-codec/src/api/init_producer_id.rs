@@ -8,10 +8,8 @@
 //!
 //! v3+ adds `(producer_id, producer_epoch)` request fields per KIP-360
 //! so a producer can ask for renewal of an existing PID after a fatal
-//! error. Kaas accepts but currently ignores these — every
-//! `InitProducerId` returns a fresh PID with `epoch = 0`. The Phase 6
-//! transaction work wires the gh #22 rejoin contract that respects the
-//! request fields.
+//! error. The codec only carries them; the broker handler validates
+//! them against the txn state store (gh #201).
 
 use bytes::BytesMut;
 

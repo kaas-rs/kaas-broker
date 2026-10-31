@@ -125,6 +125,36 @@ pub struct TxnEntry {
     pub state: TxnState,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<String>,
+    /// Apache's `lastProducerId` (KIP-360): the PID this entry held
+    /// before its latest `InitProducerId`. Differs from `pid` only
+    /// after a rotation on epoch exhaustion, and it is only consulted
+    /// while `state` is `Empty` — the state every `InitProducerId`
+    /// lands in and nothing else does — because Apache overwrites it
+    /// with the current PID on every later transition.
+    #[serde(default = "no_producer_id", skip_serializing_if = "is_no_producer_id")]
+    pub last_pid: i64,
+    /// Apache's `lastProducerEpoch` (KIP-360): the epoch a producer
+    /// held before its own claimed-identity bump, so a retry of that
+    /// bump gets the same answer instead of `PRODUCER_FENCED`. `-1`
+    /// after a new-instance init or a fence — that is what makes the
+    /// previous session's claim stale.
+    #[serde(
+        default = "no_producer_epoch",
+        skip_serializing_if = "is_no_producer_epoch"
+    )]
+    pub last_epoch: i16,
+}
+
+/// `RecordBatch.NO_PRODUCER_ID`.
+pub const NO_PRODUCER_ID: i64 = -1;
+/// `RecordBatch.NO_PRODUCER_EPOCH`.
+pub const NO_PRODUCER_EPOCH: i16 = -1;
+
+/// Apache's `TransactionMetadata.isEpochExhausted`. One short of
+/// `i16::MAX` because fencing an `Ongoing` transaction bumps once more
+/// without going through `InitProducerId`'s rotation check.
+fn is_epoch_exhausted(epoch: i16) -> bool {
+    epoch >= i16::MAX - 1
 }
 
 fn i64_is_zero(v: &i64) -> bool {
@@ -132,6 +162,32 @@ fn i64_is_zero(v: &i64) -> bool {
 }
 fn i32_is_zero(v: &i32) -> bool {
     *v == 0
+}
+fn no_producer_id() -> i64 {
+    NO_PRODUCER_ID
+}
+fn is_no_producer_id(v: &i64) -> bool {
+    *v == NO_PRODUCER_ID
+}
+fn no_producer_epoch() -> i16 {
+    NO_PRODUCER_EPOCH
+}
+fn is_no_producer_epoch(v: &i16) -> bool {
+    *v == NO_PRODUCER_EPOCH
+}
+
+/// What [`TxnStateStore::init_producer_id`] decided.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InitPidOutcome {
+    /// Hand `(pid, epoch)` to the producer.
+    Ready { pid: i64, epoch: i16 },
+    /// The id had an `Ongoing` transaction, so it was fenced instead:
+    /// the entry is now `PrepareAbort` at a bumped epoch with its
+    /// dispatch set intact. The caller owes the ABORT markers (or
+    /// leaves them to the reconcile) and must answer
+    /// `CONCURRENT_TRANSACTIONS` — the bumped epoch is never handed to
+    /// anyone, and the producer's retry bumps again once it completes.
+    AbortingOngoing(PendingMarkerDispatch),
 }
 
 /// One transaction still owing markers, as reported by
@@ -292,12 +348,70 @@ impl TxnStateStore {
     /// `transaction.timeout.ms`. `timeout_ms <= 0` leaves the
     /// existing entry's timeout untouched (cooperative for the
     /// non-transactional fast path).
+    ///
+    /// [`Self::init_producer_id`] with no claimed identity. An
+    /// `Ongoing` or `Prepare*` entry answers
+    /// [`TxnStateError::Concurrent`]; an `Ongoing` one is fenced on the
+    /// way, and its ABORT markers are left to the reconcile.
     pub fn get_or_allocate_with_timeout<F>(
         &self,
         txn_id: &str,
         timeout_ms: i32,
         alloc: F,
     ) -> Result<(i64, i16)>
+    where
+        F: FnOnce() -> i64,
+    {
+        match self.init_producer_id(txn_id, timeout_ms, None, alloc)? {
+            InitPidOutcome::Ready { pid, epoch } => Ok((pid, epoch)),
+            InitPidOutcome::AbortingOngoing(_) => Err(TxnStateError::Concurrent),
+        }
+    }
+
+    /// `InitProducerId` for a transactional id — Apache's
+    /// `prepareInitProducerIdTransit` (gh #22, KIP-360, gh #201).
+    ///
+    /// `expected` is the v3+ request's claimed `(producer_id,
+    /// producer_epoch)`, `None` for a new producer instance. The claim
+    /// is checked before anything moves:
+    ///
+    /// - The PID must be the entry's current one — or its previous one
+    ///   with an exhausted epoch, a retry of a rotation whose response
+    ///   was lost. Anything else is [`TxnStateError::EpochFenced`].
+    /// - The epoch must be the current one (bump it, remembering the
+    ///   old one) or the remembered one (a retry of that bump: answer
+    ///   the current epoch unchanged). Anything else is fenced.
+    ///
+    /// Before KIP-360 validation landed, every call bumped regardless,
+    /// so a zombie re-calling `InitProducerId` was handed a fresh valid
+    /// epoch and fenced the live session instead of being fenced
+    /// itself.
+    ///
+    /// By state:
+    ///
+    /// ```text
+    /// (none)                   → fresh PID, epoch 0 (any claim accepted:
+    ///                            a producer recovering from
+    ///                            UNKNOWN_PRODUCER_ID)
+    /// Empty / Complete*        → bump, or rotate to a fresh PID once the
+    ///                            epoch is exhausted; lands in Empty
+    /// Ongoing                  → fence: PrepareAbort at epoch + 1, lists
+    ///                            kept → AbortingOngoing
+    /// Prepare*                 → Concurrent (markers still in flight)
+    /// ```
+    ///
+    /// The `Ongoing` arm is the other half of gh #201. It used to bump
+    /// and leave the entry `Ongoing` with the previous session's
+    /// partition list, so the new session inherited the zombie's open
+    /// transaction and its first commit committed the zombie's records
+    /// too.
+    pub fn init_producer_id<F>(
+        &self,
+        txn_id: &str,
+        timeout_ms: i32,
+        expected: Option<(i64, i16)>,
+        alloc: F,
+    ) -> Result<InitPidOutcome>
     where
         F: FnOnce() -> i64,
     {
@@ -308,39 +422,99 @@ impl TxnStateStore {
         let slot = self.slot_for(txn_id);
         let mut state = self.load_slot(slot)?;
 
-        let mut entry = match state.get(txn_id) {
-            None => TxnEntry {
+        let Some(mut entry) = state.get(txn_id).cloned() else {
+            let entry = TxnEntry {
                 pid: alloc(),
                 epoch: 0,
                 partitions: Vec::new(),
                 ongoing_since_ms: 0,
-                transaction_timeout_ms: 0,
+                transaction_timeout_ms: timeout_ms.max(0),
                 state: TxnState::Empty,
                 groups: Vec::new(),
-            },
-            Some(existing) if existing.epoch == i16::MAX => TxnEntry {
-                pid: alloc(),
-                epoch: 0,
-                partitions: Vec::new(),
-                ongoing_since_ms: 0,
-                transaction_timeout_ms: existing.transaction_timeout_ms,
-                state: TxnState::Empty,
-                groups: Vec::new(),
-            },
-            Some(existing) => {
-                let mut e = existing.clone();
-                e.epoch += 1;
-                e
-            }
+                last_pid: NO_PRODUCER_ID,
+                last_epoch: NO_PRODUCER_EPOCH,
+            };
+            let (pid, epoch) = (entry.pid, entry.epoch);
+            state.insert(txn_id.to_owned(), entry);
+            self.persist_slot(slot, &state)?;
+            return Ok(InitPidOutcome::Ready { pid, epoch });
         };
+
+        if let Some((claimed_pid, claimed_epoch)) = expected {
+            let retried_rotation = entry.state == TxnState::Empty
+                && claimed_pid == entry.last_pid
+                && is_epoch_exhausted(claimed_epoch);
+            if claimed_pid != entry.pid && !retried_rotation {
+                return Err(TxnStateError::EpochFenced);
+            }
+        }
         if timeout_ms > 0 {
             entry.transaction_timeout_ms = timeout_ms;
         }
-        let pid = entry.pid;
-        let epoch = entry.epoch;
+
+        match entry.state {
+            TxnState::PrepareCommit | TxnState::PrepareAbort => {
+                return Err(TxnStateError::Concurrent);
+            }
+            TxnState::Ongoing => {
+                // Saturating: an entry can only sit `Ongoing` at
+                // `i16::MAX` if an older build handed that epoch out
+                // (it rotated at MAX, not MAX - 1). The abort still has
+                // to happen; the producer's retry then rotates.
+                entry.epoch = entry.epoch.saturating_add(1);
+                entry.last_epoch = NO_PRODUCER_EPOCH;
+                entry.state = TxnState::PrepareAbort;
+                entry.ongoing_since_ms = 0;
+                let dispatch = PendingMarkerDispatch {
+                    txn_id: txn_id.to_owned(),
+                    pid: entry.pid,
+                    epoch: entry.epoch,
+                    commit: false,
+                    partitions: entry.partitions.clone(),
+                };
+                state.insert(txn_id.to_owned(), entry);
+                self.persist_slot(slot, &state)?;
+                return Ok(InitPidOutcome::AbortingOngoing(dispatch));
+            }
+            TxnState::Empty | TxnState::CompleteCommit | TxnState::CompleteAbort => {}
+        }
+
+        let claimed_epoch = expected.map(|(_, e)| e);
+        if is_epoch_exhausted(entry.epoch) && claimed_epoch.is_none_or(|e| e == entry.epoch) {
+            // Rotate. Remembering the old epoch only for a claimed
+            // bump is Apache's `recordLastEpoch`: a new instance has
+            // no retry to recognise.
+            entry.last_pid = entry.pid;
+            entry.last_epoch = if expected.is_some() {
+                entry.epoch
+            } else {
+                NO_PRODUCER_EPOCH
+            };
+            entry.pid = alloc();
+            entry.epoch = 0;
+        } else {
+            entry.last_pid = entry.pid;
+            match claimed_epoch {
+                None => {
+                    entry.epoch += 1;
+                    entry.last_epoch = NO_PRODUCER_EPOCH;
+                }
+                Some(e) if e == entry.epoch => {
+                    entry.last_epoch = entry.epoch;
+                    entry.epoch += 1;
+                }
+                // A retry of a bump that already happened: same answer.
+                Some(e) if e == entry.last_epoch => {}
+                Some(_) => return Err(TxnStateError::EpochFenced),
+            }
+        }
+        // Complete* lists are already empty; Empty is the one state
+        // only InitProducerId produces, which `last_pid` relies on.
+        entry.state = TxnState::Empty;
+        let (pid, epoch) = (entry.pid, entry.epoch);
         state.insert(txn_id.to_owned(), entry);
         self.persist_slot(slot, &state)?;
-        Ok((pid, epoch))
+        Ok(InitPidOutcome::Ready { pid, epoch })
     }
 
     /// Union `additions` into the entry's partition list. gh #23.
@@ -1430,32 +1604,292 @@ mod tests {
         );
     }
 
+    /// Write `entry` for `txn_id` straight into its slot file.
+    fn seed(s: &TxnStateStore, txn_id: &str, pid: i64, epoch: i16, state: TxnState) {
+        let slot = s.slot_for(txn_id);
+        let mut slot_state = s.load_slot(slot).unwrap();
+        slot_state.insert(
+            txn_id.to_owned(),
+            TxnEntry {
+                pid,
+                epoch,
+                partitions: vec![],
+                ongoing_since_ms: 0,
+                transaction_timeout_ms: 5_000,
+                state,
+                groups: vec![],
+                last_pid: NO_PRODUCER_ID,
+                last_epoch: NO_PRODUCER_EPOCH,
+            },
+        );
+        s.persist_slot(slot, &slot_state).unwrap();
+    }
+
+    fn one_partition() -> Vec<TxnTopic> {
+        vec![TxnTopic {
+            topic: "t".into(),
+            partitions: vec![0],
+        }]
+    }
+
+    fn ready(outcome: InitPidOutcome) -> (i64, i16) {
+        match outcome {
+            InitPidOutcome::Ready { pid, epoch } => Some((pid, epoch)),
+            InitPidOutcome::AbortingOngoing(_) => None,
+        }
+        .expect("expected Ready, got AbortingOngoing")
+    }
+
     #[test]
     fn epoch_overflow_rotates_to_fresh_pid() {
         let (_t, s) = store();
         // Seed the slot file by hand at epoch = MAX so the next
         // get_or_allocate triggers rotation.
-        {
-            let slot = s.slot_for("tx-1");
-            let mut state = HashMap::new();
-            state.insert(
-                "tx-1".to_owned(),
-                TxnEntry {
-                    pid: 42,
-                    epoch: i16::MAX,
-                    partitions: vec![],
-                    ongoing_since_ms: 0,
-                    transaction_timeout_ms: 5_000,
-                    state: TxnState::Empty,
-                    groups: vec![],
-                },
-            );
-            s.persist_slot(slot, &state).unwrap();
-        }
+        seed(&s, "tx-1", 42, i16::MAX, TxnState::Empty);
         let mut a = pid_alloc();
         let (pid, epoch) = s.get_or_allocate("tx-1", || a()).unwrap();
         assert_ne!(pid, 42);
         assert_eq!(epoch, 0);
+    }
+
+    /// Apache's `isEpochExhausted` is `>= MAX - 1`: the last epoch is
+    /// kept back for fencing an `Ongoing` transaction, which bumps
+    /// without passing through the rotation check.
+    #[test]
+    fn epoch_exhaustion_rotates_one_short_of_max() {
+        let (_t, s) = store();
+        seed(&s, "tx-1", 42, i16::MAX - 1, TxnState::CompleteCommit);
+        let mut a = pid_alloc();
+        let (pid, epoch) = s.get_or_allocate("tx-1", || a()).unwrap();
+        assert_ne!(pid, 42);
+        assert_eq!(epoch, 0);
+    }
+
+    /// gh #201: a producer re-initialising under its own identity
+    /// (KIP-360) bumps once, and a retry of that request — its response
+    /// lost — gets the same answer rather than a second bump or a fence.
+    #[test]
+    fn a_claimed_bump_is_retry_safe() {
+        let (_t, s) = store();
+        let mut a = pid_alloc();
+        let (pid, e0) = s.get_or_allocate("tx-1", || a()).unwrap();
+
+        let first = ready(
+            s.init_producer_id("tx-1", 0, Some((pid, e0)), || a())
+                .unwrap(),
+        );
+        assert_eq!(first, (pid, e0 + 1));
+        let retry = ready(
+            s.init_producer_id("tx-1", 0, Some((pid, e0)), || a())
+                .unwrap(),
+        );
+        assert_eq!(retry, first, "a retried bump must not bump again");
+
+        let next = ready(
+            s.init_producer_id("tx-1", 0, Some((pid, e0 + 1)), || a())
+                .unwrap(),
+        );
+        assert_eq!(next, (pid, e0 + 2));
+    }
+
+    /// gh #201, the headline: once a newer instance has initialised, the
+    /// old session's claim is stale and must be fenced — not handed a
+    /// fresh epoch that fences the live session in turn.
+    #[test]
+    fn a_stale_claim_is_fenced_not_bumped() {
+        let (_t, s) = store();
+        let mut a = pid_alloc();
+        let (pid, old) = s.get_or_allocate("tx-1", || a()).unwrap();
+        // New instance (no claim) takes over.
+        let (_, live) = s.get_or_allocate("tx-1", || a()).unwrap();
+        assert_eq!(live, old + 1);
+
+        assert!(matches!(
+            s.init_producer_id("tx-1", 0, Some((pid, old)), || a()),
+            Err(TxnStateError::EpochFenced)
+        ));
+        // A claim that is ahead of the coordinator is just as stale.
+        assert!(matches!(
+            s.init_producer_id("tx-1", 0, Some((pid, live + 5)), || a()),
+            Err(TxnStateError::EpochFenced)
+        ));
+        assert_eq!(
+            s.snapshot()["tx-1"].epoch,
+            live,
+            "a fenced claim must not move the epoch"
+        );
+    }
+
+    #[test]
+    fn a_claim_for_another_pid_is_fenced() {
+        let (_t, s) = store();
+        let mut a = pid_alloc();
+        let (pid, epoch) = s.get_or_allocate("tx-1", || a()).unwrap();
+        assert!(matches!(
+            s.init_producer_id("tx-1", 0, Some((pid + 1, epoch)), || a()),
+            Err(TxnStateError::EpochFenced)
+        ));
+    }
+
+    /// No entry is Apache's "metadata just created": a producer that
+    /// lost its coordinator state (UNKNOWN_PRODUCER_ID) still gets an
+    /// identity, whatever it claims.
+    #[test]
+    fn an_unknown_txn_id_accepts_any_claim() {
+        let (_t, s) = store();
+        let mut a = pid_alloc();
+        let (pid, epoch) = ready(
+            s.init_producer_id("tx-1", 0, Some((999, 7)), || a())
+                .unwrap(),
+        );
+        assert_ne!(pid, 999);
+        assert_eq!(epoch, 0);
+    }
+
+    /// gh #201's second half. A rejoin that finds an `Ongoing`
+    /// transaction must abort it — before the fix it bumped and left the
+    /// entry `Ongoing` with the old session's partitions, so the new
+    /// session's first commit committed the zombie's records as well.
+    #[test]
+    fn a_rejoin_mid_ongoing_prepares_an_abort_at_a_bumped_epoch() {
+        let (_t, s) = store();
+        let mut a = pid_alloc();
+        let (pid, epoch) = s.get_or_allocate("tx-1", || a()).unwrap();
+        s.add_partitions("tx-1", pid, epoch, &one_partition(), 100)
+            .unwrap();
+
+        let abort = match s.init_producer_id("tx-1", 0, None, || a()).unwrap() {
+            InitPidOutcome::AbortingOngoing(d) => Some(d),
+            InitPidOutcome::Ready { .. } => None,
+        }
+        .expect("expected AbortingOngoing, got Ready");
+        assert_eq!(abort.pid, pid);
+        assert_eq!(abort.epoch, epoch + 1);
+        assert!(!abort.commit);
+        assert_eq!(abort.partitions, one_partition());
+
+        let snap = s.snapshot();
+        assert_eq!(snap["tx-1"].state, TxnState::PrepareAbort);
+        assert_eq!(snap["tx-1"].ongoing_since_ms, 0);
+        assert_eq!(
+            snap["tx-1"].partitions,
+            one_partition(),
+            "dispatch set must survive for the markers (gh #225)"
+        );
+        // The marker reconcile can finish it if the caller doesn't.
+        assert_eq!(s.pending_marker_dispatches(None).len(), 1);
+
+        // The old session is fenced the moment the abort is prepared.
+        assert!(matches!(
+            s.add_partitions("tx-1", pid, epoch, &one_partition(), 200),
+            Err(TxnStateError::EpochFenced)
+        ));
+        // Markers still in flight: retry later.
+        assert!(matches!(
+            s.init_producer_id("tx-1", 0, None, || a()),
+            Err(TxnStateError::Concurrent)
+        ));
+
+        s.complete_end_txn("tx-1", pid, epoch + 1, false).unwrap();
+        // The retry lands on a clean entry, bumped a second time, so
+        // the fence epoch itself is never handed out.
+        let (p, e) = ready(s.init_producer_id("tx-1", 0, None, || a()).unwrap());
+        assert_eq!((p, e), (pid, epoch + 2));
+        let snap = s.snapshot();
+        assert_eq!(snap["tx-1"].state, TxnState::Empty);
+        assert!(snap["tx-1"].partitions.is_empty());
+    }
+
+    /// Apache resets `lastProducerEpoch` when it fences, so a claim
+    /// from the session whose transaction was just aborted is stale on
+    /// its retry.
+    #[test]
+    fn the_session_an_abort_fenced_cannot_reclaim_its_epoch() {
+        let (_t, s) = store();
+        let mut a = pid_alloc();
+        let (pid, epoch) = s.get_or_allocate("tx-1", || a()).unwrap();
+        s.add_partitions("tx-1", pid, epoch, &one_partition(), 100)
+            .unwrap();
+        assert!(matches!(
+            s.init_producer_id("tx-1", 0, Some((pid, epoch)), || a()),
+            Ok(InitPidOutcome::AbortingOngoing(_))
+        ));
+        s.complete_end_txn("tx-1", pid, epoch + 1, false).unwrap();
+        assert!(matches!(
+            s.init_producer_id("tx-1", 0, Some((pid, epoch)), || a()),
+            Err(TxnStateError::EpochFenced)
+        ));
+    }
+
+    #[test]
+    fn a_rejoin_during_prepare_is_concurrent() {
+        let (_t, s) = store();
+        let mut a = pid_alloc();
+        let (pid, epoch) = s.get_or_allocate("tx-1", || a()).unwrap();
+        s.add_partitions("tx-1", pid, epoch, &one_partition(), 100)
+            .unwrap();
+        s.prepare_end_txn("tx-1", pid, epoch, true).unwrap();
+        assert!(matches!(
+            s.init_producer_id("tx-1", 0, None, || a()),
+            Err(TxnStateError::Concurrent)
+        ));
+        let snap = s.snapshot();
+        assert_eq!(snap["tx-1"].state, TxnState::PrepareCommit);
+        assert_eq!(snap["tx-1"].epoch, epoch, "commit markers keep their epoch");
+    }
+
+    /// KIP-360 rotation: a producer that exhausted its epoch and never
+    /// saw the rotated identity retries with its old one, and must get
+    /// the rotated identity again rather than a fence or a second PID.
+    #[test]
+    fn a_retried_rotation_gets_the_same_answer() {
+        let (_t, s) = store();
+        seed(&s, "tx-1", 42, i16::MAX - 1, TxnState::CompleteCommit);
+        let mut a = pid_alloc();
+        let rotated = ready(
+            s.init_producer_id("tx-1", 0, Some((42, i16::MAX - 1)), || a())
+                .unwrap(),
+        );
+        assert_ne!(rotated.0, 42);
+        assert_eq!(rotated.1, 0);
+        let retry = ready(
+            s.init_producer_id("tx-1", 0, Some((42, i16::MAX - 1)), || a())
+                .unwrap(),
+        );
+        assert_eq!(retry, rotated);
+    }
+
+    /// The old PID is honoured only until the rotated session moves
+    /// on. Apache overwrites `lastProducerId` on every later
+    /// transition; without that, the old session's claim would abort
+    /// the new session's live transaction.
+    #[test]
+    fn the_pre_rotation_pid_is_stale_once_the_new_session_moves() {
+        let (_t, s) = store();
+        seed(&s, "tx-1", 42, i16::MAX - 1, TxnState::CompleteCommit);
+        let mut a = pid_alloc();
+        let (pid, epoch) = ready(s.init_producer_id("tx-1", 0, None, || a()).unwrap());
+        s.add_partitions("tx-1", pid, epoch, &one_partition(), 100)
+            .unwrap();
+        assert!(matches!(
+            s.init_producer_id("tx-1", 0, Some((42, i16::MAX - 1)), || a()),
+            Err(TxnStateError::EpochFenced)
+        ));
+        assert_eq!(s.snapshot()["tx-1"].state, TxnState::Ongoing);
+    }
+
+    /// Slot files written before gh #201 have no `lastPid` /
+    /// `lastEpoch`; they must read as "none", and an entry without
+    /// either must not grow the fields on disk.
+    #[test]
+    fn last_identity_fields_default_to_none() {
+        let entry: TxnEntry = serde_json::from_str(r#"{"pid":7,"epoch":3}"#).unwrap();
+        assert_eq!(entry.last_pid, NO_PRODUCER_ID);
+        assert_eq!(entry.last_epoch, NO_PRODUCER_EPOCH);
+        assert_eq!(
+            serde_json::to_string(&entry).unwrap(),
+            r#"{"pid":7,"epoch":3}"#
+        );
     }
 
     #[test]
