@@ -14,46 +14,39 @@ metadata:
 rules:
   # Controller election + epoch watch via Leases. The broker
   # acquires/renews/releases the kaas-controller Lease with a
-  # resourceVersion-conditional replace, which needs `update`;
-  # `patch` covers older images that still server-side apply.
+  # resourceVersion-conditional replace (`update`), creates it when
+  # absent, and polls it with `get` — it never lists or watches.
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
-    verbs: [get, list, watch, create, update, patch]
+    verbs: [get, create, update]
   # Cluster topology.
   - apiGroups: [discovery.k8s.io]
     resources: [endpointslices]
     verbs: [get, list, watch]
-  # KafkaUser: brokers watch + patch quotas. The watch covers the
-  # operator's spec.authorization → acls.json translation (brokers
-  # only consume that file); update/patch cover the admin-protocol
-  # paths: AlterClientQuotas (gh #103 phase 2) writes spec.quotas,
-  # and CreateAcls/DeleteAcls (gh #107) mutate
-  # spec.authorization.acls so kafka-acls.sh / AdminClient ACL
-  # writes land on the CR. gh #135: kafkaacls + kafkausergroups
-  # removed.
+  # KafkaUser: admin-protocol writes only. Brokers don't watch the CR —
+  # they read the operator's acls.json / credentials.json off the
+  # volume. CreateAcls/DeleteAcls (gh #107) get + replace (`update`)
+  # spec.authorization.acls; AlterUserScramCredentials (gh #252)
+  # patches spec.authentication.scram.
   - apiGroups: [kaas.rs]
     resources: [kafkausers]
-    verbs: [get, list, watch, update, patch]
+    verbs: [get, update, patch]
   # KafkaTopic: brokers watch + manage. The watch covers the
   # operator-driven path (kubectl apply -f); create/delete cover
   # the admin-protocol path (gh #51) where Kafbat / kafka-topics.sh
   # / Java AdminClient calls CreateTopics/DeleteTopics on the broker
-  # and the broker's TopicCRWriter writes the CR. update/patch cover
+  # and the broker's TopicCRWriter writes the CR. `patch` covers
   # CreatePartitions (gh #52, key 37 — TopicCRWriter.ExpandTopic) and
   # IncrementalAlterConfigs (gh #9, key 44 — UpdateTopicConfig), both
-  # of which mutate spec on an existing KafkaTopic CR.
+  # merge patches of spec on an existing KafkaTopic CR.
   - apiGroups: [kaas.rs]
     resources: [kafkatopics]
-    verbs: [get, list, watch, create, update, patch, delete]
+    verbs: [get, list, watch, create, patch, delete]
   # gh #221 phase 3: AlterReplicaLogDirs flips the placement record
   # (status.volumeAssignments) after a partition move.
   - apiGroups: [kaas.rs]
     resources: [kafkatopics/status]
-    verbs: [get, update, patch]
-  # Kubernetes ServiceAccount JWT validation (SASL PLAIN).
-  - apiGroups: [authentication.k8s.io]
-    resources: [tokenreviews]
-    verbs: [create]
+    verbs: [get, patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -69,16 +62,14 @@ subjects:
     name: {{ include "kaas.brokerSAName" . }}
     namespace: {{ .Release.Namespace }}
 ---
-# Own-namespace Role: Secrets + pods/status.
+# Own-namespace Role: pods/status. No Secrets — TLS material and
+# credentials arrive by volume mount.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: {{ include "kaas.fullname" . }}-broker
   labels: {{- include "kaas.labels" . | nindent 4 }}
 rules:
-  - apiGroups: [""]
-    resources: [secrets]
-    verbs: [get, list, watch]
   # ReadinessGate updates — own pod only (k8s scopes automatically).
   - apiGroups: [""]
     resources: [pods/status]

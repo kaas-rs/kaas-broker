@@ -46,6 +46,7 @@ const EXPECTED_WIRED: &[&str] = &[
     "assignment_polls",
     "stale_assignments_rejected",
     "heartbeat_misses",
+    "self_fence_events",
     "group_rebalances",
     "auth_success",
     "auth_failure",
@@ -71,16 +72,14 @@ const EXPECTED_WIRED: &[&str] = &[
 /// * **Forward-compat / not-yet-ported subsystems**: compactor
 ///   metrics (`compaction_*`) — no compactor exists yet;
 ///   `cert_reloads` — TLS certs are bound at startup; hot reload is
-///   a Phase 8/9 gap; `heartbeat_rtt` — requires a controller-side
-///   echo-timestamp response that Phase 5 didn't wire;
-///   `self_fence_events` — self-fence is invoked from
-///   `bins/kaas/main::cluster` and hasn't been threaded through
-///   yet.
+///   a Phase 8/9 gap; `heartbeat_rtt` — the heartbeat is a bidi
+///   stream, so an RTT needs a controller-side echo timestamp in
+///   `proto/heartbeat.proto`, which nothing sends. No alert or panel
+///   reads it (gh #265).
 /// * **Self-observed via `ObservedExporter`**: `otlp_push_success`,
 ///   `otlp_push_failure`, `otlp_push_duration` — see
 ///   `otlp_push_observer.rs`.
 const EXPECTED_ZERO: &[&str] = &[
-    "self_fence_events",
     "heartbeat_rtt",
     "cert_reloads",
     "compaction_runs",

@@ -13,26 +13,35 @@ metadata:
   name: {{ include "kaas.fullname" . }}-operator
   labels: {{- include "kaas.operatorLabels" . | nindent 4 }}
 rules:
-  # gh #135: kafkaacls + kafkausergroups CRs removed. ACLs now live
-  # inline on KafkaUser.spec.authorization (Strimzi-style).
+  # The operator only reads its CRs (watch + list) and writes their
+  # status (server-side apply = `patch`). It never creates, edits or
+  # deletes a CR, and holds no finalizers — cleanup is reconcile-time
+  # plus the startup sweep.
   - apiGroups: [kaas.rs]
     resources: [kafkatopics, kafkausers, kafkaclusters]
-    verbs: [get, list, watch, create, update, patch, delete]
+    verbs: [get, list, watch]
   - apiGroups: [kaas.rs]
     resources:
       - kafkatopics/status
       - kafkausers/status
       - kafkaclusters/status
-      - kafkatopics/finalizers
+    verbs: [get, patch]
+  # Not for finalizers (the operator sets none): the output Secrets,
+  # Services, Certificates and TLSRoutes carry an ownerReference with
+  # blockOwnerDeletion: true, and the OwnerReferencesPermissionEnforcement
+  # admission plugin (on by default in OpenShift) only allows that with
+  # `update` on the owner's finalizers subresource. KafkaTopic owns nothing.
+  - apiGroups: [kaas.rs]
+    resources:
       - kafkausers/finalizers
       - kafkaclusters/finalizers
-    verbs: [get, update, patch]
+    verbs: [update]
   - apiGroups: [coordination.k8s.io]
     resources: [leases]
-    # `create` + `update` needed by the operator's
-    # `KubeLeaseElection::acquire` — it creates a Lease when none
-    # exists and updates it on every renew tick.
-    verbs: [get, list, watch, create, update, patch]
+    # `KubeLeaseElection` reads the Lease with `get`, creates it when
+    # none exists, and renews it with a resourceVersion-conditional
+    # replace (`update`).
+    verbs: [get, create, update]
   # KafkaCluster controller reconciles Services and Gateway API / cert-manager resources.
   - apiGroups: [""]
     resources: [services]

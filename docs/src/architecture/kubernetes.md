@@ -108,9 +108,12 @@ CR's status. The user side works the same way against existing
 `KafkaUser` CRs: the ACL admin APIs edit `spec.authorization.acls`, the
 SCRAM admin API (KIP-554) patches `spec.authentication.scram`, and the
 quota admin API patches `spec.quotas`. The operator then materializes
-the change as usual. That is why broker RBAC carries the full verb set
-on `kafkatopics` (including `create` and `delete`), `get,update,patch`
-on `kafkatopics/status`, and read plus `update,patch` on `kafkausers`.
+the change as usual. That is why broker RBAC carries write verbs on
+`kafkatopics` (`create`, `patch`, `delete`), `get,patch` on
+`kafkatopics/status`, and `get,update,patch` on `kafkausers`. It carries
+nothing it doesn't call (gh #265): every spec write is a merge patch, so
+`kafkatopics` has no `update`, and brokers read users from the
+operator's files, so `kafkausers` has no `list` or `watch`.
 Why admin writes route through CRs at all is covered in
 [Broker/operator runtime independence](./runtime-independence.md).
 

@@ -82,9 +82,9 @@ The operator then materializes the change — partition directories,
 `.config.json`, `credentials.json`, `acls.json` — exactly as if you had
 edited the CR yourself. This keeps one writer for on-disk state while
 still serving the Kafka admin surface. (It's also why broker RBAC
-carries the full verb set on `kafkatopics` — including `create` and
-`delete` — plus `kafkatopics/status` and read/`update,patch` on
-`kafkausers`; see [Kubernetes integration](./kubernetes.md).)
+carries write verbs on `kafkatopics` — `create`, `patch` and `delete` —
+plus `kafkatopics/status` and `get,update,patch` on `kafkausers`; see
+[Kubernetes integration](./kubernetes.md).)
 
 ## The line not to cross
 

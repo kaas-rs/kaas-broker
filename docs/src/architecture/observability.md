@@ -21,7 +21,8 @@ Helm chart):
   default `30s`. The SDK default of 60 s made `rate([1m])` panels see a
   single sample and gap.
 - `OTEL_SERVICE_VERSION`, `MY_POD_NAME`, `KAAS_NAMESPACE` — folded into
-  resource attributes so dashboards can filter by broker and namespace.
+  resource attributes so dashboards can filter by version, broker and
+  namespace. The chart sets `OTEL_SERVICE_VERSION` to the image tag.
 - `OTEL_RESOURCE_ATTRIBUTES` and `OTEL_SERVICE_NAME` — the standard
   resource variables, honoured alongside the SDK's `telemetry.sdk.*`
   attributes. `service.name` is `OTEL_SERVICE_NAME`, else a

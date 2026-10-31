@@ -102,6 +102,14 @@ impl KafkaClusterReconciler {
     }
 
     pub async fn reconcile(&self, cluster: Arc<KafkaCluster>) -> Result<Action, ControllerError> {
+        let started = std::time::Instant::now();
+        let out = self.reconcile_inner(cluster).await;
+        self.observer
+            .record_duration(started.elapsed().as_secs_f64());
+        out
+    }
+
+    async fn reconcile_inner(&self, cluster: Arc<KafkaCluster>) -> Result<Action, ControllerError> {
         if cluster.metadata.deletion_timestamp.is_some() {
             // K8s GC handles the owned resources via OwnerReferences;
             // nothing to do here.

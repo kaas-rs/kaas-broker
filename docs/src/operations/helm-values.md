@@ -10,10 +10,6 @@ Two Helm behaviors worth knowing before overriding anything:
 - Helm **deep-merges** values, so restating a default changes nothing —
   and *removing* a chart default requires an explicit `null`, not
   omission.
-- A handful of keys are **dead** — parsed by nothing, kept only until a
-  cleanup release removes them. They are flagged
-  <span title="dead">⚠ **dead**</span> below rather than silently
-  omitted, so you can tell "documented and inert" from "undocumented".
 
 ## `image` and `operator.image`
 
@@ -41,7 +37,6 @@ Two Helm behaviors worth knowing before overriding anything:
 | `minReadySeconds` | `60` | Rolling-update pacing: a pod must hold Ready this long before the next one is replaced. Belt-and-braces on top of [honest readiness](../architecture/readiness-rollout.md); raise it on slow storage where takeover recovery scans run long. |
 | `ports.health` | `8080` | Health/readiness HTTP (fixed). |
 | `ports.heartbeat` | `9094` | Inter-broker heartbeat gRPC (fixed, in-cluster only). |
-| `ports.kafka`, `ports.tls` | `9092`/`9093` | ⚠ **dead** — superseded by the `listeners[]` array, referenced by no template. |
 | `resources` | 500m/1Gi – 2/4Gi | Requests/limits. For benchmarking, note the memory limit also caps page cache under cgroup v2 — a tight limit costs cold-read throughput. |
 | `readinessGate.enabled` | `true` | Adds the `kaas.rs/PartitionsReady` pod readiness gate: a pod joins Service endpoints only once its partition directories exist. Disable only for bare-bones smoke tests. |
 
@@ -128,8 +123,6 @@ is [the volume pool chapter](../architecture/volume-pool.md).
 | `enabled` | `true` | `false` swaps in an allow-all engine: no authentication anywhere, every connection is `User:ANONYMOUS`. |
 | `requireSasl` | `false` | `true` arms the SASL pre-auth gate on *anonymous* listeners too — closes the "connect to the plain listener and skip auth" hole cluster-wide. `auth.enabled: false` outranks it. |
 | `sslPrincipalMappingRules` | `""` | Apache's `ssl.principal.mapping.rules`, verbatim — regex rules mapping an mTLS client cert's subject DN to a principal. Empty = use the CN. Parse errors fail startup deliberately, so a typo crash-loops instead of silently mapping every cert to its CN. |
-| `mechanisms` | `[SCRAM-SHA-512]` | ⚠ **dead** — mechanism advertisement is per-listener now; no template reads this. |
-| `tls.enabled` / `tls.existingSecret` / `tls.certManagerIssuer` | `false` / `""` / `""` | ⚠ **dead** — pre-listener-array TLS shape; TLS is declared per `listeners[]` entry. |
 
 Authentication/authorization architecture, including what each listener
 `authentication.type` means, is
@@ -153,7 +146,6 @@ Details and the reasoning: [Kubernetes integration](../architecture/kubernetes.m
 | `podDisruptionBudget.enabled` / `maxUnavailable` | `true` / `1` | Applies to node drains and other eviction-API disruptions. Note it is inert for StatefulSet rollouts (those delete pods directly); rollout pacing is `broker.minReadySeconds`. |
 | `serviceAccount.broker.create` / `.name` | `true` / `""` | |
 | `serviceAccount.operator.create` / `.name` | `true` / `""` | |
-| `autoscaling.*` | `enabled: false`, 3–10, lag 100000 | ⚠ **dead** — the chart renders **no HorizontalPodAutoscaler**; `autoscaling.enabled: true` does nothing today. |
 | `clusterDomain` | `cluster.local` | DNS suffix for the per-broker FQDNs advertised on internal listeners. Override only on clusters with a non-default CoreDNS domain. |
 
 ## `observability`
@@ -166,7 +158,7 @@ Details and the reasoning: [Kubernetes integration](../architecture/kubernetes.m
 | `logs.level` / `logs.format` | `info` / `json` | `debug…error`; `json` or `text`. |
 | `alerts.enabled` | `false` | Render a PrometheusRule with the load-bearing kaas alerts (self-fence, stale assignments…). Needs Prometheus Operator. |
 | `alerts.additionalLabels` | `{}` | Merged into every rule (Alertmanager routing). |
-| `alerts.thresholds.*` | see values.yaml | Per-alert overrides. Caveat: `heartbeatRttP99Seconds` tunes an alert whose metric is not yet emitted — that alert cannot fire today. |
+| `alerts.thresholds.*` | see values.yaml | Per-alert overrides. |
 
 The wider observability story: [Observability](../architecture/observability.md).
 
@@ -231,10 +223,7 @@ Strimzi's `KafkaListenerAuthenticationOAuth` field names, verbatim:
   `deploy/helm/kaas/templates/_helpers.tpl`, landing as the
   `KAAS_LISTENERS` env (gh #126). Env-var names for the broker knobs are
   parsed in `crates/kaas-broker/src/cli.rs`.
-- The ⚠ dead keys (`broker.ports.kafka`/`tls`, `auth.mechanisms`,
-  `auth.tls.*`, `autoscaling.*`) and the inert
-  `heartbeatRttP99Seconds` threshold are tracked in gh #265; the
-  external advertised-hostname gap is gh #263; the unapplied
+- The external advertised-hostname gap is gh #263; the unapplied
   `service.annotations` is part of gh #266.
 - This page documents chart defaults, not any specific deployment.
   When a key moves or dies, update this page in the same commit — the

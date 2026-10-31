@@ -7,16 +7,18 @@
 //! cleanly on SIGTERM.
 //!
 //! Environment variables (chart-templated by
-//! `templates/operator-deployment.yaml`):
+//! `templates/operator-deployment.yaml` unless noted):
 //!
 //! - `KAAS_DATA_DIR`            — shared PVC mount (default `/data`)
 //! - `KAAS_NAMESPACE`           — operator's own namespace
 //! - `KAAS_LOG_LEVEL`           — `debug`/`info`/`warn`/`error`
 //! - `KAAS_LOG_FORMAT`          — `json` or `text`
-//! - `METRICS_BIND_ADDRESS`       — `:8080` (axum metrics endpoint)
-//! - `HEALTH_PROBE_BIND_ADDRESS`  — `:8081` (healthz / readyz)
-//! - `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_RESOURCE_ATTRIBUTES`,
-//!   `OTEL_SERVICE_NAME` — read by `kaas_observability::bootstrap`.
+//! - `HEALTH_PROBE_BIND_ADDRESS`  — healthz / readyz; not templated, the
+//!   default `:8081` is what the chart's probes target
+//! - `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_SERVICE_VERSION`,
+//!   `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SERVICE_NAME` — read by
+//!   `kaas_observability::bootstrap`. Metrics are pushed over OTLP;
+//!   there is no scrape endpoint.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -45,7 +47,6 @@ const DEFAULT_DATA_DIR: &str = "/data";
 const DEFAULT_NAMESPACE: &str = "default";
 const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_LOG_FORMAT: &str = "json";
-const DEFAULT_METRICS_ADDR: &str = "0.0.0.0:8080";
 const DEFAULT_PROBE_ADDR: &str = "0.0.0.0:8081";
 const LEADER_LEASE: &str = "kaas-operator-leader";
 const LEASE_DURATION: Duration = Duration::from_secs(15);
@@ -89,13 +90,12 @@ async fn main() -> Result<()> {
         kaas_storage::parse_log_dirs_json(&std::env::var("KAAS_LOG_DIRS").unwrap_or_default())
             .map_err(|e: String| anyhow::anyhow!(e))?;
     let namespace = env_or("KAAS_NAMESPACE", DEFAULT_NAMESPACE);
-    let metrics_addr = env_or("METRICS_BIND_ADDRESS", DEFAULT_METRICS_ADDR);
     let probe_addr = env_or("HEALTH_PROBE_BIND_ADDRESS", DEFAULT_PROBE_ADDR);
 
     info!(
         %namespace, data_dir = %data_dir.display(),
         cluster_dir = %cluster_dir.display(),
-        %metrics_addr, %probe_addr,
+        %probe_addr,
         "starting kaas-operator"
     );
 
@@ -141,10 +141,6 @@ async fn main() -> Result<()> {
             }
         })
         .context("spawning probe-server thread")?;
-    // Metrics endpoint placeholder — Phase 8 wires the OTLP push
-    // path via kaas_observability::bootstrap. axum gives us a free
-    // 200-on-/metrics for now so a Prometheus scrape doesn't trip.
-    let metrics_task = tokio::spawn(spawn_metrics_server(metrics_addr.clone(), cancel.clone()));
 
     // Build the kube client. try_default reads KUBECONFIG or the
     // in-cluster ServiceAccount.
@@ -274,7 +270,6 @@ async fn main() -> Result<()> {
     info!("shutdown signal received; waiting for reconcilers");
 
     let _ = tokio::join!(topic_task, user_task, cluster_task);
-    let _ = metrics_task.await;
     // The probe thread exits via the axum graceful shutdown once
     // `cancel` fires; join it off the async runtime.
     let _ = tokio::task::spawn_blocking(move || probe_thread.join()).await;
@@ -359,26 +354,6 @@ async fn spawn_probe_server(
         }
     };
     info!(%addr, "probe server listening");
-    let _ = axum::serve(listener, app)
-        .with_graceful_shutdown(async move { cancel.cancelled().await })
-        .await;
-}
-
-async fn spawn_metrics_server(addr: String, cancel: CancellationToken) {
-    let app = Router::new().route(
-        "/metrics",
-        // Phase 8 swaps this for an OTel exposition; for now,
-        // return an empty body so a Prometheus scrape doesn't 404.
-        get(|| async { (StatusCode::OK, "# kaas-operator metrics — placeholder\n") }),
-    );
-    let listener = match tokio::net::TcpListener::bind(&addr).await {
-        Ok(l) => l,
-        Err(e) => {
-            error!(error = ?e, %addr, "metrics server failed to bind");
-            return;
-        }
-    };
-    info!(%addr, "metrics server listening");
     let _ = axum::serve(listener, app)
         .with_graceful_shutdown(async move { cancel.cancelled().await })
         .await;

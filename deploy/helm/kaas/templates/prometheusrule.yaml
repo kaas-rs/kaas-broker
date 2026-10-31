@@ -128,24 +128,4 @@ spec:
               object caps would bite any CR-shaped reflection of it, and
               where write/parse latency on the shared volume starts to
               matter. The authoritative file on the PVC keeps working.
-
-    - name: kaas.heartbeat
-      interval: 30s
-      rules:
-        - alert: KaasHeartbeatRTTHigh
-          expr: histogram_quantile(0.99, sum by (le) (rate(kaas_heartbeat_rtt_seconds_bucket[5m]))) > {{ .Values.observability.alerts.thresholds.heartbeatRttP99Seconds }}
-          for: 5m
-          labels:
-            severity: warning
-            {{- with .Values.observability.alerts.additionalLabels }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
-          annotations:
-            summary: "Heartbeat RTT p99 above {{ .Values.observability.alerts.thresholds.heartbeatRttP99Seconds }}s"
-            description: |
-              The broker→controller→broker round-trip is slow. Doesn't affect
-              data plane directly, but high RTT eats into the 3s heartbeatTimeout
-              budget — sustained values above ~1s mean self-fencing is one
-              network blip away. Check inter-pod network latency and the
-              controller pod's CPU.
 {{- end }}

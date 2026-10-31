@@ -221,6 +221,9 @@ spec:
             {{- if .Values.observability.otlp.metrics.enabled }}
             - name: OTEL_EXPORTER_OTLP_METRICS_ENDPOINT
               value: {{ .Values.observability.otlp.metrics.endpoint | quote }}
+            # → resource attribute service.version (gh #265).
+            - name: OTEL_SERVICE_VERSION
+              value: {{ .Values.image.tag | default .Chart.AppVersion | quote }}
             # gh #133: explicit push interval. Defaults to the value
             # set in values.yaml (30s). Override here without touching
             # the broker binary — accepts duration strings like

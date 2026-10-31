@@ -62,8 +62,6 @@ broker:
   # Raise it on slow shared storage where recovery scans take longer.
   minReadySeconds: 60
   ports:
-    kafka: 9092
-    tls: 9093
     health: 8080
     # Internal-only gRPC heartbeat between brokers and the elected
     # cluster controller (Phase 4/5). Not exposed externally; the
@@ -238,8 +236,6 @@ auth:
   # RealAuthEngine reads credentials.json and acls.json from the shared
   # PVC. Translates to KAAS_AUTH_DISABLED env var on the broker.
   enabled: true
-  mechanisms:
-    - SCRAM-SHA-512
   # When true, the dispatcher rejects non-ApiVersions/SaslHandshake/SaslAuthenticate
   # requests from connections that haven't completed SASL — closes the
   # "anonymous fallthrough" hole. Translates to KAAS_REQUIRE_SASL.
@@ -250,10 +246,6 @@ auth:
   # CN unchanged). Parse errors fail broker startup, so a typo shows
   # up as a crash-loop rather than every cert mapping to its CN.
   sslPrincipalMappingRules: ""
-  tls:
-    enabled: false
-    existingSecret: ""          # Secret with tls.crt + tls.key
-    certManagerIssuer: ""
 
 admin:
   # Optional ArgoCD integration for admin-protocol-created CRs
@@ -314,12 +306,6 @@ serviceAccount:
     create: true
     name: ""
 
-autoscaling:
-  enabled: false
-  minReplicas: 3
-  maxReplicas: 10
-  targetConsumerLagMessages: 100000
-
 observability:
   # OTLP push exporter. Metrics push to Prometheus's native OTLP/HTTP
   # receiver. kaas exports no traces (gh #269): the old `traces` block wired
@@ -355,8 +341,6 @@ observability:
     # Override individual alert thresholds. Each key maps to a value
     # that's substituted into the rule expression / for clause.
     thresholds:
-      # Heartbeat RTT p99 above this for 5m → warning.
-      heartbeatRttP99Seconds: 0.5
       # Self-fence events in 1m above this → warning.
       selfFencePerMinute: 1
       # assignment.json size in bytes — warning above this, critical past 900KB.

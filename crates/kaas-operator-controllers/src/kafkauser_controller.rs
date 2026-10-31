@@ -60,6 +60,14 @@ impl KafkaUserReconciler {
     }
 
     pub async fn reconcile(&self, user: Arc<KafkaUser>) -> Result<Action, ControllerError> {
+        let started = std::time::Instant::now();
+        let out = self.reconcile_inner(user).await;
+        self.observer
+            .record_duration(started.elapsed().as_secs_f64());
+        out
+    }
+
+    async fn reconcile_inner(&self, user: Arc<KafkaUser>) -> Result<Action, ControllerError> {
         if user.metadata.deletion_timestamp.is_some() {
             self.observer.bump_requeue();
             return Ok(Action::await_change());

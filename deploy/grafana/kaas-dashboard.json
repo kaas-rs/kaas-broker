@@ -188,23 +188,11 @@
       "fieldConfig": {"defaults": {"unit": "s"}}
     },
     {
-      "id": 15,
-      "type": "timeseries",
-      "title": "Heartbeat RTT p50 / p99",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 44},
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-      "targets": [
-        {"expr": "histogram_quantile(0.50, sum by (le) (rate(kaas_heartbeat_rtt_seconds_bucket[5m])))", "legendFormat": "p50"},
-        {"expr": "histogram_quantile(0.99, sum by (le) (rate(kaas_heartbeat_rtt_seconds_bucket[5m])))", "legendFormat": "p99"}
-      ],
-      "fieldConfig": {"defaults": {"unit": "s"}}
-    },
-    {
       "id": 16,
       "type": "timeseries",
       "title": "Self-fence + heartbeat miss events (1m)",
       "description": "Both should be zero in steady state. Spikes correlate with controller failover or heartbeat path latency.",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 44},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 44},
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "targets": [
         {"expr": "sum by (broker_id) (increase(kaas_self_fence_events_total[1m]))", "legendFormat": "self_fence {{broker_id}}"},
