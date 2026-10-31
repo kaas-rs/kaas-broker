@@ -38,6 +38,14 @@ pub trait QuotaChecker: Send + Sync + std::fmt::Debug + 'static {
     /// Deduct `bytes` from the principal's consumer bucket. Returns
     /// `throttle_time_ms` (0 = no throttle needed).
     fn check_fetch_quota(&self, principal: &Principal, bytes: usize) -> i32;
+
+    /// The [`QuotaEnforcer`] behind this checker, if any. The quota
+    /// admin APIs (keys 48/49) read and write limits through it, so
+    /// taking it from the checker means they act on the instance that
+    /// throttles, with no second wiring step to forget (gh #260).
+    fn as_enforcer(self: Arc<Self>) -> Option<Arc<QuotaEnforcer>> {
+        None
+    }
 }
 
 /// No-throttle mode — every check returns 0. Used when no listener
@@ -230,6 +238,10 @@ impl QuotaChecker for QuotaEnforcer {
             );
         }
         throttle_ms
+    }
+
+    fn as_enforcer(self: Arc<Self>) -> Option<Arc<QuotaEnforcer>> {
+        Some(self)
     }
 }
 

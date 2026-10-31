@@ -126,10 +126,13 @@ pub struct Broker {
     /// admin handlers (DescribeClientQuotas / AlterClientQuotas)
     /// which need access to `set_user_quota` / `describe_user_quota`
     /// / `list_user_quotas` — methods the `QuotaChecker` trait
-    /// doesn't expose. `None` when the broker runs without a
-    /// real quota enforcer (`auth.enabled=false`); the admin
-    /// handlers then surface `UNSUPPORTED_VERSION` (35).
-    quota_enforcer: RwLock<Option<Arc<QuotaEnforcer>>>,
+    /// doesn't expose. Taken from `quotas` itself
+    /// ([`QuotaChecker::as_enforcer`]), so the admin APIs act on the
+    /// instance that throttles; a separate install step had no caller
+    /// for the life of the Rust broker (gh #260). `None` when the broker
+    /// runs without a real quota enforcer (`auth.enabled=false`); the
+    /// admin handlers then surface `UNSUPPORTED_VERSION` (35).
+    quota_enforcer: Option<Arc<QuotaEnforcer>>,
     /// Live broker catalog for Metadata (cluster mode only). `None`
     /// keeps the single-broker "self is the whole cluster" shape.
     broker_view: RwLock<Option<Arc<dyn ClusterBrokerView>>>,
@@ -184,6 +187,7 @@ impl Broker {
         quotas: Arc<dyn QuotaChecker>,
     ) -> Self {
         let broker_id_val = broker_id;
+        let quota_enforcer = quotas.clone().as_enforcer();
         Self {
             engine,
             topics,
@@ -201,7 +205,7 @@ impl Broker {
             cr_writer: RwLock::new(None),
             acl_cr_writer: RwLock::new(None),
             user_cr_writer: RwLock::new(None),
-            quota_enforcer: RwLock::new(None),
+            quota_enforcer,
             broker_view: RwLock::new(None),
             producer_ids: RwLock::new(None),
             // Start at 1 so 0 stays available as an "unset" sentinel
@@ -387,18 +391,11 @@ impl Broker {
         self.acl_cr_writer.read().clone()
     }
 
-    /// Install the concrete-typed [`QuotaEnforcer`] used by the
-    /// Phase 7 admin quota handlers. Called once from
-    /// `bins/kaas/main.rs` when `auth.enabled` is true.
-    pub fn install_quota_enforcer(&self, e: Arc<QuotaEnforcer>) {
-        *self.quota_enforcer.write() = Some(e);
-    }
-
-    /// Read the installed quota enforcer. `None` ⇒ Describe/AlterClientQuotas
-    /// surface `UNSUPPORTED_VERSION` (35) without attempting any
-    /// mutation.
+    /// The quota enforcer behind [`Self::quotas`]. `None` ⇒
+    /// Describe/AlterClientQuotas surface `UNSUPPORTED_VERSION` (35)
+    /// without attempting any mutation.
     pub fn quota_enforcer(&self) -> Option<Arc<QuotaEnforcer>> {
-        self.quota_enforcer.read().clone()
+        self.quota_enforcer.clone()
     }
 
     /// Drop everything this broker holds for a deleted topic. Called

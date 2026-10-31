@@ -154,7 +154,10 @@ wire from "no quotas configured", mirroring Apache.
 
 **Verified by**: `scripts/kafka-configs.sh` (quota scenarios 6–9); resolution-
 order unit tests in `crates/kaas-auth/src/quota.rs`
-(`describe_user_quota_resolution_order`).
+(`describe_user_quota_resolution_order`); and
+`crates/kaas-broker/tests/client_quotas.rs`, which builds the broker the way
+`bins/kaas` does, so it catches the admin surface losing the enforcer — it did,
+from the Rust cutover until gh #260.
 
 ## AlterClientQuotas
 
@@ -195,7 +198,9 @@ answers `UNSUPPORTED_VERSION` (35). `validate_only` skips the install.
 `crates/kaas-auth/src/quota.rs` (`set_user_quota`).
 
 **Verified by**: `scripts/kafka-configs.sh` (alter/describe/clear round trip);
-`set_user_quota_live_updates_existing_bucket` and the debt-carry contention
+`alter_changes_the_limit_that_throttles` in
+`crates/kaas-broker/tests/client_quotas.rs` (the override reaches the instance
+on the throttling path); `set_user_quota_live_updates_existing_bucket` and the debt-carry contention
 test in `crates/kaas-auth/src/quota.rs`; enforcement end-to-end in
 `bins/kaas/tests/auth_smoke.rs` (`produce_exceeds_quota_returns_throttle`).
 
