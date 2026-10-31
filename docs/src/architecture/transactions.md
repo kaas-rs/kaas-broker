@@ -33,7 +33,7 @@ mirroring the Java client's `max.in.flight.requests.per.connection=5`:
 
 - **duplicate** → echo the cached `baseOffset`, no log write;
 - **out-of-order sequence** → error 45 (`OUT_OF_ORDER_SEQUENCE_NUMBER`);
-- **stale epoch** → error 47 (`PRODUCER_FENCED`);
+- **stale epoch** → error 47 (`INVALID_PRODUCER_EPOCH`);
 - otherwise accept and advance the ring.
 
 The ring survives leadership moves via `producer-state.snapshot`
@@ -73,7 +73,11 @@ can't collide with producer state already on the volume.
 
 A transactional producer that reconnects gets the **same PID with
 `epoch+1`** — fencing is the monotonic epoch, exactly Apache's KIP-360
-contract. Two mechanisms make the bump stick everywhere:
+contract. A v3+ request that carries the producer's claimed identity is
+checked first: a stale claim gets `PRODUCER_FENCED` instead of a newer
+epoch, and a retry of a claimed bump gets the same answer back (details
+on the [KIP-360 page](../compat/kip/kip-360.md)). Two mechanisms make the
+bump stick everywhere:
 
 - **Cross-partition fence**: after every `epoch > 0` rejoin, the
   InitProducerId handler walks every local partition, advances the
@@ -102,8 +106,11 @@ stateDiagram-v2
     Ongoing --> PrepareAbort : timeout reaper, 10 s sweep<br/>ongoingSinceMs + transactionTimeoutMs elapsed<br/>epoch bump, dispatch set retained
     PrepareCommit --> CompleteCommit : every marker durable<br/>clears partitions + groups,<br/>staged offsets committed
     PrepareAbort --> CompleteAbort : every marker durable<br/>staged offsets discarded
+    Ongoing --> PrepareAbort : InitProducerId rejoin<br/>old session fenced at epoch + 1,<br/>answers CONCURRENT_TRANSACTIONS
     CompleteCommit --> Ongoing : AddPartitionsToTxn /<br/>AddOffsetsToTxn<br/>next transaction begins
     CompleteAbort --> Ongoing : AddPartitionsToTxn /<br/>AddOffsetsToTxn
+    CompleteCommit --> Empty : InitProducerId rejoin<br/>epoch + 1
+    CompleteAbort --> Empty : InitProducerId rejoin<br/>epoch + 1
 ```
 
 Facts the diagram compresses:
@@ -115,10 +122,16 @@ Facts the diagram compresses:
   retry all re-derive the identical dispatch set from it; only the
   transition to `Complete*` — taken once every marker is durable —
   clears the lists and releases the staged offsets.
-- `InitProducerId` on a **rejoin** does not reset the state: the entry
-  keeps the same PID and bumps `epoch += 1` — fencing is purely the
-  monotonic epoch. Only epoch overflow (`i16::MAX`) allocates a fresh
-  PID and resets to `Empty`.
+- `InitProducerId` on a **rejoin** keeps the same PID, bumps
+  `epoch += 1` and lands the entry in `Empty`. If the entry is `Ongoing`,
+  the rejoin aborts that transaction first: `PrepareAbort` at `epoch + 1`
+  with its lists kept, ABORT markers written, and `CONCURRENT_TRANSACTIONS`
+  back to the client, whose retry then bumps onto the clean entry (gh #201).
+  Before that fix the new session inherited the open transaction, and its
+  first commit committed the zombie's records too. A rejoin during
+  `Prepare*` answers `CONCURRENT_TRANSACTIONS` until the markers land.
+  Once the epoch reaches `i16::MAX - 1` the rejoin rotates to a fresh PID
+  at epoch 0 instead; the last epoch is kept back for that fence bump.
 - A retried `EndTxn` in the matching `Complete*` state is answered
   idempotently (no second transition); a direction mismatch returns
   `INVALID_TXN_STATE`, and `EndTxn` on `Empty` is `INVALID_TXN_STATE`
@@ -221,7 +234,9 @@ poll rather than skipping it.
   (gh #219 — both the silent-drop and the `OUT_OF_ORDER` symptoms of
   PID reuse were seen there; the pre-fix allocator was an in-memory
   `AtomicI64`).
-- Fence-on-rejoin contract: gh #22. Cross-broker fence broadcast
+- Fence-on-rejoin contract: gh #22; claimed-identity validation and
+  abort-on-rejoin: gh #201 (`TxnStateStore::init_producer_id`, a port of
+  Apache's `prepareInitProducerIdTransit`). Cross-broker fence broadcast
   (gh #108 phase 2): fence log in
   `crates/kaas-coordinator/src/fence_log.rs`, applied by each peer's
   `FenceWatcher` (`crates/kaas-broker/src/fence_watcher.rs`).

@@ -44,7 +44,7 @@ use crate::atomic_write::atomic_write_json;
 /// **Do not change this value on a deployed cluster.** The on-disk
 /// slot is computed as `fnv1a_32(txn_id) % NUM_SLOTS`; a different
 /// constant moves every existing entry to a different slot file and
-/// the next `get_or_allocate` for an existing `txn_id` reads an
+/// the next `init_producer_id` for an existing `txn_id` reads an
 /// empty slot — silently breaking the gh #22 rejoin contract. Apache
 /// enforces this by reading `transaction.state.log.num.partitions`
 /// at first cluster start and ignoring later changes. Kaas relies

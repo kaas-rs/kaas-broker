@@ -1,7 +1,10 @@
 //! kaas-codec — Kafka wire frames, primitives, CRC32C, KIP-482 tagged fields.
 //!
-//! Kafka wire codec: every registered API key/version encodes/decodes
-//! byte-identically against captured Apache Kafka 3.7 fixtures.
+//! Kafka wire codec for every registered API key/version. Each module
+//! round-trips its versions; `api::leave_group` also decodes a captured
+//! Java-client request. A round trip can't catch a bug its encoder and
+//! decoder share (gh #272), so header versions are pinned against
+//! Apache's values in `api::registry`.
 //!
 //! # Byte-opacity contract
 //!

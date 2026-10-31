@@ -131,9 +131,15 @@ epoch 0, and a one-shot warning that the rejoin fence is disabled.
 `crates/kaas-storage/src/idempotence.rs` (dedupe window it seeds).
 
 **Verified by**: handler unit tests (same-PID/epoch-bump rejoin,
-fence-log broadcast, empty-string id treated as non-transactional);
-`first_call_allocates_epoch_zero_rejoin_bumps` and
-`epoch_overflow_rotates_to_fresh_pid` in
+fence-log broadcast, empty-string id treated as non-transactional, and the
+gh #201 set: `stale_claim_is_producer_fenced`,
+`current_claim_bumps_and_its_retry_is_stable`,
+`half_set_claim_is_invalid_request`,
+`rejoin_mid_ongoing_aborts_it_and_answers_concurrent`);
+`first_call_allocates_epoch_zero_rejoin_bumps`,
+`epoch_overflow_rotates_to_fresh_pid`,
+`epoch_exhaustion_rotates_one_short_of_max` and
+`a_rejoin_mid_ongoing_prepares_an_abort_at_a_bumped_epoch` in
 `crates/kaas-coordinator/src/txn_state.rs`; `bins/kaas/tests/eos_v2.rs`;
 `scripts/kafka-txn-coordinator.sh` and `scripts/kafka-txn-timeout.sh`
 (wire-surface probes — the Kafka 4.x CLI dropped

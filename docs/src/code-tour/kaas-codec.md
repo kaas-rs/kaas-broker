@@ -2,14 +2,21 @@
 
 The Kafka wire-protocol codec: frames, primitives, CRC32C, KIP-482 tagged fields, and per-API request/response types with the ApiSpec registry.
 
-The wire boundary of the whole system. Everything here is pinned by fixture
-tests: every registered API key/version encodes and decodes byte-identically
-against captures from Apache Kafka 3.7.
+The wire boundary of the whole system. Every API module round-trips its
+supported versions through its own encoder and decoder, and one module
+(`leave_group.rs`) also decodes a captured Java-client request. Round
+trips can't catch a bug the encoder and decoder share, which is how every
+legacy-version response carried a stray header byte until gh #272. Header
+versions are now pinned against Apache's values instead
+(`registry.rs`'s `header_versions_match_apache`), and the
+`bins/kaas/tests/*` smoke suites exercise a real socket.
 
 **Module map**: `frame.rs` (length-prefixed framing, streaming
 `FrameReader`), `primitives.rs` + `tagged.rs` (Kafka primitive types and
-KIP-482 compact/tagged encoding), `headers.rs` (per-API header-version
-resolution), `crc.rs` (CRC32C batch verification), `errors.rs`, one module
+KIP-482 compact/tagged encoding), `headers.rs` (request/response
+header shapes; which one applies is `ApiSpec::request_header` /
+`response_header` in the registry, derived from the flexible range),
+`crc.rs` (CRC32C batch verification), `errors.rs`, one module
 per API under `src/api/`, and `src/api/registry.rs` — the `ApiSpec` table.
 
 **The invariant callers must hold**: RecordBatch payloads are byte-opaque.
