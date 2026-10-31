@@ -1557,7 +1557,6 @@ dependencies = [
  "bytes",
  "dashmap",
  "futures",
- "kaas-codec",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

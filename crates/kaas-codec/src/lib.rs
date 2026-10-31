@@ -14,10 +14,10 @@
 //! touches batch bytes beyond the 61-byte v2 header is [`crc::verify_batch_crc`],
 //! which treats them as opaque input to CRC32C.
 //!
-//! Any future code that does decode a record or re-encode a batch MUST bump
-//! the matching counter in [`tripwires`]. The integration tests in
-//! `crates/kaas-codec/tests/` assert both counters read zero after every run.
-//!
+//! Nothing counts or alarms on a violation (gh #275): a code path that
+//! starts decoding records wouldn't report itself. The invariant is held by
+//! that structure plus the byte-identity tests on the disk engine and over
+//! the wire (`bins/kaas/tests/smoke.rs`).
 
 pub mod api;
 pub mod crc;
@@ -26,7 +26,6 @@ pub mod frame;
 pub mod headers;
 pub mod primitives;
 pub mod tagged;
-pub mod tripwires;
 
 pub use bytes::{Bytes, BytesMut};
 pub use errors::CodecError;

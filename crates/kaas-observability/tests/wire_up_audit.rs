@@ -11,8 +11,8 @@
 //!    call site fails the test rather than silently dropping the
 //!    metric from Grafana.
 //! 2. **Coverage checklist** — the `EXPECTED_ZERO` list documents
-//!    which metrics are intentionally unwired (tripwires, forward-
-//!    compat, or subsystem-not-yet-ported), so a reviewer can spot
+//!    which metrics are intentionally unwired (forward-compat or
+//!    subsystem-not-yet-ported), so a reviewer can spot
 //!    when the assumption breaks.
 //!
 //! If you wire a new call site for a field currently in
@@ -68,11 +68,6 @@ const EXPECTED_WIRED: &[&str] = &[
 
 /// Metrics that are intentionally unwired today. Categories:
 ///
-/// * **Tripwires** (should never fire): `codec_record_decode`,
-///   `codec_batch_reencode`. Alertable-on-nonzero. The
-///   `kaas_codec::tripwires::install_tripwire_hooks` seam forwards any
-///   future bump to the OTel counters, but no production emitter
-///   exists today.
 /// * **Forward-compat / not-yet-ported subsystems**: compactor
 ///   metrics (`compaction_*`) — no compactor exists yet;
 ///   `cert_reloads` — TLS certs are bound at startup; hot reload is
@@ -85,8 +80,6 @@ const EXPECTED_WIRED: &[&str] = &[
 ///   `otlp_push_failure`, `otlp_push_duration` — see
 ///   `otlp_push_observer.rs`.
 const EXPECTED_ZERO: &[&str] = &[
-    "codec_record_decode",
-    "codec_batch_reencode",
     "self_fence_events",
     "heartbeat_rtt",
     "cert_reloads",

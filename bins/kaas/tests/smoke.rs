@@ -1,6 +1,5 @@
 //! End-to-end smoke test: drive Produce → Fetch over real TCP
-//! against an in-process server, assert byte-equal records and zero
-//! tripwires.
+//! against an in-process server, assert byte-equal records.
 //!
 //! No rdkafka — this is the framework-free version of the Phase 3
 //! exit criterion #6. Once rdkafka builds on the CI runners, a
@@ -32,7 +31,7 @@ use kaas_codec::api::{describe_cluster, fetch, metadata, produce};
 use kaas_codec::headers::{encode_request_header, HeaderVersion};
 use kaas_codec::primitives::{write_i16, write_i32, write_i64, write_i8};
 use kaas_codec::tagged;
-use kaas_codec::{tripwires, RequestHeader};
+use kaas_codec::RequestHeader;
 use kaas_protocol::{Dispatcher, ListenerConfig, Server, ServerConfigBuilder};
 use kaas_storage::{MemoryStorage, StorageEngine};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -257,10 +256,6 @@ async fn produce_fetch_metadata_roundtrip() {
     let serve_cancel = cancel.clone();
     let server_task = tokio::spawn(async move { bound.serve(dispatcher, serve_cancel).await });
 
-    // baseline tripwires before any traffic.
-    let dec_before = tripwires::record_decode_count();
-    let enc_before = tripwires::batch_reencode_count();
-
     let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
 
     // ---- Metadata ----
@@ -326,18 +321,6 @@ async fn produce_fetch_metadata_roundtrip() {
     // wrote, so the bytes match identically).
     assert_eq!(returned.len(), batch.len(), "byte-length mismatch");
     assert_eq!(returned, batch, "records byte-opacity violated");
-
-    // ---- Tripwires ----
-    assert_eq!(
-        tripwires::record_decode_count(),
-        dec_before,
-        "record decode tripwire bumped — byte-opacity contract broken"
-    );
-    assert_eq!(
-        tripwires::batch_reencode_count(),
-        enc_before,
-        "batch reencode tripwire bumped — byte-opacity contract broken"
-    );
 
     drop(sock);
     cancel.cancel();

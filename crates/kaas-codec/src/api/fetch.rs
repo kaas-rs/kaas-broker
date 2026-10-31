@@ -369,7 +369,6 @@ pub fn decode_response(buf: &mut Bytes, version: i16) -> Result<Response, CodecE
 mod tests {
     use super::*;
     use crate::primitives::write_i8;
-    use crate::tripwires;
 
     fn sample_request(version: i16) -> Request {
         Request {
@@ -560,7 +559,6 @@ mod tests {
 
     #[test]
     fn records_are_byte_opaque() {
-        let before = tripwires::record_decode_count();
         let resp = sample_response(12);
         let mut w = BytesMut::new();
         encode_response(&mut w, &resp, 12).unwrap();
@@ -570,7 +568,6 @@ mod tests {
             got.responses[0].partitions[0].records,
             resp.responses[0].partitions[0].records
         );
-        assert_eq!(tripwires::record_decode_count(), before);
     }
 
     #[test]

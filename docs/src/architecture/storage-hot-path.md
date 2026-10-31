@@ -272,8 +272,8 @@ format**, which is what makes Fetch a byte copy rather than a
 re-encode. Fetch is symmetric — batch bytes come back off disk
 undecoded. What holds the invariant is structural (there is no record
 type to decode into) plus byte-identity tests on the disk engine and over
-the wire. The tripwire counters (see [Observability](./observability.md))
-only move if a violating path reports itself (gh #275).
+the wire. No metric watches it (see [Observability](./observability.md),
+gh #275).
 
 ## The durability dial
 

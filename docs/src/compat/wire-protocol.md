@@ -62,11 +62,8 @@ Consequences worth internalizing:
   batch-level equivalent (the compactor itself is not yet implemented).
 - What enforces the contract is structural: with no record type there
   is nothing to decode into, and batch bytes are asserted byte-identical
-  through the disk engine and over the wire. The tripwire counters
-  (surfaced as metrics — see
-  [Observability](../architecture/observability.md)) only move if a
-  violating code path calls them itself, so they can't catch a violation
-  that doesn't report itself (gh #275).
+  through the disk engine and over the wire. No metric or alert watches
+  it (see [Observability](../architecture/observability.md), gh #275).
 
 ## Where to dig deeper
 
@@ -97,5 +94,3 @@ Everything wire-level lives in `crates/kaas-codec`:
 - `crates/kaas-codec/src/api/` — one request/response module per API;
   `crates/kaas-codec/src/api/registry.rs` — the `ApiSpec` table that
   drives both the ApiVersions response and the generated matrix.
-- `crates/kaas-codec/src/tripwires.rs` — the byte-opacity counters;
-  nothing calls them (gh #275).

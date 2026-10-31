@@ -1,4 +1,4 @@
-//! kaas-observability — OTLP metrics, log setup, /healthz, tripwires.
+//! kaas-observability — OTLP metrics, log setup, /healthz.
 //!
 //! Central registry for every
 //! OTel instrument kaas emits; `bootstrap` wires OTLP push (metrics)
@@ -12,7 +12,6 @@
 //! dereference from tests and pre-boot code without nil checks.
 
 pub mod bootstrap;
-pub mod byteopacity;
 pub mod gauges;
 pub mod health;
 pub mod k8s_api;
@@ -26,7 +25,6 @@ pub mod tracing;
 pub use opentelemetry::{self, KeyValue};
 
 pub use bootstrap::{bootstrap, Providers};
-pub use byteopacity::{bump_codec_batch_reencode, bump_codec_record_decode};
 pub use gauges::{set_gauge_source, GaugeSource, LogDirCapacityGauge, PartitionGauge};
 pub use health::{
     health_router, is_draining, main_alive, mark_draining, ready, record_main_tick, set_ready,

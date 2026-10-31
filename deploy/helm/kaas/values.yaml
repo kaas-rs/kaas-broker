@@ -344,7 +344,7 @@ observability:
     format: json       # json|text
 
   # Prometheus Operator PrometheusRule for the load-bearing kaas alerts
-  # (byte-opacity tripwires, self-fence, stale assignments, etc.).
+  # (self-fence, stale assignments, etc.).
   # Off by default — opt in only if Prometheus Operator is installed and
   # routes PrometheusRule resources from this namespace.
   alerts:

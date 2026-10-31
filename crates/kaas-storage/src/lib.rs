@@ -3,11 +3,9 @@
 //! # Byte-opacity contract
 //!
 //! Record-batch bytes flow through `kaas-storage` as `bytes::Bytes` —
-//! never decoded into a `Record` struct. The only module allowed to
-//! inspect record contents is the log-compactor (workstream G,
-//! follow-up); it bumps the `kaas_codec::tripwires` counters with
-//! `site = "compactor"` so the byte-opacity integration test (which
-//! exercises Produce/Fetch only) keeps both counters at zero.
+//! never decoded into a `Record` struct. The only module that will need
+//! to inspect record contents is the log compactor (gh #158, not yet
+//! built), and its granularity is per-batch.
 //!
 //! # Initial slice (Phase 2 commit 1)
 //!

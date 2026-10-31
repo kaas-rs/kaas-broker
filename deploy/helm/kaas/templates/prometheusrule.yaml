@@ -5,8 +5,7 @@ modes. Off by default — opt in via observability.alerts.enabled.
 
 Each rule's "summary" + "description" annotations are written so an
 operator hitting Alertmanager has enough context to start an
-investigation without reading the source. The byte-opacity tripwires
-are critical (architectural invariant); the rest are warnings unless
+investigation without reading the source. Rules are warnings unless
 they sustain.
 */ -}}
 apiVersion: monitoring.coreos.com/v1
@@ -20,26 +19,6 @@ metadata:
     {{- end }}
 spec:
   groups:
-    - name: kaas.byteopacity
-      interval: 30s
-      rules:
-        - alert: KaasByteOpacityViolated
-          expr: increase(kaas_codec_record_decode_total[5m]) > 0 or increase(kaas_codec_batch_reencode_total[5m]) > 0
-          for: 0s
-          labels:
-            severity: critical
-            {{- with .Values.observability.alerts.additionalLabels }}
-            {{- toYaml . | nindent 12 }}
-            {{- end }}
-          annotations:
-            summary: "Byte-opacity invariant violated on {{`{{ $labels.broker_id }}`}}"
-            description: |
-              kaas_codec_record_decode_total or kaas_codec_batch_reencode_total
-              incremented. The v3.3 plan is explicit: the broker is a byte mover,
-              not a byte interpreter. A non-zero increment means some code path
-              decoded an individual record or re-encoded a RecordBatch — page on
-              this. Check the slog warnings around the increment for the call site.
-
     - name: kaas.coordination
       interval: 30s
       rules:

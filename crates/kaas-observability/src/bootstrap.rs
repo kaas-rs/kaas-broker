@@ -103,16 +103,6 @@ pub async fn bootstrap(
     // gauges::set_gauge_source is wired by the runtime owner.
     install_runtime_gauges(&meter);
 
-    // Forward kaas-codec's tripwire bumps to the OTel counters. If a
-    // future code path fires the tripwire in production, the
-    // KaasByteOpacityViolated alert reads the OTel side and pages;
-    // pre-bootstrap and tests keep the in-process counter as the
-    // fast in-test signal.
-    kaas_codec::tripwires::install_tripwire_hooks(
-        crate::byteopacity::bump_codec_record_decode,
-        crate::byteopacity::bump_codec_batch_reencode,
-    );
-
     ::tracing::info!(
         service,
         otlp_metrics = std::env::var("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")

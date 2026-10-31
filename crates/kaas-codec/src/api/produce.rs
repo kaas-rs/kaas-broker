@@ -270,7 +270,6 @@ mod tests {
     use super::*;
     use crate::api::common::{write_nullable_bytes, write_nullable_str};
     use crate::primitives::{write_i16 as wi16, write_i32 as wi32};
-    use crate::tripwires;
 
     fn sample_request(version: i16) -> Request {
         Request {
@@ -428,7 +427,6 @@ mod tests {
 
     #[test]
     fn records_are_byte_opaque() {
-        let before = tripwires::record_decode_count();
         let req = sample_request(9);
         let w = encode_request(&req, 9);
         let mut r = w.freeze();
@@ -444,11 +442,6 @@ mod tests {
             .as_ref()
             .unwrap();
         assert_eq!(original, echoed);
-        assert_eq!(
-            tripwires::record_decode_count(),
-            before,
-            "decode_request must not bump the record-decode tripwire"
-        );
     }
 
     /// gh #272: v3–v8 responses have no tagged-fields byte in the

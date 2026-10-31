@@ -22,9 +22,9 @@ per API under `src/api/`, and `src/api/registry.rs` — the `ApiSpec` table.
 **The invariant callers must hold**: RecordBatch payloads are byte-opaque.
 There is no `Record` struct in this crate, and none may be added — batch
 bytes travel as `Option<bytes::Bytes>`, and the only code reading past the
-fixed v2 header is CRC verification (`crc.rs`). `tripwires.rs` has
-counters a violating path is meant to bump, but nothing would make it, so
-the byte-identity tests are what catch a change to the bytes (gh #275).
+fixed v2 header is CRC verification (`crc.rs`). The byte-identity tests
+are what catch a change to the bytes; there is no counter or alert
+(gh #275).
 The full rationale is in
 [Wire protocol & framing](../compat/wire-protocol.md).
 

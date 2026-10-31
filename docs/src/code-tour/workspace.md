@@ -96,8 +96,8 @@ flowchart LR
 
 One crate is left off the diagram to keep it readable:
 **`kaas-observability`** is depended on by every crate above except
-`kaas-codec` and `kaas-operator-api` (and by both bins); its own single
-dependency is `kaas-codec`, for the byte-opacity tripwire counters.
+`kaas-codec` and `kaas-operator-api` (and by both bins); it depends on
+no other kaas crate.
 
 > This graph is hand-maintained (checked against `Cargo.toml` on 2026-08-11).
 > Auto-generating it from `cargo metadata` is a possible future

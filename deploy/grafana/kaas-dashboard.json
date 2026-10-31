@@ -245,31 +245,11 @@
       ]
     },
     {
-      "id": 20,
-      "type": "timeseries",
-      "title": "Byte-opacity tripwires (MUST stay at zero)",
-      "description": "If either line leaves zero, code is decoding individual records or re-encoding RecordBatches — a violation of the v3.3 byte-mover invariant. Page on this.",
-      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 58},
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-      "targets": [
-        {"expr": "sum(kaas_codec_record_decode_total)", "legendFormat": "record_decode"},
-        {"expr": "sum(kaas_codec_batch_reencode_total)", "legendFormat": "batch_reencode"}
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "thresholds": {"mode": "absolute", "steps": [
-            {"color": "green", "value": null},
-            {"color": "red", "value": 1}
-          ]}
-        }
-      }
-    },
-    {
       "id": 21,
       "type": "timeseries",
       "title": "Partition high watermark by topic",
       "description": "Per-leader HWM. Use `max by (topic, partition)` to dedupe across non-leader brokers reporting zero.",
-      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 66},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 58},
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "targets": [
         {"expr": "sum by (topic) (max by (topic, partition) (kaas_partition_high_watermark))", "legendFormat": "{{topic}}"}
@@ -280,7 +260,7 @@
       "type": "timeseries",
       "title": "Partition leader churn",
       "description": "When kaas_partition_leader changes for a (topic, partition), this counter ticks. Steady = stable assignment; bursts = rebalance / failover.",
-      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 66},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 58},
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "targets": [
         {"expr": "sum(changes(kaas_partition_leader[5m]))", "legendFormat": "leader changes (5m)"}

@@ -75,19 +75,24 @@ when no controller, coordinator, or heartbeat client is running.
 leadership as the Produce/Fetch ownership check — `/healthz` never
 invents its own answer to "who leads what".
 
-## Byte-opacity tripwires
+## Byte opacity has no metric
 
 The broker's load-bearing invariant is *"kaas is a byte mover, not a
 byte interpreter"*: no code path decodes individual records or
 re-encodes a `RecordBatch` (see
-[Storage engine hot path](./storage-hot-path.md)). Two counters were
-meant to give that invariant teeth — `codec_record_decode` and
-`codec_batch_reencode` — which **must stay at zero in steady state**.
-Every increment names the offending call site in a `site` attribute,
-and the `KaasByteOpacityViolated` alert fires on non-zero.
+[Storage engine hot path](./storage-hot-path.md)). No metric or alert
+watches it. Earlier releases shipped two counters
+(`kaas_codec_record_decode_total`, `kaas_codec_batch_reencode_total`)
+and a `KaasByteOpacityViolated` alert, but a counter moved only when the
+violating code path called it, and a refactor that starts decoding
+records would not add that call. They were removed (gh #275).
 
-As of today no kaas code path calls these functions; the counters exist
-so the *first* violation is an alert, not an archaeology project.
+The invariant is held by structure, not by a signal: the codec has no
+record type to decode into, and batch bytes are asserted byte-identical
+through the disk engine (`append_then_read_byte_identical`) and over the
+wire (`bins/kaas/tests/smoke.rs`). A runtime check would have to be
+something a violation can't skip, such as re-verifying a stored batch's
+CRC32C on the Fetch path.
 
 ## Logs and traces
 
@@ -108,12 +113,8 @@ tracing backend.
 
 - Everything lives in `crates/kaas-observability`: `bootstrap.rs`
   (OTel SDK bring-up), `health.rs` (the axum `/healthz`/`/readyz`
-  surface; the JSON view is the `RuntimeState` trait), `byteopacity.rs`
-  (tripwire counters), `tracing.rs` (`install_tracing`, the
-  `tracing-subscriber` log stack).
-- Codec-side tripwire counterparts:
-  `crates/kaas-codec/src/tripwires.rs`. Nothing calls them, so they can't
-  catch a violation that doesn't report itself; gh #275 tracks removing them.
+  surface; the JSON view is the `RuntimeState` trait), `tracing.rs`
+  (`install_tracing`, the `tracing-subscriber` log stack).
 - Two standing rules: pick `KAAS_METRIC_EXPORT_INTERVAL` with the
   Prometheus `rate()` window in mind, and gauge callbacks must read
   the engine's `ArcSwap` snapshot, never the partition mutex.

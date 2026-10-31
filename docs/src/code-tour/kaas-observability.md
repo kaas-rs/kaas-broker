@@ -1,6 +1,6 @@
 # kaas-observability
 
-The OTLP metrics bootstrap, the log subscriber, the `/healthz` HTTP handler, and the byte-opacity tripwire counters.
+The OTLP metrics bootstrap, the log subscriber, and the `/healthz` HTTP handler.
 
 The content of this crate — what gets exported where, the `/healthz`
 runtime view, why gauges read through lock-free snapshots — is covered in
@@ -15,8 +15,7 @@ receiver speaks; no traces, gh #269),
 no-op registry before bootstrap, so pre-boot code and tests never
 nil-check), `gauges.rs` (the `GaugeSource` seam the broker feeds partition
 gauges through), `health.rs` (axum `/healthz` + `/readyz`; the
-`RuntimeState` trait), `byteopacity.rs` (the tripwire counters),
-`otlp_push_observer.rs` (a `PushMetricExporter` wrapper that makes OTLP
+`RuntimeState` trait), `otlp_push_observer.rs` (a `PushMetricExporter` wrapper that makes OTLP
 push failures alertable, gh #121), `k8s_api.rs` (K8s API call metrics),
 `topic_traffic.rs`, `tracing.rs`
 (`tracing-subscriber` log filter and formatter).

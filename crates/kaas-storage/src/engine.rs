@@ -10,8 +10,7 @@
 //!
 //! The trait is `dyn`-compatible (no generics, no `Self: Sized` methods,
 //! async fn via `async_trait`). Every consumer holds
-//! `Arc<dyn StorageEngine>`. This is the seam tests mock and the seam
-//! the byte-opacity cross-engine test exercises.
+//! `Arc<dyn StorageEngine>`. This is the seam tests mock.
 //!
 //! # Byte-opacity
 //!

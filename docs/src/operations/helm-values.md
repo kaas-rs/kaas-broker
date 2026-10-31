@@ -164,7 +164,7 @@ Details and the reasoning: [Kubernetes integration](../architecture/kubernetes.m
 | `otlp.metrics.endpoint` | `http://prometheus.observability...:9090/api/v1/otlp/v1/metrics` | Path must end in `/v1/metrics`. |
 | `otlp.metrics.exportInterval` | `"30s"` | Push cadence. The SDK's 60 s default leaves Grafana `rate([1m])` panels with one sample per window; 30 s guarantees two. Duration strings accepted. |
 | `logs.level` / `logs.format` | `info` / `json` | `debug…error`; `json` or `text`. |
-| `alerts.enabled` | `false` | Render a PrometheusRule with the load-bearing kaas alerts (byte-opacity tripwires, self-fence, stale assignments…). Needs Prometheus Operator. |
+| `alerts.enabled` | `false` | Render a PrometheusRule with the load-bearing kaas alerts (self-fence, stale assignments…). Needs Prometheus Operator. |
 | `alerts.additionalLabels` | `{}` | Merged into every rule (Alertmanager routing). |
 | `alerts.thresholds.*` | see values.yaml | Per-alert overrides. Caveat: `heartbeatRttP99Seconds` tunes an alert whose metric is not yet emitted — that alert cannot fire today. |
 

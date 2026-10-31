@@ -69,10 +69,6 @@ pub struct Metrics {
     pub heartbeat_misses: Counter<u64>,
     pub self_fence_events: Counter<u64>,
 
-    // Byte-opacity tripwires — MUST stay at zero. See [`crate::byteopacity`].
-    pub codec_record_decode: Counter<u64>,
-    pub codec_batch_reencode: Counter<u64>,
-
     // Consumer groups.
     pub group_rebalances: Counter<u64>,
 
@@ -204,17 +200,6 @@ pub fn new_metrics(m: &Meter) -> Metrics {
             m,
             "kaas.self.fence.events",
             "Times this broker self-fenced due to stale heartbeat",
-        ),
-
-        codec_record_decode: counter(
-            m,
-            "kaas.codec.record.decode",
-            "Tripwire: code path decoded an individual record. MUST stay at zero — alert if non-zero",
-        ),
-        codec_batch_reencode: counter(
-            m,
-            "kaas.codec.batch.reencode",
-            "Tripwire: code path re-encoded a RecordBatch. MUST stay at zero — alert if non-zero",
         ),
 
         group_rebalances: counter(
@@ -433,8 +418,7 @@ mod tests {
         // Doesn't panic; observations are silently dropped.
         let m = global();
         m.request_latency.record(0.001, &[]);
-        m.codec_record_decode
-            .add(1, &[KeyValue::new("site", "test")]);
+        m.self_fence_events.add(1, &[KeyValue::new("site", "test")]);
     }
 
     #[test]
