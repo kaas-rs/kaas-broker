@@ -27,7 +27,6 @@ use crate::api::common::{
 };
 use crate::api::registry::ApiSpec;
 use crate::errors::CodecError;
-use crate::headers::HeaderVersion;
 use crate::primitives::{read_i16, read_i32, read_i64, write_i16, write_i32, write_i64};
 use crate::tagged;
 use crate::Bytes;
@@ -35,29 +34,11 @@ use crate::Bytes;
 pub const VERSIONS: (i16, i16) = (3, 9);
 pub const MIN_FLEXIBLE: i16 = 9;
 
-const fn header_for(version: i16) -> HeaderVersion {
-    if version >= MIN_FLEXIBLE {
-        HeaderVersion::V2
-    } else {
-        HeaderVersion::V1
-    }
-}
-
-fn request_hdr(version: i16) -> HeaderVersion {
-    header_for(version)
-}
-
-fn response_hdr(version: i16) -> HeaderVersion {
-    header_for(version)
-}
-
 pub const SPEC: ApiSpec = ApiSpec {
     key: 0,
     min_version: VERSIONS.0,
     max_version: VERSIONS.1,
     min_flexible: Some(MIN_FLEXIBLE),
-    request_hdr,
-    response_hdr,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -470,12 +451,16 @@ mod tests {
         );
     }
 
+    /// gh #272: v3–v8 responses have no tagged-fields byte in the
+    /// header; this test used to assert they did.
     #[test]
     fn header_versions() {
-        assert!(matches!(request_hdr(3), HeaderVersion::V1));
-        assert!(matches!(request_hdr(8), HeaderVersion::V1));
-        assert!(matches!(request_hdr(9), HeaderVersion::V2));
-        assert!(matches!(response_hdr(8), HeaderVersion::V1));
-        assert!(matches!(response_hdr(9), HeaderVersion::V2));
+        use crate::headers::HeaderVersion;
+        assert_eq!(SPEC.request_header(3), HeaderVersion::V1);
+        assert_eq!(SPEC.request_header(8), HeaderVersion::V1);
+        assert_eq!(SPEC.request_header(9), HeaderVersion::V2);
+        assert_eq!(SPEC.response_header(3), HeaderVersion::V0);
+        assert_eq!(SPEC.response_header(8), HeaderVersion::V0);
+        assert_eq!(SPEC.response_header(9), HeaderVersion::V1);
     }
 }

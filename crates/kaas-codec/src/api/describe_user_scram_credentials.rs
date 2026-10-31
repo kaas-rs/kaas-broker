@@ -19,7 +19,6 @@ use crate::api::common::{read_nullable_str, write_array_len, write_nullable_str}
 use crate::api::common::{read_str, write_str};
 use crate::api::registry::ApiSpec;
 use crate::errors::CodecError;
-use crate::headers::HeaderVersion;
 use crate::primitives::{
     read_i16, read_i32, read_i8, read_uvarint, write_i16, write_i32, write_i8, write_uvarint,
 };
@@ -29,21 +28,11 @@ use crate::Bytes;
 pub const VERSIONS: (i16, i16) = (0, 0);
 pub const MIN_FLEXIBLE: i16 = 0;
 
-fn request_hdr(_version: i16) -> HeaderVersion {
-    HeaderVersion::V2
-}
-
-fn response_hdr(_version: i16) -> HeaderVersion {
-    HeaderVersion::V1
-}
-
 pub const SPEC: ApiSpec = ApiSpec {
     key: 50,
     min_version: VERSIONS.0,
     max_version: VERSIONS.1,
     min_flexible: Some(MIN_FLEXIBLE),
-    request_hdr,
-    response_hdr,
 };
 
 /// `ScramMechanism` discriminants (Apache's enum).

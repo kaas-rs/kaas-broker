@@ -34,7 +34,7 @@ use kaas_codec::api::common::{
 };
 use kaas_codec::api::{produce, sasl_authenticate, sasl_handshake};
 use kaas_codec::headers::{encode_request_header, HeaderVersion};
-use kaas_codec::primitives::{write_compact_bytes, write_i16, write_i32};
+use kaas_codec::primitives::{write_bytes, write_compact_bytes, write_i16, write_i32};
 use kaas_codec::tagged;
 use kaas_codec::RequestHeader;
 use kaas_protocol::{Dispatcher, ListenerConfig, Server, ServerConfigBuilder};
@@ -269,6 +269,12 @@ fn authenticate_frame_v2(payload: &[u8], correlation_id: i32) -> Vec<u8> {
     w.to_vec()
 }
 
+fn authenticate_frame_v1(payload: &[u8], correlation_id: i32) -> Vec<u8> {
+    let mut w = header(36, 1, correlation_id, HeaderVersion::V1);
+    write_bytes(&mut w, payload).unwrap();
+    w.to_vec()
+}
+
 fn produce_frame_v9(topic: &str, records: Bytes, correlation_id: i32) -> Vec<u8> {
     let mut w = header(0, 9, correlation_id, HeaderVersion::V2);
     // body (v9 flexible): transactional_id (nullable compact), acks (i16),
@@ -396,6 +402,55 @@ async fn scram_handshake_then_authenticate_unblocks_produce() {
     let mut b = body;
     let r = produce::decode_response(&mut b, 9).unwrap();
     assert_eq!(r.responses[0].partition_responses[0].error_code, 3);
+
+    cancel.cancel();
+}
+
+#[tokio::test]
+async fn legacy_sasl_authenticate_response_has_no_tagged_header_byte() {
+    // gh #272: a non-flexible response header is the bare correlation id.
+    // kaas used to append a tagged-fields byte to every legacy-version
+    // response, so a client reading SaslAuthenticate v1 the way Apache
+    // frames it took that byte for the first half of the error code.
+    let creds = loader_with_alice();
+    let (engines, authorizer, quotas) = build_auth(creds);
+    let broker = broker_with(&[("ok", 1)], authorizer, quotas);
+    let listeners = vec![ListenerEntry {
+        name: "authed".to_owned(),
+        addr: "127.0.0.1:0".to_owned(),
+        advertised_host: Some("127.0.0.1".to_owned()),
+        tls: None,
+        authentication_type: Some("scram-sha-512".to_owned()),
+        oauth: None,
+    }];
+    let dispatcher = build_dispatcher(broker, &listeners, engines);
+    let (cancel, port) = spawn_server(dispatcher).await;
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+
+    let resp = send(&mut sock, &handshake_frame("SCRAM-SHA-512", 1)).await;
+    let mut b = strip_response_header(&resp, HeaderVersion::V0);
+    assert_eq!(
+        sasl_handshake::decode_response(&mut b, 1)
+            .unwrap()
+            .error_code,
+        0
+    );
+
+    let resp = send(
+        &mut sock,
+        &authenticate_frame_v1(b"n,,n=alice,r=clientnonce", 2),
+    )
+    .await;
+    assert_eq!(&resp[..4], &2i32.to_be_bytes(), "correlation id");
+    let mut b = strip_response_header(&resp, HeaderVersion::V0);
+    let r = sasl_authenticate::decode_response(&mut b, 1).unwrap();
+    assert_eq!(r.error_code, 0);
+    assert!(
+        r.auth_bytes.starts_with(b"r=clientnonce"),
+        "server-first must follow the error fields directly, got {:?}",
+        String::from_utf8_lossy(&r.auth_bytes)
+    );
+    assert!(b.is_empty(), "no bytes may trail the v1 body");
 
     cancel.cancel();
 }

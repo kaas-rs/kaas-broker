@@ -16,7 +16,6 @@ use crate::api::common::{
 };
 use crate::api::registry::ApiSpec;
 use crate::errors::CodecError;
-use crate::headers::HeaderVersion;
 use crate::primitives::{read_i16, read_i32, read_i8, write_i16, write_i32, write_i8};
 use crate::tagged;
 use crate::Bytes;
@@ -26,21 +25,11 @@ pub use crate::api::describe_user_scram_credentials::mechanism;
 pub const VERSIONS: (i16, i16) = (0, 0);
 pub const MIN_FLEXIBLE: i16 = 0;
 
-fn request_hdr(_version: i16) -> HeaderVersion {
-    HeaderVersion::V2
-}
-
-fn response_hdr(_version: i16) -> HeaderVersion {
-    HeaderVersion::V1
-}
-
 pub const SPEC: ApiSpec = ApiSpec {
     key: 51,
     min_version: VERSIONS.0,
     max_version: VERSIONS.1,
     min_flexible: Some(MIN_FLEXIBLE),
-    request_hdr,
-    response_hdr,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

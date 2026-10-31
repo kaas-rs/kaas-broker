@@ -7,7 +7,6 @@ use bytes::BytesMut;
 
 use crate::api::registry::ApiSpec;
 use crate::errors::CodecError;
-use crate::headers::HeaderVersion;
 use crate::primitives::{
     read_array_len, read_compact_array_len, read_compact_string, read_i16, read_i32,
     write_array_len, write_compact_array_len, write_i16, write_i32,
@@ -18,36 +17,11 @@ use crate::Bytes;
 pub const VERSIONS: (i16, i16) = (0, 4);
 pub const MIN_FLEXIBLE: i16 = 3;
 
-const fn header_for(version: i16) -> HeaderVersion {
-    if version >= MIN_FLEXIBLE {
-        HeaderVersion::V2
-    } else if version >= 1 {
-        HeaderVersion::V1
-    } else {
-        HeaderVersion::V0
-    }
-}
-
-fn request_hdr(version: i16) -> HeaderVersion {
-    header_for(version)
-}
-
-fn response_hdr(version: i16) -> HeaderVersion {
-    // ApiVersions is the bootstrap call: its *response* header is always
-    // V0 (no tagged-field block on the response header itself), even on
-    // flexible versions, so an old client that misreads the header can
-    // still recover the error code. Apache's documented exception.
-    let _ = version;
-    HeaderVersion::V0
-}
-
 pub const SPEC: ApiSpec = ApiSpec {
     key: 18,
     min_version: VERSIONS.0,
     max_version: VERSIONS.1,
     min_flexible: Some(MIN_FLEXIBLE),
-    request_hdr,
-    response_hdr,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]

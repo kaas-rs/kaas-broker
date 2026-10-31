@@ -21,9 +21,13 @@ then the message. Inside a frame:
   flexible.
 
 One subtlety Kafka clients normally hide from you: the header's *own*
-version depends on `(api key, api version)`. kaas resolves it through a
-per-API header-version function carried on each registry entry, so every
-key answers with exactly the header shape Apache Kafka 3.7 would use.
+version depends on `(api key, api version)`. kaas derives it from each
+registry entry's flexible-from version, the same rule Apache's generated
+code applies: tagged fields on a flexible version and none on a legacy
+one. ApiVersions is the one exception: its response header is always v0.
+Until gh #272 each API module carried its own header functions, and every
+legacy-version response gained a tagged-fields byte that a client
+negotiating that version would misread.
 
 ## KIP-482: flexible versions and tagged fields
 

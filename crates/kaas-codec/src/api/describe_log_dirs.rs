@@ -17,7 +17,6 @@ use bytes::BytesMut;
 
 use crate::api::registry::ApiSpec;
 use crate::errors::CodecError;
-use crate::headers::HeaderVersion;
 use crate::primitives::{
     read_bool, read_compact_array_len, read_compact_string, read_i16, read_i32, read_i64,
     read_string, read_uvarint, write_bool, write_compact_array_len, write_compact_string,
@@ -29,29 +28,11 @@ use crate::Bytes;
 pub const VERSIONS: (i16, i16) = (0, 4);
 pub const MIN_FLEXIBLE: i16 = 2;
 
-fn request_hdr(version: i16) -> HeaderVersion {
-    if version >= MIN_FLEXIBLE {
-        HeaderVersion::V2
-    } else {
-        HeaderVersion::V1
-    }
-}
-
-fn response_hdr(version: i16) -> HeaderVersion {
-    if version >= MIN_FLEXIBLE {
-        HeaderVersion::V1
-    } else {
-        HeaderVersion::V0
-    }
-}
-
 pub const SPEC: ApiSpec = ApiSpec {
     key: 35,
     min_version: VERSIONS.0,
     max_version: VERSIONS.1,
     min_flexible: Some(MIN_FLEXIBLE),
-    request_hdr,
-    response_hdr,
 };
 
 const fn flexible(version: i16) -> bool {

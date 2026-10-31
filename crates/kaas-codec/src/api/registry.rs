@@ -7,11 +7,11 @@
 
 use crate::headers::HeaderVersion;
 
-// No `PartialEq`/`Eq`: the two `fn` pointer fields below make derived
-// equality meaningless (function addresses aren't unique across codegen
-// units), and rustc denies the comparison since 1.86. Nothing compares
-// `ApiSpec` values — lookups go by `key`.
-#[derive(Debug, Clone, Copy)]
+/// `ApiVersions` — the one key whose response header ignores the
+/// flexible range.
+const API_VERSIONS_KEY: i16 = 18;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApiSpec {
     pub key: i16,
     pub min_version: i16,
@@ -19,14 +19,42 @@ pub struct ApiSpec {
     /// `Some(v)` if the API is flexible (KIP-482) from version `v` onward;
     /// `None` if all supported versions are still legacy.
     pub min_flexible: Option<i16>,
-    pub request_hdr: fn(i16) -> HeaderVersion,
-    pub response_hdr: fn(i16) -> HeaderVersion,
 }
 
 impl ApiSpec {
     /// True if `version` is in the flexible range for this API.
     pub fn is_flexible(&self, version: i16) -> bool {
         matches!(self.min_flexible, Some(min) if version >= min)
+    }
+
+    /// Apache's generated `requestHeaderVersion`: v2 (tagged fields) on
+    /// a flexible version, v1 (`client_id`) otherwise. Request header v0
+    /// only ever served ControlledShutdown v0, which kaas doesn't
+    /// register.
+    pub fn request_header(&self, version: i16) -> HeaderVersion {
+        if self.is_flexible(version) {
+            HeaderVersion::V2
+        } else {
+            HeaderVersion::V1
+        }
+    }
+
+    /// Apache's generated `responseHeaderVersion`: v1 (tagged fields) on
+    /// a flexible version, v0 otherwise — except ApiVersions, whose
+    /// response header is v0 at every version, because a client has to
+    /// parse it before it knows which versions the broker speaks
+    /// (KIP-511).
+    ///
+    /// Derived from `min_flexible` rather than written per module: the
+    /// per-module copies shared one helper with the request side, which
+    /// handed every non-flexible response a tagged-fields byte it must
+    /// not have (gh #272).
+    pub fn response_header(&self, version: i16) -> HeaderVersion {
+        if self.key != API_VERSIONS_KEY && self.is_flexible(version) {
+            HeaderVersion::V1
+        } else {
+            HeaderVersion::V0
+        }
     }
 }
 
@@ -100,6 +128,44 @@ mod tests {
     #[test]
     fn lookup_returns_none_for_unknown_key() {
         assert!(lookup(999).is_none());
+    }
+
+    /// gh #272: the response header follows the flexible range, so a
+    /// legacy version gets no tagged-fields byte. Values are Apache 3.7's
+    /// `ApiKeys.{request,response}HeaderVersion`.
+    #[test]
+    fn header_versions_match_apache() {
+        let cases: &[(i16, i16, HeaderVersion, HeaderVersion)] = &[
+            // (key, version, request header, response header)
+            (0, 8, HeaderVersion::V1, HeaderVersion::V0), // Produce, last legacy
+            (0, 9, HeaderVersion::V2, HeaderVersion::V1),
+            (1, 11, HeaderVersion::V1, HeaderVersion::V0), // Fetch
+            (1, 12, HeaderVersion::V2, HeaderVersion::V1),
+            (3, 8, HeaderVersion::V1, HeaderVersion::V0), // Metadata
+            (3, 9, HeaderVersion::V2, HeaderVersion::V1),
+            (10, 2, HeaderVersion::V1, HeaderVersion::V0), // FindCoordinator
+            (17, 1, HeaderVersion::V1, HeaderVersion::V0), // SaslHandshake, never flexible
+            (36, 1, HeaderVersion::V1, HeaderVersion::V0), // SaslAuthenticate
+            (36, 2, HeaderVersion::V2, HeaderVersion::V1),
+            (60, 0, HeaderVersion::V2, HeaderVersion::V1), // DescribeCluster, flexible from v0
+            // ApiVersions: legacy request header carries client_id even at
+            // v0; the response header stays v0 even once flexible.
+            (18, 0, HeaderVersion::V1, HeaderVersion::V0),
+            (18, 3, HeaderVersion::V2, HeaderVersion::V0),
+        ];
+        for &(key, version, req, resp) in cases {
+            let spec = lookup(key).expect("registered");
+            assert_eq!(
+                spec.request_header(version),
+                req,
+                "request key={key} v{version}"
+            );
+            assert_eq!(
+                spec.response_header(version),
+                resp,
+                "response key={key} v{version}"
+            );
+        }
     }
 
     #[test]

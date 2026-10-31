@@ -258,7 +258,7 @@ fn response_header_version(
     spec: Option<&'static registry::ApiSpec>,
     version: i16,
 ) -> HeaderVersion {
-    spec.map(|s| (s.response_hdr)(version))
+    spec.map(|s| s.response_header(version))
         .unwrap_or(HeaderVersion::V0)
 }
 
@@ -329,6 +329,18 @@ mod tests {
         assert_eq!(&body[2..], b"hello");
         // ApiVersions response header is always V0 (the documented exception).
         assert!(matches!(hv, HeaderVersion::V0));
+    }
+
+    /// gh #272: a legacy (non-flexible) version gets the bare v0
+    /// response header; only flexible versions carry tagged fields.
+    #[tokio::test]
+    async fn legacy_versions_get_a_v0_response_header() {
+        let mut d = Dispatcher::new();
+        d.register(0, 3, 9, Arc::new(EchoHandler));
+        let (_, legacy) = d.dispatch(&conn(), header(0, 8), Bytes::new()).await;
+        assert_eq!(legacy, HeaderVersion::V0, "Produce v8 is not flexible");
+        let (_, flexible) = d.dispatch(&conn(), header(0, 9), Bytes::new()).await;
+        assert_eq!(flexible, HeaderVersion::V1, "Produce v9 is flexible");
     }
 
     #[tokio::test]

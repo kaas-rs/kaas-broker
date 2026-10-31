@@ -76,7 +76,7 @@ where
         let api_version = i16::from_be_bytes([frame[2], frame[3]]);
         let hv = match registry::lookup(api_key) {
             Some(spec) if api_version >= spec.min_version && api_version <= spec.max_version => {
-                (spec.request_hdr)(api_version)
+                spec.request_header(api_version)
             }
             // Unknown key or out-of-range version: V1 is the safe
             // fallback. It at least reads the client_id nullable
@@ -93,8 +93,8 @@ where
     /// Write a response frame: `[size:i32][correlation_id:i32]
     /// [maybe tagged fields][body]`. `header_version` controls
     /// whether the empty tagged-fields block follows the correlation
-    /// id — picked by the dispatcher off the per-API
-    /// `response_hdr(version)` function pointer.
+    /// id — picked by the dispatcher from
+    /// [`registry::ApiSpec::response_header`].
     pub async fn write_response(
         &mut self,
         correlation_id: i32,

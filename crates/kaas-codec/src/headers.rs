@@ -7,9 +7,11 @@
 //! - **Response v0**: `int32 correlation_id`
 //! - **Response v1**: v0 + `tagged_fields`
 //!
-//! The (api_key, api_version) → header version mapping lives in
-//! [`crate::api::registry`] per Apache's
-//! `ApiKeys.requestHeaderVersion(apiKey, apiVersion)` table.
+//! The (api_key, api_version) → header version mapping is derived from
+//! each registry entry's flexible range by
+//! [`crate::api::registry::ApiSpec::request_header`] and
+//! [`crate::api::registry::ApiSpec::response_header`], as Apache's
+//! generated `ApiMessageType.{request,response}HeaderVersion` does.
 
 use bytes::BytesMut;
 
@@ -24,8 +26,8 @@ use crate::Bytes;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HeaderVersion {
     /// Legacy header without `client_id` (request) or without tagged fields
-    /// (response). v0 is the wire shape for the oldest supported API
-    /// versions, and for response of every non-flexible API.
+    /// (response). The response header of every non-flexible version, and
+    /// of ApiVersions at every version.
     V0,
     /// Request: v0 + `client_id`. Response: v0 + tagged fields.
     V1,

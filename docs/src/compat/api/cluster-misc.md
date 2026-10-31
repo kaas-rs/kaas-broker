@@ -41,8 +41,9 @@ completes. Two protocol subtleties are implemented faithfully:
   levels (see [Non-goals](../non-goals.md)).
 
 **Source**: `crates/kaas-broker/src/handlers/api_versions.rs`,
-`crates/kaas-codec/src/api/api_versions.rs` (`response_from_registry`, the
-always-v0 `response_hdr`), `crates/kaas-codec/src/api/registry.rs`,
+`crates/kaas-codec/src/api/api_versions.rs` (`response_from_registry`),
+`crates/kaas-codec/src/api/registry.rs` (the always-v0 exception in
+`ApiSpec::response_header`),
 `crates/kaas-protocol/src/dispatch.rs` (clamp + pre-auth allowlist).
 
 **Verified by**: `scripts/kafka-broker-api-versions.sh` (asserts the required

@@ -34,7 +34,6 @@ use crate::api::common::{
 };
 use crate::api::registry::ApiSpec;
 use crate::errors::CodecError;
-use crate::headers::HeaderVersion;
 use crate::primitives::{
     read_bool, read_i16, read_i32, read_i8, write_bool, write_i16, write_i32, write_i8,
 };
@@ -58,21 +57,11 @@ pub mod endpoint_type {
 /// *did* ask but is authorized for nothing gets `0` instead.
 pub const NOT_REQUESTED: i32 = i32::MIN;
 
-fn request_hdr(_version: i16) -> HeaderVersion {
-    HeaderVersion::V2
-}
-
-fn response_hdr(_version: i16) -> HeaderVersion {
-    HeaderVersion::V1
-}
-
 pub const SPEC: ApiSpec = ApiSpec {
     key: 60,
     min_version: VERSIONS.0,
     max_version: VERSIONS.1,
     min_flexible: Some(MIN_FLEXIBLE),
-    request_hdr,
-    response_hdr,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -399,8 +388,9 @@ mod tests {
     /// baseline.
     #[test]
     fn headers_are_flexible_from_v0() {
+        use crate::headers::HeaderVersion;
         assert!(SPEC.is_flexible(0));
-        assert_eq!(request_hdr(0), HeaderVersion::V2);
-        assert_eq!(response_hdr(0), HeaderVersion::V1);
+        assert_eq!(SPEC.request_header(0), HeaderVersion::V2);
+        assert_eq!(SPEC.response_header(0), HeaderVersion::V1);
     }
 }
