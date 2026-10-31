@@ -102,6 +102,17 @@ impl Issuer {
 
 // --- Broker bring-up (TLS listener named "oauth") ---
 
+/// Same call bins/kaas/src/main.rs makes at boot: with kube's
+/// hyper-rustls enabling aws-lc-rs alongside our ring feature, rustls
+/// can't auto-pick a provider. It has to run before the first TLS
+/// client or server is built in the process — reqwest included — so call
+/// it first in any test that touches TLS. The tests share one process
+/// and run in parallel, so relying on another test to have installed it
+/// passes or panics ("No provider set") depending on scheduling.
+fn install_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 async fn spawn_oauth_broker(
     validator: Arc<OauthValidator>,
 ) -> (
@@ -109,10 +120,7 @@ async fn spawn_oauth_broker(
     u16,
     rustls::pki_types::CertificateDer<'static>,
 ) {
-    // Same call bins/kaas/src/main.rs makes at boot: with kube's
-    // hyper-rustls enabling aws-lc-rs alongside our ring feature,
-    // rustls can't auto-pick a provider.
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    install_crypto_provider();
     let engine: Arc<dyn AuthEngine> = Arc::new(OauthEngine::new(validator));
     let mut sel = PerListenerAuthEngine::new(engine.clone());
     sel.insert("oauth", engine);
@@ -324,6 +332,8 @@ fn validator_with(max_reauth: Option<u64>) -> Arc<OauthValidator> {
 
 #[tokio::test]
 async fn oauthbearer_end_to_end_over_tls() {
+    // Before the JWKS fetch below: reqwest builds a rustls client.
+    install_crypto_provider();
     let issuer = Issuer::new();
 
     // The JWKS travels over HTTP exactly like the production fetch
