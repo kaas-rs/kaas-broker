@@ -273,7 +273,7 @@ Reclaim of a deleted topic's directory is two-track and neither track needs a de
 - `crates/kaas-observability` — OTLP metrics bootstrap (`bootstrap.rs`, push-mode to Prometheus's native OTLP receiver; `KAAS_METRIC_EXPORT_INTERVAL` accepts duration strings like `30s`; no trace pipeline — it never had a span to export and was removed, gh #269) and the log subscriber (`tracing.rs`), `/healthz` HTTP handler with rich runtime state (`health.rs`), `byteopacity.rs` tripwire counters.
 - `crates/kaas-operator-api` — CRD types (kube-derive); `cargo xtask gen-crds` regenerates `deploy/crds/*.yaml` and mirrors them to the Helm chart.
 - `crates/kaas-operator-controllers` — one reconciler per CRD; topic/user reconcilers materialize state to files in `/data/__cluster/` on the shared PVC; leader-elected startup sweeps for orphans.
-- `bins/kaas` — broker entrypoint: `main.rs` (dispatcher registration, env wiring, SIGTERM drain), `cluster.rs` (cluster runtime: election glue, topic/broker-set watchers, assignment-source hot-swap). Integration tests in `bins/kaas/tests/`: `smoke.rs`, `auth_smoke.rs`, `byte_opacity.rs` (codec tripwire), `cluster_bringup.rs`, `cluster_smoke.rs`, `eos_v2.rs`.
+- `bins/kaas` — broker entrypoint: `main.rs` (dispatcher registration, env wiring, SIGTERM drain), `cluster.rs` (cluster runtime: election glue, topic/broker-set watchers, assignment-source hot-swap). Integration tests in `bins/kaas/tests/`: `smoke.rs`, `auth_smoke.rs`, `cluster_bringup.rs`, `cluster_smoke.rs`, `eos_v2.rs`.
 - `bins/kaas-operator` — operator entrypoint driving `kaas-operator-controllers`.
 - `xtask` — plain-match task runner: `ci`, `gen-proto`, `gen-crds`, `check-crd-drift`, `fmt-check`.
 

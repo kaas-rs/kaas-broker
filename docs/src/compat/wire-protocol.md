@@ -60,11 +60,13 @@ Consequences worth internalizing:
   without interpreting it. Where Apache applies per-record semantics —
   e.g. tombstone expiry during compaction — kaas will apply the
   batch-level equivalent (the compactor itself is not yet implemented).
-- The contract is enforced, not aspirational: tripwire counters
+- What enforces the contract is structural: with no record type there
+  is nothing to decode into, and batch bytes are asserted byte-identical
+  through the disk engine and over the wire. The tripwire counters
   (surfaced as metrics — see
-  [Observability](../architecture/observability.md)) must read zero
-  after every test run, and any future record-decoding code path is
-  required to bump them, making the first violation loud.
+  [Observability](../architecture/observability.md)) only move if a
+  violating code path calls them itself, so they can't catch a violation
+  that doesn't report itself (gh #275).
 
 ## Where to dig deeper
 
@@ -85,8 +87,9 @@ Everything wire-level lives in `crates/kaas-codec`:
 
 - `crates/kaas-codec/src/frame.rs` — frame reader/writer, plus the
   streaming `FrameReader` used by the server accept loop.
-- `crates/kaas-codec/src/headers.rs` — per-API `HeaderVersion`
-  resolution.
+- `crates/kaas-codec/src/headers.rs` — the request/response header
+  shapes; which one applies is derived from the flexible range in
+  `crates/kaas-codec/src/api/registry.rs` (gh #272).
 - `crates/kaas-codec/src/tagged.rs` — the KIP-482 tagged-field envelope;
   `crates/kaas-codec/src/primitives.rs` — compact strings, arrays, and
   the other wire primitives.
@@ -94,5 +97,5 @@ Everything wire-level lives in `crates/kaas-codec`:
 - `crates/kaas-codec/src/api/` — one request/response module per API;
   `crates/kaas-codec/src/api/registry.rs` — the `ApiSpec` table that
   drives both the ApiVersions response and the generated matrix.
-- `crates/kaas-codec/src/tripwires.rs` — the byte-opacity counters,
-  asserted zero after real traffic by `bins/kaas/tests/byte_opacity.rs`.
+- `crates/kaas-codec/src/tripwires.rs` — the byte-opacity counters;
+  nothing calls them (gh #275).

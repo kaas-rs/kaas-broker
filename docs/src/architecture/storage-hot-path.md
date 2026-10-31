@@ -270,9 +270,10 @@ After that, the same opaque bytes the client sent land verbatim on disk
 (with the base offset rewritten in place): **the log file IS the wire
 format**, which is what makes Fetch a byte copy rather than a
 re-encode. Fetch is symmetric — batch bytes come back off disk
-undecoded. The invariant is enforced by tripwire counters that must
-stay at zero (see [Observability](./observability.md)) and by an
-integration test.
+undecoded. What holds the invariant is structural (there is no record
+type to decode into) plus byte-identity tests on the disk engine and over
+the wire. The tripwire counters (see [Observability](./observability.md))
+only move if a violating path reports itself (gh #275).
 
 ## The durability dial
 
@@ -379,9 +380,11 @@ ownership](./file-handles.md).
 - Byte-opacity peeks: `kaas-storage/src/idempotence.rs` (PID / epoch /
   sequence) and `kaas-storage/src/segment.rs` (offsets / timestamp);
   the codec side is `kaas-codec` decoding
-  `records: Option<bytes::Bytes>` as a zero-copy slice. Enforced by the
-  tripwire counters and the `bins/kaas/tests/byte_opacity.rs`
-  integration test.
+  `records: Option<bytes::Bytes>` as a zero-copy slice. Guarded by
+  `append_then_read_byte_identical` in `crates/kaas-storage/src/disk.rs`,
+  `append_then_read_back_is_byte_identical` in
+  `crates/kaas-storage/src/segment.rs`, and the Produce → Fetch byte
+  comparison in `bins/kaas/tests/smoke.rs`.
 - Topic-config plumbing: `crates/kaas-storage/src/topicconfig.rs`;
   `RetentionCleaner` and its policy sources:
   `crates/kaas-storage/src/cleaner.rs`; the interval loop and the

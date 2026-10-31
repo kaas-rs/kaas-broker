@@ -41,8 +41,8 @@ a broker started inside the test process:
 
 - wire-level round trips (produce → fetch → metadata);
 - the SASL/SCRAM handshake plus ACL enforcement;
-- the [byte-opacity tripwires](wire-protocol.md#the-byte-opacity-contract),
-  asserted to read zero after real traffic;
+- [byte opacity](wire-protocol.md#the-byte-opacity-contract): a produced
+  batch comes back byte-identical through Fetch;
 - multi-broker bring-up: assignment, takeover, coordinator routing;
 - the full KIP-447 consume-process-produce-commit round trip (EOS v2);
 - controller failover and the stale-epoch fence.
@@ -84,7 +84,7 @@ snapshots as a NAS-liveness probe, and recorded reports under
   `scripts/_common.sh`, sourced by every `kafka-*.sh` script.
 - The integration tests above, in list order:
   `bins/kaas/tests/smoke.rs`, `bins/kaas/tests/auth_smoke.rs`,
-  `bins/kaas/tests/oauth_smoke.rs`, `bins/kaas/tests/byte_opacity.rs`,
+  `bins/kaas/tests/oauth_smoke.rs`,
   `bins/kaas/tests/cluster_bringup.rs` + `cluster_smoke.rs`,
   `bins/kaas/tests/eos_v2.rs`, `bins/kaas/tests/retention.rs`, and
   `crates/kaas-controller/tests/controller_failover.rs` +

@@ -55,8 +55,9 @@ after the appends, and feeds `throttle_time_ms` in the response.
 `crates/kaas-storage/src/idempotence.rs`.
 
 **Verified by**: `unknown_topic_returns_error_code_3` (handler unit test),
-`produce_fetch_metadata_roundtrip` in `bins/kaas/tests/smoke.rs`,
-`storage_round_trip_is_byte_identical` in `bins/kaas/tests/byte_opacity.rs`,
+`produce_fetch_metadata_roundtrip` in `bins/kaas/tests/smoke.rs` (which
+also asserts the fetched batch is byte-identical to the produced one),
+`append_then_read_byte_identical` in `crates/kaas-storage/src/disk.rs`,
 and the full transactional round trip in `bins/kaas/tests/eos_v2.rs`. Shell
 suite: `scripts/kafka-console-producer.sh`,
 `scripts/kafka-producer-perf-test.sh`, `scripts/kafka-verifiable-producer.sh`.

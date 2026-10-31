@@ -10,11 +10,12 @@
 //!   decoded fields. Storage stores the wire bytes as-is; the response path
 //!   emits them as-is.
 //!
-//! Either invariant being broken should fail loudly. These counters are the
-//! pre-production trip mechanism: every offender calls
-//! [`bump_codec_record_decode`] or [`bump_codec_batch_reencode`] with a
-//! `site` string, and the integration tests in `crates/kaas-codec/tests/`
-//! assert both counters read zero at the end of every run.
+//! These counters only move if an offending code path calls
+//! [`bump_codec_record_decode`] or [`bump_codec_batch_reencode`] itself, and
+//! nothing does, so they can't catch a violation that doesn't report itself
+//! (gh #275). What actually holds the invariant is structural (there is no
+//! record type) plus the byte-identity tests on the disk engine and over
+//! the wire.
 //!
 //! In Phase 1 these are atomic counters. Phase 8 swaps them for OTLP
 //! metric instruments behind the same function signature so production
@@ -88,22 +89,4 @@ pub fn batch_reencode_count() -> u64 {
 pub fn reset_for_test() {
     RECORD_DECODE.store(0, Ordering::Relaxed);
     BATCH_REENCODE.store(0, Ordering::Relaxed);
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Meta-test: prove the bump function does increment the counter, so
-    /// alerts wired against `kaas_codec_record_decode_total` will fire.
-    /// This is the only test that calls `bump_*` by design — production
-    /// code must never call it.
-    #[test]
-    fn bumps_are_observable() {
-        reset_for_test();
-        bump_codec_record_decode("meta_test");
-        assert_eq!(record_decode_count(), 1);
-        bump_codec_batch_reencode("meta_test");
-        assert_eq!(batch_reencode_count(), 1);
-    }
 }

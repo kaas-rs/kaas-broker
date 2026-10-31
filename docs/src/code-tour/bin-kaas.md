@@ -35,7 +35,7 @@ cluster runtime, local-lease "I lead everything"); `KAAS_DATA_DIR` set but
 loop **is** installed); `MY_POD_NAME` set → cluster mode.
 
 **Integration tests** live in `bins/kaas/tests/` — `smoke.rs`,
-`auth_smoke.rs`, `byte_opacity.rs`, `cluster_bringup.rs`,
+`auth_smoke.rs`, `cluster_bringup.rs`,
 `cluster_smoke.rs`, `eos_v2.rs`, `oauth_smoke.rs`, `retention.rs` — the
 suites the
 [verification story](../compat/verification.md) leans on.

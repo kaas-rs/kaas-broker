@@ -55,9 +55,10 @@ wrote are stored and served back byte-identical. Concretely:
   parsed out of the 43-byte header and tracked per segment.
 - `crates/kaas-storage/src/memory.rs`: `offset_for_timestamp_sentinel`
   pins the honest "no match" answer for timestamp queries.
-- `bins/kaas/tests/byte_opacity.rs` — the tripwire integration test that
-  proves records (timestamps included) round-trip byte-identical and no
-  code path decoded them.
+- `crates/kaas-storage/src/disk.rs` (`append_then_read_byte_identical`)
+  and `bins/kaas/tests/smoke.rs` (`produce_fetch_metadata_roundtrip`) —
+  records, timestamps included, come back byte-identical from the disk
+  engine and over the wire.
 - `scripts/kafka-get-offsets.sh` exercises `--time -2` / `--time -1`
   against a live broker; `scripts/kafka-console-producer.sh` /
   `scripts/kafka-console-consumer.sh` round-trip producer-stamped records.

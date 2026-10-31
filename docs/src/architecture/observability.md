@@ -80,8 +80,8 @@ invents its own answer to "who leads what".
 The broker's load-bearing invariant is *"kaas is a byte mover, not a
 byte interpreter"*: no code path decodes individual records or
 re-encodes a `RecordBatch` (see
-[Storage engine hot path](./storage-hot-path.md)). Two counters give
-that invariant teeth — `codec_record_decode` and
+[Storage engine hot path](./storage-hot-path.md)). Two counters were
+meant to give that invariant teeth — `codec_record_decode` and
 `codec_batch_reencode` — which **must stay at zero in steady state**.
 Every increment names the offending call site in a `site` attribute,
 and the `KaasByteOpacityViolated` alert fires on non-zero.
@@ -112,8 +112,8 @@ tracing backend.
   (tripwire counters), `tracing.rs` (`install_tracing`, the
   `tracing-subscriber` log stack).
 - Codec-side tripwire counterparts:
-  `crates/kaas-codec/src/tripwires.rs`; CI assertion:
-  `bins/kaas/tests/byte_opacity.rs`.
+  `crates/kaas-codec/src/tripwires.rs`. Nothing calls them, so they can't
+  catch a violation that doesn't report itself; gh #275 tracks removing them.
 - Two standing rules: pick `KAAS_METRIC_EXPORT_INTERVAL` with the
   Prometheus `rate()` window in mind, and gauge callbacks must read
   the engine's `ArcSwap` snapshot, never the partition mutex.
