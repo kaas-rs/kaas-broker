@@ -2,9 +2,10 @@
 //!
 //! The
 //! runtime gauges (`kaas.is.controller`, `kaas.assignment.version`,
-//! per-partition leader/epoch/HWM) are registered once on the meter at
-//! [`crate::bootstrap`] time; a single global [`GaugeSource`] provides
-//! the snapshot at every scrape.
+//! per-partition leader/epoch/HWM) are registered once on the broker's
+//! meter by [`crate::Providers::install_runtime_gauges`]. The operator
+//! never registers them (gh #290). A single global [`GaugeSource`]
+//! provides the snapshot at every scrape.
 //!
 //! A `None` source (the default before [`set_gauge_source`] is called)
 //! makes every gauge report zero — dashboards prefer present-but-zero
@@ -72,8 +73,8 @@ fn load_source() -> Option<Arc<Box<dyn GaugeSource>>> {
     source_slot().load_full()
 }
 
-/// Register the Phase 10 observable gauges on `meter`. Called once
-/// during [`crate::bootstrap`]. Safe to call before
+/// Register the Phase 10 observable gauges on `meter`. Called once by
+/// the broker, via [`crate::Providers::install_runtime_gauges`]. Safe to call before
 /// [`set_gauge_source`] — until a source is installed, every gauge
 /// reports 0.
 pub fn install_runtime_gauges(meter: &Meter) {

@@ -191,6 +191,8 @@ async fn main() -> Result<()> {
     let providers = kaas_observability::bootstrap("kaas", obs_cancel.clone())
         .await
         .context("initialising observability")?;
+    // Broker-only gauges (gh #290); the operator never registers them.
+    providers.install_runtime_gauges();
 
     info!(
         broker_id = cli.broker_id,
@@ -1401,10 +1403,6 @@ impl kaas_observability::health::RuntimeState for BrokerRuntimeState {
     }
     fn controller_epoch(&self) -> i64 {
         self.snapshot().map_or(0, |a| a.controller_epoch)
-    }
-    fn heartbeat_rtt_ms(&self) -> i64 {
-        // Not measured on the Rust client yet; renders as JSON null.
-        -1
     }
     fn heartbeat_age_ms(&self) -> i64 {
         self.0

@@ -23,7 +23,7 @@ spec:
       interval: 30s
       rules:
         - alert: KaasSelfFencing
-          expr: sum by (broker_id) (rate(kaas_self_fence_events_total[1m])) * 60 > {{ .Values.observability.alerts.thresholds.selfFencePerMinute }}
+          expr: sum by (instance) (rate(kaas_self_fence_events_total[1m])) * 60 > {{ .Values.observability.alerts.thresholds.selfFencePerMinute }}
           for: 2m
           labels:
             severity: warning
@@ -31,7 +31,7 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           annotations:
-            summary: "Broker {{`{{ $labels.broker_id }}`}} is self-fencing on stale heartbeats"
+            summary: "Broker {{`{{ $labels.instance }}`}} is self-fencing on stale heartbeats"
             description: |
               kaas_self_fence_events_total exceeded {{ .Values.observability.alerts.thresholds.selfFencePerMinute }}/min for 2 minutes.
               The broker has lost connectivity to the controller; produces are
@@ -41,7 +41,7 @@ spec:
               controller pod issue.
 
         - alert: KaasStaleControllerWriting
-          expr: sum by (broker_id) (rate(kaas_stale_assignments_rejected_total[1m])) * 60 > {{ .Values.observability.alerts.thresholds.staleAssignmentsPerMinute }}
+          expr: sum by (instance) (rate(kaas_stale_assignments_rejected_total[1m])) * 60 > {{ .Values.observability.alerts.thresholds.staleAssignmentsPerMinute }}
           for: 5m
           labels:
             severity: critical
@@ -49,7 +49,7 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           annotations:
-            summary: "Stale controller still writing assignment.json (broker {{`{{ $labels.broker_id }}`}} rejecting)"
+            summary: "Stale controller still writing assignment.json (broker {{`{{ $labels.instance }}`}} rejecting)"
             description: |
               An ex-controller whose lease expired is still writing assignment.json.
               The epoch fence is rejecting these files (correctly), but the
@@ -104,7 +104,7 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           annotations:
-            summary: "AssignmentStore.Write failures on {{`{{ $labels.broker_id }}`}}"
+            summary: "AssignmentStore.Write failures on {{`{{ $labels.instance }}`}}"
             description: |
               The controller can't persist assignment.json — partition
               rebalances and broker join/leave events will not propagate.

@@ -10,13 +10,20 @@
 //! `templates/operator-deployment.yaml` unless noted):
 //!
 //! - `KAAS_DATA_DIR`            — shared PVC mount (default `/data`)
+//! - `KAAS_CLUSTER_DIR`         — cluster-state dir (default
+//!   `<KAAS_DATA_DIR>/__cluster`); templated only when
+//!   `storage.controlPlane.enabled` mounts it on its own PVC (gh #221)
+//! - `KAAS_LOG_DIRS`            — volume-pool log dirs as JSON; templated
+//!   only when `storage.pool` is non-empty (gh #221 phase 2)
 //! - `KAAS_NAMESPACE`           — operator's own namespace
 //! - `KAAS_LOG_LEVEL`           — `debug`/`info`/`warn`/`error`
 //! - `KAAS_LOG_FORMAT`          — `json` or `text`
 //! - `HEALTH_PROBE_BIND_ADDRESS`  — healthz / readyz; not templated, the
 //!   default `:8081` is what the chart's probes target
 //! - `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`, `OTEL_SERVICE_VERSION`,
-//!   `OTEL_RESOURCE_ATTRIBUTES`, `OTEL_SERVICE_NAME` — read by
+//!   `KAAS_METRIC_EXPORT_INTERVAL` (templated when
+//!   `observability.otlp.metrics.enabled`), plus `OTEL_RESOURCE_ATTRIBUTES`
+//!   and `OTEL_SERVICE_NAME` (not templated) — read by
 //!   `kaas_observability::bootstrap`. Metrics are pushed over OTLP;
 //!   there is no scrape endpoint.
 

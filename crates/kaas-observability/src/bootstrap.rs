@@ -45,10 +45,24 @@ use crate::ObservabilityError;
 pub struct Providers {
     pub meter_provider: SdkMeterProvider,
     pub metrics: Arc<Metrics>,
+    service: &'static str,
     _cancel: CancellationToken,
 }
 
 impl Providers {
+    /// Register the broker's runtime observable gauges
+    /// (`kaas.is.controller`, `kaas.assignment.version`, the
+    /// per-partition and per-log-dir gauges). Only the broker calls
+    /// this (gh #290). They describe a broker, and an observable gauge
+    /// exports on every push even before a source is installed. When
+    /// [`bootstrap`] registered them for every process, the operator
+    /// pushed a zero-valued `kaas_is_controller` and
+    /// `kaas_assignment_version` with no `instance` label into the
+    /// per-broker panels.
+    pub fn install_runtime_gauges(&self) {
+        install_runtime_gauges(&global::meter(self.service));
+    }
+
     /// Flush the last metric export and shut the meter provider down.
     pub fn shutdown(self) -> Result<(), ObservabilityError> {
         self.meter_provider
@@ -57,8 +71,9 @@ impl Providers {
     }
 }
 
-/// Set up the meter provider, install the global `Metrics`
-/// registry, and register the runtime gauges. Idempotent w.r.t. the
+/// Set up the meter provider and install the global `Metrics`
+/// registry. The broker then registers its runtime gauges with
+/// [`Providers::install_runtime_gauges`]. Idempotent w.r.t. the
 /// OTel globals — safe to call once per process; subsequent calls
 /// stomp the previous provider.
 ///
@@ -99,10 +114,6 @@ pub async fn bootstrap(
     let metrics = Arc::new(new_metrics(&meter));
     set_global(Arc::clone(&metrics));
 
-    // Runtime observable gauges. Callback is a no-op until
-    // gauges::set_gauge_source is wired by the runtime owner.
-    install_runtime_gauges(&meter);
-
     ::tracing::info!(
         service,
         otlp_metrics = std::env::var("OTEL_EXPORTER_OTLP_METRICS_ENDPOINT")
@@ -114,6 +125,7 @@ pub async fn bootstrap(
     Ok(Providers {
         meter_provider,
         metrics,
+        service,
         _cancel: cancel,
     })
 }

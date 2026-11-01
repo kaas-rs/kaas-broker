@@ -35,7 +35,6 @@ pub trait RuntimeState: Send + Sync {
     fn is_controller(&self) -> bool;
     fn controller_id(&self) -> String;
     fn controller_epoch(&self) -> i64;
-    fn heartbeat_rtt_ms(&self) -> i64;
     fn heartbeat_age_ms(&self) -> i64;
     fn assignment_version(&self) -> u64;
     fn assignment_age_ms(&self) -> i64;
@@ -73,8 +72,6 @@ struct HealthState {
     #[serde(skip_serializing_if = "is_zero_i64")]
     controller_epoch: i64,
 
-    #[serde(skip_serializing_if = "Option::is_none")]
-    heartbeat_rtt_ms: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     heartbeat_age_ms: Option<i64>,
 
@@ -147,7 +144,6 @@ async fn healthz(State(cfg): State<HealthConfig>) -> impl IntoResponse {
         is_controller: false,
         controller_id: String::new(),
         controller_epoch: 0,
-        heartbeat_rtt_ms: None,
         heartbeat_age_ms: None,
         assignment_version: 0,
         assignment_age_ms: None,
@@ -160,7 +156,6 @@ async fn healthz(State(cfg): State<HealthConfig>) -> impl IntoResponse {
         state.is_controller = src.is_controller();
         state.controller_id = src.controller_id();
         state.controller_epoch = src.controller_epoch();
-        state.heartbeat_rtt_ms = pos_i64(src.heartbeat_rtt_ms());
         state.heartbeat_age_ms = pos_i64(src.heartbeat_age_ms());
         state.assignment_version = src.assignment_version();
         state.assignment_age_ms = pos_i64(src.assignment_age_ms());
@@ -386,7 +381,6 @@ mod tests {
             is_controller: false,
             controller_id: String::new(),
             controller_epoch: 0,
-            heartbeat_rtt_ms: None,
             heartbeat_age_ms: None,
             assignment_version: 0,
             assignment_age_ms: None,
@@ -399,7 +393,6 @@ mod tests {
         assert_eq!(json["status"], "ok");
         assert_eq!(json["broker_id"], "kaas-0");
         assert_eq!(json["listeners"][0], "plain");
-        assert!(json.get("heartbeat_rtt_ms").is_none());
         assert!(json.get("controller_epoch").is_none());
         assert!(json.get("storage_stalled").is_none());
     }
@@ -416,9 +409,6 @@ mod tests {
         }
         fn controller_epoch(&self) -> i64 {
             0
-        }
-        fn heartbeat_rtt_ms(&self) -> i64 {
-            -1
         }
         fn heartbeat_age_ms(&self) -> i64 {
             -1

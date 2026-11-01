@@ -8,16 +8,7 @@
   "time": {"from": "now-1h", "to": "now"},
   "refresh": "30s",
   "templating": {
-    "list": [
-      {
-        "name": "cluster",
-        "label": "Cluster",
-        "type": "query",
-        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-        "query": "label_values(kaas_produce_records_total, cluster)",
-        "refresh": 1
-      }
-    ]
+    "list": []
   },
   "panels": [
     {
@@ -104,7 +95,7 @@
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "targets": [
         {"expr": "sum(increase(kaas_controller_failovers_total[1m]))", "legendFormat": "cluster"},
-        {"expr": "sum by (broker_id) (increase(kaas_controller_failovers_total[1m]))", "legendFormat": "{{broker_id}}"}
+        {"expr": "sum by (instance) (increase(kaas_controller_failovers_total[1m]))", "legendFormat": "{{instance}}"}
       ]
     },
     {
@@ -127,7 +118,7 @@
       "gridPos": {"h": 6, "w": 8, "x": 0, "y": 30},
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "targets": [
-        {"expr": "kaas_is_controller", "legendFormat": "{{broker_id}}"}
+        {"expr": "max by (instance) (kaas_is_controller)", "legendFormat": "{{instance}}"}
       ],
       "fieldConfig": {"defaults": {"min": 0, "max": 1}}
     },
@@ -172,7 +163,7 @@
       "gridPos": {"h": 8, "w": 12, "x": 0, "y": 36},
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "targets": [
-        {"expr": "kaas_assignment_version", "legendFormat": "{{broker_id}}"}
+        {"expr": "max by (instance) (kaas_assignment_version)", "legendFormat": "{{instance}}"}
       ]
     },
     {
@@ -195,8 +186,8 @@
       "gridPos": {"h": 8, "w": 24, "x": 0, "y": 44},
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "targets": [
-        {"expr": "sum by (broker_id) (increase(kaas_self_fence_events_total[1m]))", "legendFormat": "self_fence {{broker_id}}"},
-        {"expr": "sum by (broker_id) (increase(kaas_heartbeat_misses_total[1m]))", "legendFormat": "miss {{broker_id}}"}
+        {"expr": "sum by (instance) (increase(kaas_self_fence_events_total[1m]))", "legendFormat": "self_fence {{instance}}"},
+        {"expr": "sum by (instance) (increase(kaas_heartbeat_misses_total[1m]))", "legendFormat": "miss {{instance}}"}
       ]
     },
     {
@@ -207,7 +198,7 @@
       "gridPos": {"h": 6, "w": 12, "x": 0, "y": 52},
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "targets": [
-        {"expr": "sum by (broker_id) (increase(kaas_stale_assignments_rejected_total[1m]))", "legendFormat": "{{broker_id}}"}
+        {"expr": "sum by (instance) (increase(kaas_stale_assignments_rejected_total[1m]))", "legendFormat": "{{instance}}"}
       ]
     },
     {

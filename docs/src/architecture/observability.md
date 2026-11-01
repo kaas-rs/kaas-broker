@@ -32,6 +32,15 @@ Helm chart):
   dashboards key on, so a conflicting `k8s.pod.name` or
   `service.instance.id` in `OTEL_RESOURCE_ATTRIBUTES` is overridden.
 
+Per broker, Prometheus's OTLP receiver promotes `service.instance.id` (the
+pod name) to the `instance` label, and `service.name` to `job`. Grouping by
+broker is therefore `sum by (instance)`. The bundled alerts and dashboard
+group that way: no kaas metric carries a `broker_id` label, and until gh #290
+they grouped by one. The broker-state gauges (`kaas_is_controller`,
+`kaas_assignment_version`, the per-partition and per-log-dir gauges) come
+only from brokers. The operator doesn't register them, so it adds no
+unlabelled zero series to per-broker panels.
+
 With no endpoint set the SDK still runs and exports go nowhere —
 safe for tests and local dev. Before bootstrap runs, the global metrics
 handle is a no-op registry, so pre-boot code and tests can record
@@ -58,7 +67,8 @@ Both are served on port 8080:
   [Honest readiness & rollout pacing](./readiness-rollout.md).
 - **`/healthz`** returns a JSON runtime view: controller identity
   (`is_controller`, `controller_id`, `controller_epoch`), heartbeat
-  health (`heartbeat_rtt_ms`, `heartbeat_age_ms`), assignment state
+  health (`heartbeat_age_ms`, the time since the last controller
+  heartbeat), assignment state
   (`assignment_version`, `assignment_age_ms`), partition counts
   (`partitions_led`, `partitions_assigned`, `partitions_recovering`),
   and `storage_stalled` — true when any partition's most recent
