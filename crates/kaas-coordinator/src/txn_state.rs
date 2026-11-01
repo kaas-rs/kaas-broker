@@ -269,7 +269,7 @@ pub enum TxnStateError {
     /// Wire code 51 — CONCURRENT_TRANSACTIONS.
     #[error("txn state: concurrent transition in progress")]
     Concurrent,
-    /// Wire code 50 — INVALID_TXN_STATE.
+    /// Wire code 48 — INVALID_TXN_STATE (gh #198; 50 is INVALID_TRANSACTION_TIMEOUT).
     #[error("txn state: invalid state transition")]
     InvalidState,
     #[error("txn state: i/o: {0}")]

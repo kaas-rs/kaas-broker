@@ -51,7 +51,7 @@ const ERR_NOT_COORDINATOR: i16 = 16;
 const ERR_INVALID_PRODUCER_ID_MAPPING: i16 = 49;
 const ERR_PRODUCER_FENCED: i16 = 90;
 const ERR_CONCURRENT_TRANSACTIONS: i16 = 51;
-const ERR_INVALID_TXN_STATE: i16 = 50;
+const ERR_INVALID_TXN_STATE: i16 = 48;
 const ERR_TXN_ID_AUTHZ_FAILED: i16 = 53;
 
 #[derive(Debug)]
@@ -360,7 +360,10 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(resp.error_code, ERR_INVALID_TXN_STATE);
+        // Apache's Errors.INVALID_TXN_STATE, written out: comparing to
+        // our own constant can't catch a wrong constant (gh #198 — it was
+        // 50, Apache's INVALID_TRANSACTION_TIMEOUT).
+        assert_eq!(resp.error_code, 48);
     }
 
     #[tokio::test]

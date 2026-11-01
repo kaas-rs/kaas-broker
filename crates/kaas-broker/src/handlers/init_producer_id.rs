@@ -55,7 +55,7 @@ pub const ERR_COORDINATOR_NOT_AVAILABLE: i16 = 15;
 pub const ERR_PRODUCER_FENCED: i16 = 90;
 /// `INVALID_TXN_STATE` — defensive; unreachable for InitProducerId
 /// today but kept in the mapping for forward compat.
-pub const ERR_INVALID_TXN_STATE: i16 = 50;
+pub const ERR_INVALID_TXN_STATE: i16 = 48;
 /// `CONCURRENT_TRANSACTIONS` — markers in flight, or an `Ongoing`
 /// transaction this request just aborted. Retriable.
 pub const ERR_CONCURRENT_TRANSACTIONS: i16 = 51;

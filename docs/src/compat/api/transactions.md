@@ -40,11 +40,10 @@ Four facts are shared by everything below:
   `INVALID_PRODUCER_EPOCH` 47); transition already in flight →
   `CONCURRENT_TRANSACTIONS` (51); store not yet wired at boot →
   `COORDINATOR_NOT_AVAILABLE` (15, retryable); empty `transactional.id`
-  → `INVALID_REQUEST` (42). One honest wart: invalid transitions are
-  answered with wire code **50**, but Apache's `INVALID_TXN_STATE` is
-  **48** (50 is `INVALID_TRANSACTION_TIMEOUT`), so a Java client raises
-  `InvalidTxnTimeoutException` where Apache raises
-  `InvalidTxnStateException`. Off by label, not by behaviour.
+  → `INVALID_REQUEST` (42); invalid transition → `INVALID_TXN_STATE`
+  (48). Until gh #198 that last one went out as 50, Apache's
+  `INVALID_TRANSACTION_TIMEOUT`, so Java clients raised
+  `InvalidTxnTimeoutException`.
 - **Reaper.** A per-broker task fires every 10 s (Apache's
   `transaction.abort.timed.out.transaction.cleanup.interval.ms` default)
   and transitions `Ongoing` entries past
@@ -171,9 +170,8 @@ repeated on every requested partition; the Java client picks any one.
   its brokers use for server-side verification. kaas stops at v3, which
   is the version client producers negotiate; nothing client-visible is
   missing.
-- None known otherwise, beyond the shared warts in the preamble (wire
-  code 50 for invalid transitions is unreachable here — bad states map
-  to 49/90/51).
+- None known otherwise; an invalid transition is unreachable here, bad
+  states map to 49/90/51.
 
 **Source**: `crates/kaas-broker/src/handlers/add_partitions_to_txn.rs`
 (handler), `crates/kaas-codec/src/api/add_partitions_to_txn.rs` (codec),
@@ -267,7 +265,6 @@ up.
 - `CoordinatorEpoch` in emitted markers is always 0 (kaas tracks no txn
   coordinator epoch distinct from the assignment epoch); consumers do
   not act on the field.
-- Wire 50 where Apache answers `INVALID_TXN_STATE` (48) — see preamble.
 
 **Source**: `crates/kaas-broker/src/handlers/end_txn.rs` (handler),
 `crates/kaas-codec/src/api/end_txn.rs` (codec),
