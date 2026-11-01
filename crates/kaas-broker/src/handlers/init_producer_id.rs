@@ -86,7 +86,7 @@ impl Handler for InitProducerIdHandler {
         let req = init_producer_id::decode_request(&mut body, version)?;
         let claimed = claimed_identity(&req);
 
-        let resp = match req.transactional_id.as_deref() {
+        let mut resp = match req.transactional_id.as_deref() {
             None | Some("") if claimed.is_err() => error_response(ERR_INVALID_REQUEST),
             None | Some("") => {
                 // Idempotent (non-transactional) — no per-key state,
@@ -126,6 +126,7 @@ impl Handler for InitProducerIdHandler {
             }
         };
 
+        resp.error_code = super::producer_fenced_for(resp.error_code, version, 4);
         let mut out = BytesMut::new();
         init_producer_id::encode_response(&mut out, &resp, version)?;
         Ok(out)

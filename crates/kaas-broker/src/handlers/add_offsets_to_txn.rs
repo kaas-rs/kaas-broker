@@ -69,7 +69,7 @@ impl Handler for AddOffsetsToTxnHandler {
 
         let resp = add_offsets_to_txn::Response {
             throttle_time_ms: 0,
-            error_code,
+            error_code: super::producer_fenced_for(error_code, version, 2),
         };
         let mut out = BytesMut::new();
         add_offsets_to_txn::encode_response(&mut out, &resp, version)?;

@@ -31,7 +31,7 @@ pub struct ScramCredentialSpec {
 /// Errors mapped to wire codes at the handler boundary:
 #[derive(Debug, Error)]
 pub enum UserWriteError {
-    /// No `KafkaUser` CR with this name. Wire: `RESOURCE_NOT_FOUND` (83).
+    /// No `KafkaUser` CR with this name. Wire: `RESOURCE_NOT_FOUND` (91).
     #[error("user not found: {0}")]
     NotFound(String),
 

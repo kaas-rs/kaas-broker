@@ -6,12 +6,12 @@
 //! a privileged observer harvest material for offline attack; see
 //! `kaas_auth::ScramInfo`).
 //!
-//! The request's `users` array is **nullable, and null ≠ empty**:
-//! null means "describe every user with SCRAM credentials"
-//! (`kafka-configs.sh --describe --entity-type users` with no
-//! `--entity-name`), empty means "describe none". The generic
-//! `read_array_len` helper folds null into 0, so this module reads
-//! the compact-array varint itself.
+//! The request's `users` array is **nullable**, and the codec keeps
+//! null and empty apart (the generic `read_array_len` helper folds null
+//! into 0, so this module reads the compact-array varint itself). The
+//! broker treats both as "describe every user with SCRAM credentials",
+//! as Apache does — `kafka-configs.sh --describe --entity-type users`
+//! with no `--entity-name` sends an empty array (gh #276).
 
 use bytes::BytesMut;
 
@@ -44,8 +44,8 @@ pub mod mechanism {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Request {
-    /// `None` ↔ wire null → every user with SCRAM credentials.
-    /// `Some(vec![])` → none.
+    /// `None` ↔ wire null. The handler describes every user with SCRAM
+    /// credentials for `None` and for `Some(vec![])` alike (gh #276).
     pub users: Option<Vec<String>>,
 }
 

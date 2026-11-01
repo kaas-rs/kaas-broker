@@ -233,8 +233,11 @@ Only mechanism + iteration count are reported, never salts or keys.
 `crates/kaas-auth/src/credentials.rs` (`list_all_scram_users`).
 
 **Verified by**: codec round-trip tests (null-vs-empty users pinned) in
-`crates/kaas-codec/src/api/describe_user_scram_credentials.rs`;
-`scripts/kafka-configs.sh` (user describe scenarios).
+`crates/kaas-codec/src/api/describe_user_scram_credentials.rs`; handler tests
+in `describe_user_scram_credentials.rs` and `alter_user_scram_credentials.rs`
+that assert Apache's literal codes (91, 92, 93, 33, 35 — gh #276). The
+user-describe lines in `scripts/kafka-configs.sh` only grep quota output, so
+they don't check these codes.
 
 ## AlterUserScramCredentials
 

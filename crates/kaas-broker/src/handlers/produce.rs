@@ -20,7 +20,10 @@ use crate::broker::Broker;
 const ERR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 const ERR_LEADER_NOT_AVAILABLE: i16 = 5;
 const ERR_NOT_LEADER_FOR_PARTITION: i16 = 6;
-const ERR_MESSAGE_TOO_LARGE: i16 = 18;
+/// Apache's `MESSAGE_TOO_LARGE` (`RecordTooLargeException`): a batch over
+/// `max.message.bytes`. Until gh #285 this was 18, `RECORD_LIST_TOO_LARGE`,
+/// which the Java producer doesn't answer by splitting the batch.
+const ERR_MESSAGE_TOO_LARGE: i16 = 10;
 /// Mirrors Apache Kafka's `message.max.bytes` default: 1 MiB of
 /// records plus 12 bytes of batch overhead (gh #14).
 /// Apache's `message.max.bytes` default (1 MiB + batch overhead).
@@ -443,5 +446,21 @@ mod tests {
         let allowed = ProduceHandler::new(broker_with_topic("known", 1));
         let r = allowed.append_one(&anon, "known", &part(999), -1).await;
         assert_eq!(r.error_code, ERR_UNKNOWN_TOPIC_OR_PARTITION);
+    }
+
+    /// gh #285: a batch over max.message.bytes is Apache's
+    /// MESSAGE_TOO_LARGE, 10 — not 18 (RECORD_LIST_TOO_LARGE), which the
+    /// Java producer doesn't answer by splitting the batch.
+    #[tokio::test]
+    async fn an_oversized_batch_is_message_too_large_10() {
+        let h = ProduceHandler::new(broker_with_topic("known", 1)).with_max_message_bytes(32);
+        let part = produce::PartitionData {
+            index: 0,
+            records: Some(Bytes::from_static(&[0; 64])),
+        };
+        let r = h
+            .append_one(&Principal::anonymous(), "known", &part, -1)
+            .await;
+        assert_eq!(r.error_code, 10);
     }
 }

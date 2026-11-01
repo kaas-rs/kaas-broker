@@ -52,7 +52,7 @@ impl Handler for AddPartitionsToTxnHandler {
         let req = add_partitions_to_txn::decode_request(&mut body, version)?;
         let principal = principal_from(conn);
 
-        let resp = match self.classify(&principal, &req) {
+        let mut resp = match self.classify(&principal, &req) {
             Some(code) => build_response(&req, code),
             None => match self.authorize_topics(&principal, &req) {
                 Some(resp) => resp,
@@ -68,6 +68,13 @@ impl Handler for AddPartitionsToTxnHandler {
             },
         };
 
+        for p in resp
+            .results
+            .iter_mut()
+            .flat_map(|t| &mut t.partition_results)
+        {
+            p.error_code = super::producer_fenced_for(p.error_code, version, 2);
+        }
         let mut out = BytesMut::new();
         add_partitions_to_txn::encode_response(&mut out, &resp, version)?;
         Ok(out)

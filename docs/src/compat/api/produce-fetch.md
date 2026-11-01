@@ -21,7 +21,9 @@ partition per the applied `assignment.json` (else
 must see a fresh controller heartbeat — a broker cut off from the
 controller stops acking within 3 s (also 6). A batch larger
 than Apache's `message.max.bytes` default (1 MiB + 12 bytes batch overhead)
-is rejected with `MESSAGE_TOO_LARGE` (18) before it hits storage.
+is rejected with `MESSAGE_TOO_LARGE` (10) before it hits storage — Apache's
+code for a batch over `max.message.bytes`, which the Java producer answers by
+splitting the batch (until gh #285 kaas sent 18, `RECORD_LIST_TOO_LARGE`).
 
 Inside the engine, under the partition mutex: idempotent-producer
 classification runs first — a duplicate (PID/epoch/sequence already in the

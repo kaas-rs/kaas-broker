@@ -92,6 +92,21 @@ pub(crate) fn principal_from(
         .unwrap_or_else(kaas_auth::Principal::anonymous)
 }
 
+/// KIP-588 (gh #285): `PRODUCER_FENCED` (90) is new in InitProducerId v4
+/// and AddPartitionsToTxn / AddOffsetsToTxn / EndTxn v2. An older client
+/// doesn't know it, so Apache answers those versions with
+/// `INVALID_PRODUCER_EPOCH` (47), which the client already handles the
+/// same way. `first_version` is where the API learned 90.
+pub(crate) fn producer_fenced_for(code: i16, version: i16, first_version: i16) -> i16 {
+    const PRODUCER_FENCED: i16 = 90;
+    const INVALID_PRODUCER_EPOCH: i16 = 47;
+    if code == PRODUCER_FENCED && version < first_version {
+        INVALID_PRODUCER_EPOCH
+    } else {
+        code
+    }
+}
+
 /// Whether `principal` may create topic `name`: `Create` on the cluster,
 /// else `Create` on the topic — Apache's rule for both CreateTopics and
 /// Metadata auto-creation, so neither is a way around the other
@@ -113,6 +128,22 @@ pub(crate) fn may_create_topic(
 
 /// gh #199 deny-path test doubles. Handler tests build a broker with
 /// one of these to prove a gate exists and fires the right code.
+#[cfg(test)]
+mod tests {
+    /// gh #285: Apache's literal codes and KIP-588's version thresholds.
+    #[test]
+    fn producer_fenced_is_down_converted_only_below_the_first_version() {
+        assert_eq!(super::producer_fenced_for(90, 3, 4), 47);
+        assert_eq!(super::producer_fenced_for(90, 4, 4), 90);
+        assert_eq!(
+            super::producer_fenced_for(51, 0, 4),
+            51,
+            "other codes untouched"
+        );
+        assert_eq!(super::producer_fenced_for(0, 0, 2), 0);
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod test_authz {
     use kaas_auth::{Authorizer, Operation, Principal, Resource};

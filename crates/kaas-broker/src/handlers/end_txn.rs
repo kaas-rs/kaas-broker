@@ -84,7 +84,7 @@ impl Handler for EndTxnHandler {
 
         let resp = end_txn::Response {
             throttle_time_ms: 0,
-            error_code,
+            error_code: super::producer_fenced_for(error_code, version, 2),
         };
         let mut out = BytesMut::new();
         end_txn::encode_response(&mut out, &resp, version)?;
@@ -383,6 +383,30 @@ mod tests {
         )
         .await;
         assert_eq!(resp.error_code, ERR_PRODUCER_FENCED);
+    }
+
+    /// gh #285 (KIP-588): EndTxn learned PRODUCER_FENCED (90) at v2; an
+    /// older client gets INVALID_PRODUCER_EPOCH (47) for the same fence.
+    #[tokio::test]
+    async fn a_pre_v2_client_is_fenced_with_invalid_producer_epoch() {
+        let (_t, b) = broker_with_txn();
+        let store = b.txn_state().unwrap();
+        let (pid, _epoch) = store.get_or_allocate("tx-1", || 1).unwrap();
+        let h = EndTxnHandler::new(b);
+        let req = end_txn::Request {
+            transactional_id: "tx-1".into(),
+            producer_id: pid,
+            producer_epoch: 99,
+            committed: true,
+        };
+        for (version, want) in [(1, 47), (2, 90)] {
+            let out = h
+                .handle(&conn(), version, encode_request(&req, version))
+                .await
+                .unwrap();
+            let resp = end_txn::decode_response(&mut out.freeze(), version).unwrap();
+            assert_eq!(resp.error_code, want, "v{version}");
+        }
     }
 
     /// Build a coordinator that says `t/0` is led by a *peer*, so the

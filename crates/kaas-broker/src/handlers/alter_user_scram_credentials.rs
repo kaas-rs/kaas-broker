@@ -194,6 +194,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct RecordingWriter {
         calls: Mutex<Vec<(String, ScramCredentialSpec)>>,
+        /// Answer every write as "no such KafkaUser".
+        missing: bool,
     }
 
     #[async_trait]
@@ -203,6 +205,9 @@ mod tests {
             username: &str,
             cred: ScramCredentialSpec,
         ) -> Result<(), UserWriteError> {
+            if self.missing {
+                return Err(UserWriteError::NotFound(username.to_owned()));
+            }
             self.calls.lock().push((username.to_owned(), cred));
             Ok(())
         }
@@ -277,7 +282,7 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(resp.results[0].error_code, ERR_UNSUPPORTED_SASL_MECHANISM);
+        assert_eq!(resp.results[0].error_code, 33, "UNSUPPORTED_SASL_MECHANISM");
         assert!(w.calls.lock().is_empty());
     }
 
@@ -294,7 +299,7 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(resp.results[0].error_code, ERR_UNACCEPTABLE_CREDENTIAL);
+        assert_eq!(resp.results[0].error_code, 93, "UNACCEPTABLE_CREDENTIAL");
         assert!(w.calls.lock().is_empty());
     }
 
@@ -312,11 +317,32 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(resp.results[0].error_code, ERR_UNSUPPORTED_VERSION);
+        assert_eq!(resp.results[0].error_code, 35, "UNSUPPORTED_VERSION");
         assert!(resp.results[0]
             .error_message
             .as_deref()
             .unwrap_or_default()
             .contains("KafkaUser"));
+    }
+
+    /// gh #276: a user with no KafkaUser CR answers Apache's
+    /// RESOURCE_NOT_FOUND, 91 — it went out as 83
+    /// (ELIGIBLE_LEADERS_NOT_AVAILABLE), and no test pinned it. The
+    /// other tests here assert Apache's literals for the same reason.
+    #[tokio::test]
+    async fn a_user_without_a_cr_is_resource_not_found_91() {
+        let w = Arc::new(RecordingWriter {
+            missing: true,
+            ..RecordingWriter::default()
+        });
+        let resp = alter(
+            broker_with_writer(w),
+            Request {
+                deletions: vec![],
+                upsertions: vec![upsertion("ghost")],
+            },
+        )
+        .await;
+        assert_eq!(resp.results[0].error_code, 91);
     }
 }
