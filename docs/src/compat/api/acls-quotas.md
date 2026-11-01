@@ -213,7 +213,8 @@ Lists which SCRAM mechanisms a user has credentials for —
 **Versions**: v0 (flexible from v0).
 
 **Handling**: authorize `Describe` on the cluster (denial → top-level
-`CLUSTER_AUTHORIZATION_FAILED` (31)), then answer from the live credential
+`CLUSTER_AUTHORIZATION_FAILED` (31), plus Apache's one row per requested user
+carrying 31 with the user name unset, gh #286), then answer from the live credential
 store — the operator-materialised `credentials.json`, hot-reloaded, so the
 response reflects the store the SCRAM authenticator actually verifies
 against. A null or empty `users` array describes every user with SCRAM
@@ -247,23 +248,32 @@ Rotates a user's SCRAM credential over the wire —
 
 **Versions**: v0 (flexible from v0).
 
-**Handling**: authorize `Alter` on the cluster (denial → per-user
-`CLUSTER_AUTHORIZATION_FAILED` (31)). The wire carries pre-salted material —
+**Handling**: authorize `Alter` on the cluster. A denial answers one sorted row
+per distinct user, each carrying `CLUSTER_AUTHORIZATION_FAILED` (31), as in
+Apache's `getErrorResponse`. Entries are then classified the way Apache's
+`ScramControlManager` does it (gh #286): one result per distinct user, and a
+user named twice in the request — a deletion plus an upsertion included — is
+`DUPLICATE_RESOURCE` (92) with nothing written. An empty user name or
+iterations outside 4096..=16384 are `UNACCEPTABLE_CREDENTIAL` (93), and an
+unknown mechanism is `UNSUPPORTED_SASL_MECHANISM` (33). The wire carries pre-salted material —
 `(salt, saltedPassword, iterations)`, never the password — and the broker
 derives the RFC 5802 stored/server keys and patches them into
 `KafkaUser.spec.authentication.scram`. The operator materialises the change
 into `credentials.json` on reconcile and every broker hot-reloads it, so
 the rotation is **asynchronous** (typically a few seconds) and cluster-wide.
-The CR must already exist (`RESOURCE_NOT_FOUND` (91) otherwise) and its
-`authentication.type` must be `scram-sha-512` or unset — rotating a `tls`
-user's SCRAM credential would silently flip its auth mechanism, so that
-answers `INVALID_REQUEST` (42). Iterations below 4096 or empty
-salt/saltedPassword answer `UNACCEPTABLE_CREDENTIAL` (93).
+The CR's `authentication.type` must be `scram-sha-512` or unset — rotating a
+`tls` user's SCRAM credential would silently flip its auth mechanism, so that
+answers `INVALID_REQUEST` (42). Empty salt/saltedPassword also answer
+`UNACCEPTABLE_CREDENTIAL` (93).
 
 **Deviations from Apache 3.7**:
 
 - **SCRAM-SHA-512 only** — SHA-256 upsertions answer
-  `UNSUPPORTED_SASL_MECHANISM` (33).
+  `UNSUPPORTED_SASL_MECHANISM` (33). Apache's own checks run first, so an
+  upsertion Apache would reject gets Apache's answer.
+- **An upsertion can't create a user**: with no `KafkaUser` CR of that name it
+  answers `RESOURCE_NOT_FOUND` (91). Apache's upsert never fails this way; in
+  kaas the CR owns the user's lifecycle.
 - **Deletions are refused** with `UNSUPPORTED_VERSION` (35): the credential
   lifecycle belongs to the `KafkaUser` CR (delete the CR or change its
   `authentication.type`). The operator would re-materialise anything the
@@ -279,6 +289,7 @@ salt/saltedPassword answer `UNACCEPTABLE_CREDENTIAL` (93).
 `crates/kaas-auth/src/scram.rs` (`keys_from_salted_password`).
 
 **Verified by**: handler tests (key derivation, mechanism/iteration
-rejection, deletion refusal) in
+rejection, deletion refusal, duplicate users, the denial shape — each
+pinning Apache's literal code) in
 `crates/kaas-broker/src/handlers/alter_user_scram_credentials.rs`; codec
 round-trips in `crates/kaas-codec/src/api/alter_user_scram_credentials.rs`.

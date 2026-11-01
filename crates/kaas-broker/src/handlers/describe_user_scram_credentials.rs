@@ -67,11 +67,27 @@ impl Handler for DescribeUserScramCredentialsHandler {
             .authorizer
             .authorize(&principal, &Resource::cluster(), Operation::Describe)
         {
+            // Apache's `getErrorResponse`, literally: the top-level error,
+            // plus one row per requested user that carries the error and
+            // leaves the user name unset. Clients act on the top-level
+            // code (gh #286).
+            let message = "Cluster authorization failed.";
+            let results = req
+                .users
+                .iter()
+                .flatten()
+                .map(|_| DescribeUserResult {
+                    user: String::new(),
+                    error_code: ERR_CLUSTER_AUTHZ_FAILED,
+                    error_message: Some(message.into()),
+                    credential_infos: Vec::new(),
+                })
+                .collect();
             let resp = Response {
                 throttle_time_ms: 0,
                 error_code: ERR_CLUSTER_AUTHZ_FAILED,
-                error_message: Some("Cluster authorization failed.".into()),
-                results: vec![],
+                error_message: Some(message.into()),
+                results,
             };
             let mut out = BytesMut::new();
             describe_user_scram_credentials::encode_response(&mut out, &resp, version)?;
@@ -196,6 +212,44 @@ mod tests {
             0,
         ));
         DescribeUserScramCredentialsHandler::new(broker, Some(Arc::new(creds)))
+    }
+
+    /// gh #286: a cluster-authorization denial is Apache's
+    /// `getErrorResponse`: top-level 31, and one row per requested user
+    /// (duplicates included) carrying 31 with the user name unset.
+    #[tokio::test]
+    async fn a_denial_carries_one_unnamed_row_per_requested_user() {
+        use crate::handlers::test_authz::DenyAllAuthorizer;
+        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let broker = Arc::new(Broker::with_auth(
+            engine,
+            Arc::new(TopicRegistry::new()),
+            "test",
+            0,
+            Arc::new(DenyAllAuthorizer),
+            Arc::new(kaas_auth::NoQuotaChecker),
+        ));
+        let h = DescribeUserScramCredentialsHandler::new(broker, None);
+        for (users, rows) in [(Some(vec!["alice", "bob", "alice"]), 3), (None, 0)] {
+            let req = describe_user_scram_credentials::Request {
+                users: users.map(|u| u.into_iter().map(str::to_owned).collect()),
+            };
+            let mut body = BytesMut::new();
+            describe_user_scram_credentials::encode_request(&mut body, &req, 0).unwrap();
+            let conn = Mutex::new(ConnState::new(
+                "scram",
+                SocketAddr::from_str("127.0.0.1:9095").unwrap(),
+            ));
+            let out = h.handle(&conn, 0, body.freeze()).await.unwrap();
+            let resp =
+                describe_user_scram_credentials::decode_response(&mut out.freeze(), 0).unwrap();
+            assert_eq!(resp.error_code, 31);
+            assert_eq!(resp.results.len(), rows);
+            assert!(resp
+                .results
+                .iter()
+                .all(|r| r.error_code == 31 && r.user.is_empty() && r.credential_infos.is_empty()));
+        }
     }
 
     async fn describe(users: Option<Vec<&str>>) -> Response {
