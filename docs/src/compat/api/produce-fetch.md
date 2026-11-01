@@ -233,8 +233,8 @@ answered once.
 - Auto-creation (`auto.create.topics.enable`, chart
   `autoCreateTopics.enabled`, gh #242) mints a `KafkaTopic` CR and answers
   `LEADER_NOT_AVAILABLE` (5) until the operator materializes it. It needs
-  `Create` on the topic; Apache also accepts `Create` on the cluster, which
-  kaas does not consult.
+  `Create` on the cluster or on the topic, as in Apache and as CreateTopics
+  does (gh #280; the cluster-wide grant wasn't consulted before).
 - `rack` is always null and `is_internal` always false — kaas advertises no
   internal topics (there is no on-wire `__consumer_offsets`).
 - v11+ is not registered; clients negotiate down to v10 via ApiVersions.

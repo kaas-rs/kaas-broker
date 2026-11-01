@@ -8,16 +8,24 @@
 //! existing topic watch (`run_topic_watch`) and serves Produce/Fetch
 //! against it on subsequent requests.
 //!
-//! Authorization: `Operation::Create` on the topic resource.
+//! Authorization: `Operation::Create` on the cluster, else on the topic
+//! resource — Apache's rule (gh #280), shared with Metadata auto-create.
 //!
 //! Wire error mapping (see also [`TopicWriteError`]):
 //!
 //! - authorization denied → `TOPIC_AUTHORIZATION_FAILED` (29)
+//! - partitions 0 / < -1  → `INVALID_PARTITIONS` (37)
+//! - replication 0 / < -1 → `INVALID_REPLICATION_FACTOR` (38)
 //! - missing CR writer    → `CLUSTER_AUTHORIZATION_FAILED` (31)
 //! - bad config key/value → `INVALID_CONFIG` (40)
 //! - CR already exists    → `TOPIC_ALREADY_EXISTS` (36)
 //! - RBAC denial          → `CLUSTER_AUTHORIZATION_FAILED` (31)
 //! - other kube error     → `UNKNOWN_SERVER_ERROR` (-1)
+//!
+//! `-1` partitions means the broker default, `KAAS_NUM_PARTITIONS`
+//! (Apache's `num.partitions`, KIP-464 — what `kafka-topics.sh --create`
+//! sends without `--partitions`); `-1` replicas means 1, the only replica
+//! count kaas has (gh #280).
 //!
 //! `validate_only: true` (v1+) short-circuits BEFORE minting the CR —
 //! the authorization + writer + config-validation checks still run
@@ -35,7 +43,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
-use kaas_auth::{Operation, Resource};
 use kaas_codec::api::create_topics;
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
@@ -48,17 +55,32 @@ const ERR_NONE: i16 = 0;
 const ERR_TOPIC_ALREADY_EXISTS: i16 = 36;
 const ERR_CLUSTER_AUTHZ_FAILED: i16 = 31;
 const ERR_TOPIC_AUTHZ_FAILED: i16 = 29;
+const ERR_INVALID_PARTITIONS: i16 = 37;
+const ERR_INVALID_REPLICATION_FACTOR: i16 = 38;
 const ERR_INVALID_CONFIG: i16 = 40;
 const ERR_UNKNOWN_SERVER: i16 = -1;
 
 #[derive(Debug)]
 pub struct CreateTopicsHandler {
     broker: Arc<Broker>,
+    /// Partition count for a request that sends `-1` (gh #280).
+    default_partitions: i32,
 }
 
 impl CreateTopicsHandler {
     pub fn new(broker: Arc<Broker>) -> Self {
-        Self { broker }
+        Self {
+            broker,
+            default_partitions: 1,
+        }
+    }
+
+    /// The broker's `num.partitions` (`KAAS_NUM_PARTITIONS`), used when a
+    /// request asks for the default with `-1`.
+    #[must_use]
+    pub fn with_default_partitions(mut self, n: i32) -> Self {
+        self.default_partitions = n;
+        self
     }
 }
 
@@ -78,33 +100,48 @@ impl Handler for CreateTopicsHandler {
         let mut topics = Vec::with_capacity(req.topics.len());
 
         for topic in req.topics {
-            // Determine effective partition count: negative (typical
-            // AdminClient shape when caller wants "server default")
-            // maps to 1 partition — mirrors Apache's
-            // `num.partitions=1` default.
-            let num_partitions = if topic.num_partitions <= 0 {
-                1
-            } else {
-                topic.num_partitions
-            };
-            let replication_factor = if topic.replication_factor <= 0 {
-                1
-            } else {
-                topic.replication_factor
-            };
-
-            let resource = Resource::topic(&topic.name);
-            if !self
-                .broker
-                .authorizer
-                .authorize(&principal, &resource, Operation::Create)
-            {
+            if !super::may_create_topic(&self.broker, &principal, &topic.name) {
                 topics.push(create_topics::CreatableTopicResult::new(
                     &topic.name,
                     ERR_TOPIC_AUTHZ_FAILED,
                 ));
                 continue;
             }
+
+            // gh #280, Apache's KIP-464 rules: -1 asks for the broker
+            // default, anything else must be positive.
+            let num_partitions = match topic.num_partitions {
+                -1 => self.default_partitions,
+                n if n > 0 => n,
+                _ => {
+                    topics.push(
+                        create_topics::CreatableTopicResult::new(
+                            &topic.name,
+                            ERR_INVALID_PARTITIONS,
+                        )
+                        .with_error_message(
+                            "Number of partitions must be larger than 0, or -1 to use the default value.",
+                        ),
+                    );
+                    continue;
+                }
+            };
+            let replication_factor = match topic.replication_factor {
+                -1 => 1,
+                n if n > 0 => n,
+                _ => {
+                    topics.push(
+                        create_topics::CreatableTopicResult::new(
+                            &topic.name,
+                            ERR_INVALID_REPLICATION_FACTOR,
+                        )
+                        .with_error_message(
+                            "Replication factor must be larger than 0, or -1 to use the default value.",
+                        ),
+                    );
+                    continue;
+                }
+            };
 
             let Some(w) = writer.as_ref() else {
                 topics.push(
@@ -255,12 +292,20 @@ mod tests {
         broker: Arc<Broker>,
         configs: Vec<CreatableTopicConfig>,
     ) -> create_topics::Response {
-        let h = CreateTopicsHandler::new(broker);
+        create_with(CreateTopicsHandler::new(broker), 3, 1, configs).await
+    }
+
+    async fn create_with(
+        h: CreateTopicsHandler,
+        num_partitions: i32,
+        replication_factor: i16,
+        configs: Vec<CreatableTopicConfig>,
+    ) -> create_topics::Response {
         let req = Request {
             topics: vec![CreatableTopic {
                 name: "t".into(),
-                num_partitions: 3,
-                replication_factor: 1,
+                num_partitions,
+                replication_factor,
                 assignments: vec![],
                 configs,
             }],
@@ -330,6 +375,74 @@ mod tests {
         )
         .await;
         assert_eq!(resp.topics[0].error_code, ERR_INVALID_CONFIG);
+        assert!(w.calls.lock().is_empty());
+    }
+
+    /// gh #280: -1 asks for the broker default (Apache's
+    /// `num.partitions`), which is what `kafka-topics.sh --create` sends
+    /// without `--partitions`.
+    #[tokio::test]
+    async fn minus_one_partitions_uses_the_broker_default() {
+        let w = Arc::new(RecordingWriter::default());
+        let h = CreateTopicsHandler::new(broker_with_writer(w.clone())).with_default_partitions(6);
+        let resp = create_with(h, -1, -1, vec![]).await;
+        assert_eq!(resp.topics[0].error_code, ERR_NONE);
+        assert_eq!(resp.topics[0].num_partitions, 6);
+        assert_eq!(resp.topics[0].replication_factor, 1);
+        assert_eq!(w.calls.lock()[0].1, 6);
+    }
+
+    /// gh #280: Apache's codes, written out — 0 and anything below -1 are
+    /// invalid, and nothing is minted.
+    #[tokio::test]
+    async fn zero_or_below_minus_one_is_rejected() {
+        for (partitions, replicas, code) in [(0, 1, 37), (-2, 1, 37), (3, 0, 38), (3, -2, 38)] {
+            let w = Arc::new(RecordingWriter::default());
+            let h = CreateTopicsHandler::new(broker_with_writer(w.clone()));
+            let resp = create_with(h, partitions, replicas, vec![]).await;
+            assert_eq!(
+                resp.topics[0].error_code, code,
+                "partitions={partitions} replicas={replicas}"
+            );
+            assert!(w.calls.lock().is_empty());
+        }
+    }
+
+    /// gh #280: Apache accepts `Create` on the cluster in place of
+    /// `Create` on each topic; without either the topic is refused.
+    #[tokio::test]
+    async fn cluster_create_suffices_and_neither_grant_is_refused() {
+        use crate::handlers::test_authz::{ClusterCreateOnlyAuthorizer, DenyOpAuthorizer};
+        use kaas_auth::Operation;
+        let with_auth = |auth: Arc<dyn kaas_auth::Authorizer>, w: Arc<RecordingWriter>| {
+            let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+            let b = Arc::new(Broker::with_auth(
+                engine,
+                Arc::new(TopicRegistry::new()),
+                "test",
+                0,
+                auth,
+                Arc::new(kaas_auth::NoQuotaChecker),
+            ));
+            b.install_cr_writer(w);
+            b
+        };
+        let w = Arc::new(RecordingWriter::default());
+        let resp = create(
+            with_auth(Arc::new(ClusterCreateOnlyAuthorizer), w.clone()),
+            vec![],
+        )
+        .await;
+        assert_eq!(resp.topics[0].error_code, ERR_NONE);
+        assert_eq!(w.calls.lock().len(), 1);
+
+        let w = Arc::new(RecordingWriter::default());
+        let resp = create(
+            with_auth(Arc::new(DenyOpAuthorizer(Operation::Create)), w.clone()),
+            vec![],
+        )
+        .await;
+        assert_eq!(resp.topics[0].error_code, ERR_TOPIC_AUTHZ_FAILED);
         assert!(w.calls.lock().is_empty());
     }
 }

@@ -176,9 +176,11 @@ broker:
   #     client retries. Required for Kafka Streams' DSL `.to(<sink>)`
   #     to work without explicit AdminClient.createTopics. Disable to
   #     force every topic to be pre-created via KafkaTopic CR.
-  #   numPartitions — default 1; partition count for auto-created
-  #     topics. Topics created via explicit AdminClient.createTopics
-  #     (or KafkaTopic CR with spec.partitions) ignore this.
+  #   numPartitions — default 1; Apache's num.partitions. Used for
+  #     auto-created topics and for a CreateTopics request that asks
+  #     for the default with -1 (kafka-topics.sh --create without
+  #     --partitions, gh #280). An explicit count, or a KafkaTopic CR's
+  #     spec.partitions, wins.
   autoCreateTopics:
     enabled: true
     numPartitions: 1

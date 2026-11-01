@@ -92,6 +92,25 @@ pub(crate) fn principal_from(
         .unwrap_or_else(kaas_auth::Principal::anonymous)
 }
 
+/// Whether `principal` may create topic `name`: `Create` on the cluster,
+/// else `Create` on the topic — Apache's rule for both CreateTopics and
+/// Metadata auto-creation, so neither is a way around the other
+/// (gh #280). The cluster check is quiet (Apache's `logIfDenied = false`):
+/// lacking the cluster-wide grant is the normal case, not a denial.
+pub(crate) fn may_create_topic(
+    broker: &crate::broker::Broker,
+    principal: &kaas_auth::Principal,
+    name: &str,
+) -> bool {
+    use kaas_auth::{Operation, Resource};
+    broker
+        .authorizer
+        .authorize_quietly(principal, &Resource::cluster(), Operation::Create)
+        || broker
+            .authorizer
+            .authorize(principal, &Resource::topic(name), Operation::Create)
+}
+
 /// gh #199 deny-path test doubles. Handler tests build a broker with
 /// one of these to prove a gate exists and fires the right code.
 #[cfg(test)]
@@ -128,6 +147,17 @@ pub(crate) mod test_authz {
     impl Authorizer for DenyOpAuthorizer {
         fn authorize(&self, _p: &Principal, _r: &Resource, op: Operation) -> bool {
             op != self.0
+        }
+    }
+
+    /// Grants `Create` only on the cluster resource, everything else
+    /// everywhere — Apache's cluster-wide create grant (gh #280).
+    #[derive(Debug)]
+    pub struct ClusterCreateOnlyAuthorizer;
+
+    impl Authorizer for ClusterCreateOnlyAuthorizer {
+        fn authorize(&self, _p: &Principal, r: &Resource, op: Operation) -> bool {
+            op != Operation::Create || r.kind == kaas_auth::ResourceKind::Cluster
         }
     }
 }

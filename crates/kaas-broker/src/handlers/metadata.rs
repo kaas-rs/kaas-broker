@@ -151,11 +151,7 @@ impl MetadataHandler {
         // Auto-creation is a create, so it takes the same ACL as
         // CreateTopics — otherwise Metadata would be a way around the
         // authorizer.
-        if !self
-            .broker
-            .authorizer
-            .authorize(principal, &Resource::topic(name), Operation::Create)
-        {
+        if !super::may_create_topic(&self.broker, principal, name) {
             return ERR_TOPIC_AUTHZ_FAILED;
         }
         let Some(writer) = self.broker.cr_writer() else {
@@ -955,5 +951,21 @@ mod tests {
         let resp = metadata_v9(&h, encode_request_v9(&["a", "a", "nope", "nope"])).await;
         let names: Vec<&str> = resp.topics.iter().map(|t| t.name.as_str()).collect();
         assert_eq!(names, ["a", "nope"]);
+    }
+
+    /// gh #280: auto-create accepts Apache's cluster-wide `Create` grant,
+    /// the same rule as CreateTopics.
+    #[tokio::test]
+    async fn auto_create_accepts_cluster_create() {
+        use crate::handlers::test_authz::ClusterCreateOnlyAuthorizer;
+        let broker = broker_with_auth(Vec::new(), Arc::new(ClusterCreateOnlyAuthorizer));
+        let writer = Arc::new(RecordingWriter::default());
+        broker.install_cr_writer(writer.clone());
+        let h = MetadataHandler::new(broker, &listeners()).with_auto_create(true, 2);
+        assert_eq!(
+            error_code_for(&h, "brand-new", true).await,
+            ERR_LEADER_NOT_AVAILABLE
+        );
+        assert_eq!(writer.calls(), [("brand-new".to_owned(), 2)]);
     }
 }

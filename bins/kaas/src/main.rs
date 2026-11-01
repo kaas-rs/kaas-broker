@@ -1194,7 +1194,12 @@ fn build_dispatcher(
         4,
         Arc::new(DescribeConfigsHandler::new(broker.clone())),
     );
-    d.register(19, 0, 7, Arc::new(CreateTopicsHandler::new(broker.clone())));
+    d.register(
+        19,
+        0,
+        7,
+        Arc::new(CreateTopicsHandler::new(broker.clone()).with_default_partitions(num_partitions)),
+    );
     d.register(
         37,
         0,

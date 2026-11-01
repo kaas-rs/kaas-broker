@@ -83,7 +83,7 @@ leader-election Lease is separate and not configurable: it is fixed at
 | `fsyncMaxLatencyMs` | `30000` | — | Fsync watchdog — the stuck-storage tripwire. Every acked produce fsyncs (at the default flush interval), and a hung NFS server makes that fsync block *forever*, not fail: appenders queue behind the partition lock and producers time out with no error naming the cause. Past this deadline the append instead fails with a **retriable** error and the broker's health state reports storage as stalled, so clients retry and `/healthz` points at the substrate. Apache has no equivalent because ISR failover covers a broker with a hung disk; kaas has no replicas, so failing fast is the fallback. On healthy storage it never fires (fsyncs run in the tens of milliseconds). `0` disables it, for substrates whose legitimate worst-case fsync latency exceeds any sane deadline. |
 | `txnState.numSlots` | `50` | `transaction.state.log.num.partitions` | Transaction-state slot-file count, cluster-wide. Changing it on a live cluster re-shards slot ownership; drain transactional producers first. |
 | `autoCreateTopics.enabled` | `true` | `auto.create.topics.enable` | Metadata requests for unknown topics mint a `KafkaTopic` CR and answer `LEADER_NOT_AVAILABLE` until the operator materializes it — what Kafka Streams' `.to(sink)` relies on. |
-| `autoCreateTopics.numPartitions` | `1` | `num.partitions` | Partition count for auto-created topics only. |
+| `autoCreateTopics.numPartitions` | `1` | `num.partitions` | Partition count for auto-created topics, and for a CreateTopics request that sends `-1` (`kafka-topics.sh --create` without `--partitions`, gh #280). |
 
 ## `storage`
 

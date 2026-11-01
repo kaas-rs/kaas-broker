@@ -20,13 +20,17 @@ Creates topics — the broker side of `kafka-topics.sh --create` and
 **Versions**: v0–v7 (flexible from v5).
 
 **Handling**: per requested topic, the handler authorizes `Create` on the
-topic resource, then POSTs a fresh `KafkaTopic` CR. The operator reconciles it
+cluster, else on the topic resource (Apache's rule, shared with Metadata
+auto-create, gh #280), then POSTs a fresh `KafkaTopic` CR. The operator reconciles it
 into partition directories on the shared volume; the broker picks the topic up
 via its topic watcher and serves it on subsequent requests — creation is
 therefore **asynchronous** (a success response means the CR was accepted, not
-that partition dirs exist yet). A non-positive `num_partitions` (the
-AdminClient's "server default" convention) maps to 1, mirroring Apache's
-`num.partitions=1` default; the same rule applies to `replication_factor`.
+that partition dirs exist yet). `num_partitions = -1` (the AdminClient's
+"server default", KIP-464) takes the broker's `num.partitions`
+(`broker.autoCreateTopics.numPartitions`); `replication_factor = -1` means
+1, kaas's only replica count. `0` or anything below `-1` is refused with
+`INVALID_PARTITIONS` (37) / `INVALID_REPLICATION_FACTOR` (38), as in Apache
+(gh #280; until then every non-positive value silently meant 1).
 Kafka topic names that aren't valid RFC 1123 subdomains (Kafka Streams
 internals, dotted names) get a deterministic synthetic CR name
 `kaas-topic-<16 hex>` with the literal name stashed in `spec.topicName`.
