@@ -58,7 +58,8 @@ pub struct CreatableTopic {
     /// Kaas has no replicas so any positive value is accepted
     /// and ignored at the handler.
     pub replication_factor: i16,
-    /// Per-partition replica assignments. Kaas ignores these.
+    /// Per-partition replica assignments. kaas has no replicas, so only
+    /// the partition count they imply is used (gh #292).
     pub assignments: Vec<CreatableReplicaAssignment>,
     /// Per-topic config overrides (retention.ms, cleanup.policy,
     /// ...). Handler forwards these through the CR patch.
@@ -112,8 +113,10 @@ impl CreatableTopicResult {
             topic_id: [0u8; 16],
             error_code,
             error_message: None,
-            num_partitions: 0,
-            replication_factor: 0,
+            // Apache's schema default; a successful create overwrites
+            // both via `with_created` (gh #292).
+            num_partitions: -1,
+            replication_factor: -1,
             configs: Vec::new(),
         }
     }
@@ -299,7 +302,8 @@ pub fn decode_response(buf: &mut Bytes, version: i16) -> Result<Response, CodecE
             }
             (np, rf, out)
         } else {
-            (0, 0, Vec::new())
+            // Not on the wire below v5; Apache's schema default is -1.
+            (-1, -1, Vec::new())
         };
         if flexible {
             tagged::read(buf)?;
@@ -403,8 +407,8 @@ mod tests {
                     topic_id: [0u8; 16],
                     error_code: 0,
                     error_message: None,
-                    num_partitions: if version >= 5 { 3 } else { 0 },
-                    replication_factor: if version >= 5 { 1 } else { 0 },
+                    num_partitions: if version >= 5 { 3 } else { -1 },
+                    replication_factor: if version >= 5 { 1 } else { -1 },
                     configs: Vec::new(),
                 },
                 CreatableTopicResult {
@@ -416,8 +420,8 @@ mod tests {
                     } else {
                         None
                     },
-                    num_partitions: 0,
-                    replication_factor: 0,
+                    num_partitions: -1,
+                    replication_factor: -1,
                     configs: Vec::new(),
                 },
             ],

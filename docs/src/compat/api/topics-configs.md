@@ -19,7 +19,9 @@ Creates topics — the broker side of `kafka-topics.sh --create` and
 
 **Versions**: v0–v7 (flexible from v5).
 
-**Handling**: per requested topic, the handler authorizes `Create` on the
+**Handling**: a name that appears more than once in one request is refused
+with `INVALID_REQUEST` (42) for every entry, before authorization, as Apache's
+`KafkaApis` does (gh #292). Per remaining topic, the handler authorizes `Create` on the
 cluster, else on the topic resource (Apache's rule, shared with Metadata
 auto-create, gh #280), then POSTs a fresh `KafkaTopic` CR. The operator reconciles it
 into partition directories on the shared volume; the broker picks the topic up
@@ -31,6 +33,14 @@ that partition dirs exist yet). `num_partitions = -1` (the AdminClient's
 1, kaas's only replica count. `0` or anything below `-1` is refused with
 `INVALID_PARTITIONS` (37) / `INVALID_REPLICATION_FACTOR` (38), as in Apache
 (gh #280; until then every non-positive value silently meant 1).
+A manual replica assignment (`kafka-topics.sh --create --replica-assignment`,
+`new NewTopic(name, replicasAssignments)`) creates one partition per entry
+(gh #292; it used to be ignored). Its checks are Apache's
+`ReplicationControlManager`'s: explicit counts alongside an assignment are
+`INVALID_REQUEST` (42); duplicate or non-consecutive partition indices, an
+empty replica list, a broker named twice, or replica lists of different
+lengths are `INVALID_REPLICA_ASSIGNMENT` (39). The response's replication
+factor is the assignment's.
 Kafka topic names that aren't valid RFC 1123 subdomains (Kafka Streams
 internals, dotted names) get a deterministic synthetic CR name
 `kaas-topic-<16 hex>` with the literal name stashed in `spec.topicName`.
@@ -38,13 +48,15 @@ Config overrides on the request (`--config retention.ms=600000`) are
 validated against the supported key set and land in the minted CR's
 `spec.config`, so the operator materialises them on first reconcile exactly
 as if they had been authored on the CR; an unknown key or an unparseable
-value fails that topic's creation with `INVALID_CONFIG` (40), as in Apache.
+value fails that topic's creation with `INVALID_CONFIG` (40), as in Apache,
+and so does a null value ("Null value not supported for topic configs", gh #292).
 `validate_only` (v1+) runs the authorization, writer, and config-validation
 checks, then returns the would-be response without minting the CR. Error
 mapping: authorization denial → `TOPIC_AUTHORIZATION_FAILED` (29), bad
 config → `INVALID_CONFIG` (40), existing CR → `TOPIC_ALREADY_EXISTS` (36),
 missing writer or Kubernetes RBAC denial → `CLUSTER_AUTHORIZATION_FAILED`
-(31), other kube errors → `UNKNOWN_SERVER_ERROR` (-1). On ArgoCD-managed
+(31), other kube errors → `UNKNOWN_SERVER_ERROR` (-1). Error rows carry the
+schema default `-1` for the partition count and replication factor. On ArgoCD-managed
 clusters, `admin.argocd.enabled` on the Helm chart makes the minted CR
 carry ArgoCD tracking/coexistence annotations so runtime-created topics
 appear in the Application tree without being prune targets — see
@@ -63,6 +75,9 @@ appear in the Application tree without being prune targets — see
   reconcile, after the response has gone out.
 - `replication_factor` is accepted and echoed but has no effect — kaas is
   single-writer-per-partition by design (see [Non-goals](../non-goals.md)).
+  Likewise a manual assignment's broker ids only shape the partition count:
+  they aren't checked against the registered brokers (Apache answers 39 for an
+  unknown one), and kaas's balancer places the partitions.
 - `validate_only` does not check for an existing topic; it reports success
   even when a real create would return `TOPIC_ALREADY_EXISTS`.
 
@@ -73,8 +88,12 @@ appear in the Application tree without being prune targets — see
 **Verified by**: `scripts/kafka-topics.sh` (create/list/describe scenarios);
 codec round-trip tests in `crates/kaas-codec/src/api/create_topics.rs`
 (including `v7_carries_topic_id`); CR-name mapping and config-conversion
-tests in `crates/kaas-broker/src/topic_cr_writer.rs`; config-threading and
-rejection handler tests in `crates/kaas-broker/src/handlers/create_topics.rs`.
+tests in `crates/kaas-broker/src/topic_cr_writer.rs`; config-threading,
+rejection, manual-assignment, null-config and duplicate-name handler tests in
+`crates/kaas-broker/src/handlers/create_topics.rs`; the `KAAS_NUM_PARTITIONS`
+parse in `crates/kaas-broker/src/cli.rs` and its dispatcher wiring
+(`create_topics_minus_one_gets_the_configured_default`) in
+`bins/kaas/src/main.rs`.
 
 ## DeleteTopics
 

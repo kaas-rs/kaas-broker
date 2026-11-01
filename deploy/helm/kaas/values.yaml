@@ -183,6 +183,9 @@ broker:
   #     spec.partitions, wins.
   autoCreateTopics:
     enabled: true
+    # Apache's num.partitions. Also the count CreateTopics uses when a
+    # request asks for the default with -1 (`kafka-topics.sh --create`
+    # without --partitions), whether or not auto-create is enabled.
     numPartitions: 1
 
 storage:

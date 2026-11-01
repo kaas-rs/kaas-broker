@@ -292,8 +292,10 @@ pub struct Cli {
     /// `LEADER_NOT_AVAILABLE` so the client retries. Defaults to
     /// Apache's `true`; inert without a CR writer (dev mode).
     pub auto_create_topics: bool,
-    /// `KAAS_NUM_PARTITIONS` — Apache `num.partitions`, the partition
-    /// count given to an auto-created topic. Apache's default is 1.
+    /// `KAAS_NUM_PARTITIONS` — Apache `num.partitions`: the partition
+    /// count of an auto-created topic, and of a CreateTopics request
+    /// that asks for the default with `-1` (gh #280). Apache's default
+    /// is 1.
     pub num_partitions: i32,
     /// `KAAS_REQUIRE_SASL` (gh #251, re-port of the Go broker's
     /// `SKAFKA_REQUIRE_SASL`) — when true, listeners with no
@@ -421,18 +423,10 @@ impl Cli {
         // dead broker is the worse outcome — but it is reported.
         let auto_create_topics =
             parse_bool_env("KAAS_AUTO_CREATE_TOPICS_ENABLE", true, &mut config_warnings);
-        let num_partitions = match env::var("KAAS_NUM_PARTITIONS") {
-            Err(_) => 1,
-            Ok(s) => match s.trim().parse::<i32>() {
-                Ok(n) if n > 0 => n,
-                _ => {
-                    config_warnings.push(format!(
-                        "KAAS_NUM_PARTITIONS={s:?} is not a positive integer; using 1"
-                    ));
-                    1
-                }
-            },
-        };
+        let num_partitions = parse_num_partitions(
+            env::var("KAAS_NUM_PARTITIONS").ok().as_deref(),
+            &mut config_warnings,
+        );
 
         let require_sasl = parse_bool_env("KAAS_REQUIRE_SASL", false, &mut config_warnings);
 
@@ -509,6 +503,21 @@ pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 1_048_588;
 /// false-ish is reported in `warnings`, naming the value used, and also
 /// yields `default`: a typo like `flase` used to read as `false`
 /// silently (gh #281).
+/// `KAAS_NUM_PARTITIONS`: unset is Apache's default, 1. A non-positive
+/// or unparseable value also yields 1, and is reported.
+fn parse_num_partitions(raw: Option<&str>, warnings: &mut Vec<String>) -> i32 {
+    let Some(s) = raw else { return 1 };
+    match s.trim().parse::<i32>() {
+        Ok(n) if n > 0 => n,
+        _ => {
+            warnings.push(format!(
+                "KAAS_NUM_PARTITIONS={s:?} is not a positive integer; using 1"
+            ));
+            1
+        }
+    }
+}
+
 fn parse_bool_env(name: &str, default: bool, warnings: &mut Vec<String>) -> bool {
     let Ok(raw) = env::var(name) else {
         return default;
@@ -727,6 +736,21 @@ mod tests {
             mtls.client_ca_path.as_deref(),
             Some(std::path::Path::new("/tls-client-ca/mtls/ca.crt"))
         );
+    }
+
+    /// gh #292: `KAAS_NUM_PARTITIONS` unset is Apache's default, 1; a
+    /// non-positive or unparseable value degrades to 1 and is reported.
+    #[test]
+    fn num_partitions_defaults_to_one_and_reports_bad_values() {
+        let mut w = Vec::new();
+        assert_eq!(parse_num_partitions(None, &mut w), 1);
+        assert_eq!(parse_num_partitions(Some(" 6 "), &mut w), 6);
+        assert!(w.is_empty(), "{w:?}");
+        for bad in ["0", "-3", "six", ""] {
+            let mut w = Vec::new();
+            assert_eq!(parse_num_partitions(Some(bad), &mut w), 1, "{bad:?}");
+            assert_eq!(w.len(), 1, "{bad:?} must be reported");
+        }
     }
 
     /// gh #281: a value that is neither true-ish nor false-ish is

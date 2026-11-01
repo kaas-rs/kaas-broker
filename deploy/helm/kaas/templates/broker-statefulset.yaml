@@ -188,10 +188,14 @@ spec:
             # AllowAutoTopicCreation=true, it writes a KafkaTopic CR via
             # TopicCRWriter and returns LEADER_NOT_AVAILABLE so the
             # client retries. Internal topics (`__` prefix) are
-            # reserved, and the principal needs Create on the topic —
-            # the same ACL CreateTopics enforces.
+            # reserved, and the principal needs Create on the cluster or
+            # on the topic, the same rule CreateTopics enforces (gh #280).
             - name: KAAS_AUTO_CREATE_TOPICS_ENABLE
               value: "{{ .Values.broker.autoCreateTopics.enabled }}"
+            # Apache's num.partitions: the partition count of an
+            # auto-created topic AND of a CreateTopics request that asks
+            # for the default with -1 (`kafka-topics.sh --create` without
+            # --partitions), despite living under autoCreateTopics.
             - name: KAAS_NUM_PARTITIONS
               value: "{{ .Values.broker.autoCreateTopics.numPartitions }}"
             {{- if .Values.auth.requireSasl }}

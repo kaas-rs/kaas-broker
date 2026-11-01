@@ -1473,3 +1473,108 @@ impl kaas_observability::health::RuntimeState for BrokerRuntimeState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use bytes::BytesMut;
+    use kaas_broker::{ConfigOpWithValue, TopicCRWriter, TopicWriteError};
+    use kaas_codec::api::create_topics;
+    use kaas_codec::headers::RequestHeader;
+    use kaas_protocol::ConnState;
+
+    /// Records the partition count of every CR the broker mints.
+    #[derive(Debug, Default)]
+    struct RecordingWriter(parking_lot::Mutex<Vec<(String, i32)>>);
+
+    #[async_trait]
+    impl TopicCRWriter for RecordingWriter {
+        async fn create_topic(
+            &self,
+            name: &str,
+            n: i32,
+            _: &[(String, String)],
+        ) -> Result<(), TopicWriteError> {
+            self.0.lock().push((name.to_owned(), n));
+            Ok(())
+        }
+        async fn expand_topic(&self, _: &str, _: i32) -> Result<(), TopicWriteError> {
+            unreachable!()
+        }
+        async fn update_topic_config(
+            &self,
+            _: &str,
+            _: &[ConfigOpWithValue],
+        ) -> Result<(), TopicWriteError> {
+            unreachable!()
+        }
+        async fn delete_topic(&self, _: &str) -> Result<(), TopicWriteError> {
+            unreachable!()
+        }
+        async fn set_partition_log_dir(
+            &self,
+            _: &str,
+            _: i32,
+            _: &str,
+        ) -> Result<(), TopicWriteError> {
+            unreachable!()
+        }
+    }
+
+    /// gh #292: the dispatcher `main` builds hands `num_partitions`
+    /// (`KAAS_NUM_PARTITIONS`) to CreateTopics, so a request that asks
+    /// for the default with -1 gets it. Nothing else exercised that
+    /// wiring.
+    #[tokio::test]
+    async fn create_topics_minus_one_gets_the_configured_default() {
+        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let broker = Arc::new(Broker::new(
+            engine,
+            Arc::new(TopicRegistry::new()),
+            "test",
+            0,
+        ));
+        let writer = Arc::new(RecordingWriter::default());
+        broker.install_cr_writer(writer.clone());
+        let allow_all: Arc<dyn AuthEngine> = Arc::new(AllowAllAuthEngine);
+        let d = build_dispatcher(
+            broker,
+            &[],
+            Arc::new(PerListenerAuthEngine::new(allow_all)),
+            true,
+            4,
+            1_048_588,
+            None,
+        );
+
+        let req = create_topics::Request {
+            topics: vec![create_topics::CreatableTopic {
+                name: "t".into(),
+                num_partitions: -1,
+                replication_factor: -1,
+                assignments: vec![],
+                configs: vec![],
+            }],
+            timeout_ms: 1000,
+            validate_only: false,
+        };
+        let mut body = BytesMut::new();
+        create_topics::encode_request(&mut body, &req, 5).unwrap();
+        let conn = parking_lot::Mutex::new(ConnState::new(
+            "internal",
+            "127.0.0.1:9092".parse().unwrap(),
+        ));
+        let header = RequestHeader {
+            api_key: 19,
+            api_version: 5,
+            correlation_id: 1,
+            client_id: None,
+        };
+        let (out, _) = d.dispatch(&conn, header, body.freeze()).await;
+        let resp = create_topics::decode_response(&mut out.freeze(), 5).unwrap();
+        assert_eq!(resp.topics[0].error_code, 0);
+        assert_eq!(resp.topics[0].num_partitions, 4);
+        assert_eq!(*writer.0.lock(), [("t".to_owned(), 4)]);
+    }
+}
