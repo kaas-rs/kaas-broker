@@ -128,8 +128,11 @@ fn principal_to_user_name(principal: &str) -> Result<&str, AclWriteError> {
 }
 
 /// CR's lowercase `allow`/`deny` → the on-disk `Allow`/`Deny` casing
-/// the wire response and the broker's ACL engine both expect.
-#[cfg(any(feature = "cr-writer", test))]
+/// the wire response and the broker's ACL engine both expect. Only the
+/// kube writer calls it, so it carries that gate alone: with `test` added
+/// it was dead code in a featureless `cargo test -p kaas-broker`, which
+/// `-D warnings` turns into a build failure.
+#[cfg(feature = "cr-writer")]
 fn normalise_permission(t: &str) -> &'static str {
     if t.eq_ignore_ascii_case("deny") {
         "Deny"
