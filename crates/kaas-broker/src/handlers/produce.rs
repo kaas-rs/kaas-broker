@@ -397,7 +397,9 @@ mod tests {
         };
         for (acks, want) in [(0, Reply::Close), (1, Reply::Send), (-1, Reply::Send)] {
             let c = conn();
-            h.handle(&c, 9, encode_request(&req(acks), 9)).await.unwrap();
+            h.handle(&c, 9, encode_request(&req(acks), 9))
+                .await
+                .unwrap();
             assert_eq!(c.lock().reply, want, "acks={acks}");
         }
     }
