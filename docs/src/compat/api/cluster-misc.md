@@ -145,6 +145,11 @@ responses carry per-dir `TotalBytes` / `UsableBytes` (KIP-827) from a
 `statvfs` of the dir's filesystem — `-1` when the probe fails (the
 dev-mode `memory://` sentinel).
 
+**Authorization** (gh #293): `Describe` on the cluster resource, as in
+Apache. Without it the response lists no dirs and, from v3, carries
+`CLUSTER_AUTHORIZATION_FAILED` (31) at the top level; v0–v2 have no
+top-level error field, so a denied client sees an empty list.
+
 **Deviations from Apache 3.7**:
 
 - `partition_size` is only real for partitions **this broker currently
@@ -157,12 +162,14 @@ dev-mode `memory://` sentinel).
 - `offset_lag` is hardwired to 0 and `is_future_key` to false — coherent for
   a broker with no followers and no intra-broker reassignment, but a client
   should not read fetch-lag meaning into it.
+
 **Source**: `crates/kaas-broker/src/handlers/describe_log_dirs.rs`,
 `crates/kaas-storage/src/disk.rs` (`partition_size`, `log_dirs`),
 `crates/kaas-codec/src/api/describe_log_dirs.rs`.
 
 **Verified by**: `scripts/kafka-log-dirs.sh` (all-dirs describe plus
-topic-filtered describe); `partition_size_sums_segment_sizes` and
+topic-filtered describe); `denied_describe_lists_nothing` in the handler;
+`partition_size_sums_segment_sizes` and
 `placement_resolver_routes_partition_dirs` in
 `crates/kaas-storage/src/disk.rs`; version roundtrips in the codec
 module.
@@ -187,6 +194,13 @@ broker's partition → `REPLICA_NOT_AVAILABLE` (9); failed copy or
 record flip → `KAFKA_STORAGE_ERROR` (56), with the copy rolled back so
 data location and placement record never diverge.
 
+**Authorization** (gh #293): `Alter` on the cluster resource, as in
+Apache, checked before anything else — without it every requested
+partition answers `CLUSTER_AUTHORIZATION_FAILED` (31), whatever the
+path, and nothing is copied. The `kaas.rs/migrate-to-volume` annotation
+driver (gh #224) runs the same move internally and is not gated by a
+client principal.
+
 **Deviations from Apache 3.7**:
 
 - Apache moves a replica live (future replica + catch-up, then swap);
@@ -202,5 +216,7 @@ data location and placement record never diverge.
 `crates/kaas-codec/src/api/alter_replica_log_dirs.rs`.
 
 **Verified by**: `move_partition_between_log_dirs` in
-`crates/kaas-storage/src/disk.rs`; `all_versions_roundtrip` in the
+`crates/kaas-storage/src/disk.rs`; `denied_alter_is_31_and_moves_nothing`
+and `alter_on_the_cluster_moves_the_partition` in the handler;
+`all_versions_roundtrip` in the
 codec module; `scripts/kafka-log-dirs.sh`.

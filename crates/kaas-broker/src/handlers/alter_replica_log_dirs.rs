@@ -1,6 +1,13 @@
 //! AlterReplicaLogDirs handler (key 34, KIP-113) — the gh #221
 //! phase-3 volume-pool migration verb.
 //!
+//! Authorization (gh #293): `Alter` on the cluster, as in Apache's
+//! `handleAlterReplicaLogDirsRequest`. Without it every requested
+//! partition answers `CLUSTER_AUTHORIZATION_FAILED` (31) and nothing is
+//! resolved or moved. The gh #224 annotation driver calls
+//! [`migrate_partition`] directly, with no client principal, so it is
+//! not gated here.
+//!
 //! Per requested `(destination path, topic, partition)`:
 //!
 //! 1. Resolve the destination path against the engine's log dirs —
@@ -27,16 +34,19 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use kaas_auth::{Operation, Resource};
 use kaas_codec::api::alter_replica_log_dirs as arld;
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
 use tracing::{info, warn};
 
+use super::principal_from;
 use crate::broker::Broker;
 
 const ERR_NONE: i16 = 0;
 const ERR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 const ERR_REPLICA_NOT_AVAILABLE: i16 = 9;
+const ERR_CLUSTER_AUTHZ_FAILED: i16 = 31;
 const ERR_INVALID_REQUEST: i16 = 42;
 const ERR_KAFKA_STORAGE_ERROR: i16 = 56;
 const ERR_LOG_DIR_NOT_FOUND: i16 = 57;
@@ -139,12 +149,20 @@ pub async fn migrate_partition(
 impl Handler for AlterReplicaLogDirsHandler {
     async fn handle(
         &self,
-        _conn: &Mutex<ConnState>,
+        conn: &Mutex<ConnState>,
         version: i16,
         body: Bytes,
     ) -> Result<BytesMut, HandlerError> {
         let mut body = body;
         let req = arld::decode_request(&mut body, version)?;
+
+        // Moving a partition's data between volumes is a cluster-level
+        // operation in Apache, not a per-topic one.
+        let authorized = self.broker.authorizer.authorize(
+            &principal_from(conn),
+            &Resource::cluster(),
+            Operation::Alter,
+        );
 
         // path → log dir, from the same list DescribeLogDirs reports.
         let dirs = self.broker.engine.log_dirs();
@@ -158,6 +176,7 @@ impl Handler for AlterReplicaLogDirsHandler {
             for t in &dir_req.topics {
                 for p in &t.partitions {
                     let error_code = match target {
+                        _ if !authorized => ERR_CLUSTER_AUTHZ_FAILED,
                         None => ERR_LOG_DIR_NOT_FOUND,
                         // KIP-1066: cordoned log dirs accept no new
                         // placements — moves included.
@@ -188,5 +207,122 @@ impl Handler for AlterReplicaLogDirsHandler {
         let mut out = BytesMut::new();
         arld::encode_response(&mut out, &resp, version)?;
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handlers::test_authz::{DenyAllAuthorizer, DenyOpAuthorizer};
+    use crate::topic_registry::{TopicMeta, TopicRegistry};
+    use kaas_auth::Authorizer;
+    use kaas_storage::engine::LogDirInfo;
+    use kaas_storage::{DiskStorageEngine, Fs, PartitionConfig, RealFs, StorageEngine};
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+    use std::str::FromStr;
+
+    fn conn() -> Mutex<ConnState> {
+        Mutex::new(ConnState::new(
+            "internal",
+            SocketAddr::from_str("127.0.0.1:9092").unwrap(),
+        ))
+    }
+
+    /// A two-root pool (`default` + `fast`) holding partition `t-0` on
+    /// the default root, with a sentinel file to follow across a move.
+    struct Pool {
+        _tmp: tempfile::TempDir,
+        src: PathBuf,
+        fast_root: PathBuf,
+        broker: Arc<Broker>,
+    }
+
+    async fn pool(authorizer: Arc<dyn Authorizer>) -> Pool {
+        let tmp = tempfile::tempdir().unwrap();
+        let default_root = tmp.path().join("data");
+        let fast_root = tmp.path().join("fast");
+        let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+        let engine = DiskStorageEngine::new(fs, default_root.clone(), PartitionConfig::default())
+            .with_extra_log_dirs(vec![LogDirInfo {
+                name: "fast".to_owned(),
+                path: fast_root.clone(),
+                default_eligible: true,
+                cordoned: false,
+                labels: Default::default(),
+            }]);
+        engine.create_partition("t", 0).await.unwrap();
+        let src = default_root.join("t/0");
+        std::fs::write(src.join("sentinel"), b"x").unwrap();
+        let topics = Arc::new(TopicRegistry::new());
+        topics.insert(TopicMeta {
+            name: "t".to_owned(),
+            partition_count: 1,
+            topic_id: [0; 16],
+        });
+        let engine: Arc<dyn StorageEngine> = Arc::new(engine);
+        let broker = Arc::new(Broker::with_auth(
+            engine,
+            topics,
+            "test",
+            0,
+            authorizer,
+            Arc::new(kaas_auth::NoQuotaChecker),
+        ));
+        Pool {
+            _tmp: tmp,
+            src,
+            fast_root,
+            broker,
+        }
+    }
+
+    async fn alter(p: &Pool, path: &std::path::Path) -> i16 {
+        let req = arld::Request {
+            dirs: vec![arld::RequestDir {
+                path: path.display().to_string(),
+                topics: vec![arld::RequestTopic {
+                    name: "t".to_owned(),
+                    partitions: vec![0],
+                }],
+            }],
+        };
+        let mut body = BytesMut::new();
+        arld::encode_request(&mut body, &req, 2).unwrap();
+        let h = AlterReplicaLogDirsHandler::new(p.broker.clone());
+        let out = h.handle(&conn(), 2, body.freeze()).await.unwrap();
+        let resp = arld::decode_response(&mut out.freeze(), 2).unwrap();
+        assert_eq!(resp.results.len(), 1);
+        assert_eq!(resp.results[0].topic_name, "t");
+        resp.results[0].partitions[0].error_code
+    }
+
+    /// gh #293: moving a partition between volumes needs `Alter` on the
+    /// cluster (Apache's literal 31). Denied, nothing is copied and the
+    /// source stays put — and the gate runs before path resolution, so
+    /// an unknown path is 31 too, not `LOG_DIR_NOT_FOUND`.
+    #[tokio::test]
+    async fn denied_alter_is_31_and_moves_nothing() {
+        for authorizer in [
+            Arc::new(DenyAllAuthorizer) as Arc<dyn Authorizer>,
+            Arc::new(DenyOpAuthorizer(Operation::Alter)),
+        ] {
+            let p = pool(authorizer).await;
+            let fast = p.fast_root.clone();
+            assert_eq!(alter(&p, &fast).await, 31);
+            assert_eq!(alter(&p, std::path::Path::new("/no/such/dir")).await, 31);
+            assert!(!p.fast_root.join("t/0").exists(), "partition copied");
+            assert!(p.src.join("sentinel").is_file(), "source touched");
+        }
+    }
+
+    /// Control: the gate asks for `Alter`, so a principal lacking only
+    /// `Describe` still moves the partition.
+    #[tokio::test]
+    async fn alter_on_the_cluster_moves_the_partition() {
+        let p = pool(Arc::new(DenyOpAuthorizer(Operation::Describe))).await;
+        let fast = p.fast_root.clone();
+        assert_eq!(alter(&p, &fast).await, 0);
+        assert!(p.fast_root.join("t/0/sentinel").is_file(), "not moved");
     }
 }
