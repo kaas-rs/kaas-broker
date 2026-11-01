@@ -57,9 +57,10 @@ To create a topic:
     partitions: 3
   EOF
 
-To inspect cluster state (Phase 6 mirror, refreshed within ~1s of every
-assignment change):
-  kubectl get kafkaclusterassignments {{ include "kaas.fullname" . }} -n {{ .Release.Namespace }} -o yaml
+To inspect cluster state, read the controller's assignment.json on the
+cluster-state volume (the KafkaClusterAssignments mirror was removed in
+v0.3.2-preview):
+  kubectl exec -n {{ .Release.Namespace }} {{ include "kaas.fullname" . }}-0 -- cat /data/__cluster/assignment.json
 
 Storage requirements
   ReadWriteMany volume with NFSv4-class semantics:

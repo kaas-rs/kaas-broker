@@ -23,14 +23,17 @@ rules:
   - apiGroups: [discovery.k8s.io]
     resources: [endpointslices]
     verbs: [get, list, watch]
-  # KafkaUser: admin-protocol writes only. Brokers don't watch the CR —
+  # KafkaUser: the admin-protocol paths. Brokers don't watch the CR —
   # they read the operator's acls.json / credentials.json off the
   # volume. CreateAcls/DeleteAcls (gh #107) get + replace (`update`)
-  # spec.authorization.acls; AlterUserScramCredentials (gh #252)
-  # patches spec.authentication.scram.
+  # spec.authorization.acls, and DescribeAcls/DeleteAcls `list` every
+  # user to match filters (acl_cr_writer.rs); AlterUserScramCredentials
+  # (gh #252) patches spec.authentication.scram. `list` was cut in
+  # v0.3.20 on the wrong belief that nothing listed users, which broke
+  # `kafka-acls.sh --list/--remove` until v0.3.34.
   - apiGroups: [kaas.rs]
     resources: [kafkausers]
-    verbs: [get, update, patch]
+    verbs: [get, list, update, patch]
   # KafkaTopic: brokers watch + manage. The watch covers the
   # operator-driven path (kubectl apply -f); create/delete cover
   # the admin-protocol path (gh #51) where Kafbat / kafka-topics.sh

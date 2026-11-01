@@ -83,7 +83,7 @@ The operator then materializes the change — partition directories,
 edited the CR yourself. This keeps one writer for on-disk state while
 still serving the Kafka admin surface. (It's also why broker RBAC
 carries write verbs on `kafkatopics` — `create`, `patch` and `delete` —
-plus `kafkatopics/status` and `get,update,patch` on `kafkausers`; see
+plus `kafkatopics/status` and `get,list,update,patch` on `kafkausers`; see
 [Kubernetes integration](./kubernetes.md).)
 
 ## The line not to cross

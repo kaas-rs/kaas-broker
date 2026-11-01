@@ -362,7 +362,7 @@ observability:
 #   - `authentication.type`: "none" (ANONYMOUS principal) /
 #     "scram-sha-512" (SASL/SCRAM, RealAuthEngine wired) /
 #     "mtls" (requires tls: true; broker extracts CN as principal)
-#     / "plain" (SASL/PLAIN against the ServiceAccount JWT path)
+#     / "plain" (SASL/PLAIN against credentials.json, like SCRAM)
 #     / "oauth" (SASL/OAUTHBEARER, gh #42: JWTs validated against an
 #     OIDC issuer's JWKS — see the disabled `oauth` example below).
 #
