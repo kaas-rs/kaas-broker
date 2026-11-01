@@ -216,9 +216,11 @@ Lists which SCRAM mechanisms a user has credentials for —
 `CLUSTER_AUTHORIZATION_FAILED` (31)), then answer from the live credential
 store — the operator-materialised `credentials.json`, hot-reloaded, so the
 response reflects the store the SCRAM authenticator actually verifies
-against. A null `users` array describes every user with SCRAM credentials;
-a named user without any answers a per-user `RESOURCE_NOT_FOUND` (83); a
-user named twice answers `DUPLICATE_RESOURCE` (81) — all Apache's shapes.
+against. A null or empty `users` array describes every user with SCRAM
+credentials (an empty one described nobody until gh #276);
+a named user without any answers a per-user `RESOURCE_NOT_FOUND` (91); a
+user named twice answers `DUPLICATE_RESOURCE` (92) — all Apache's shapes
+(both codes went out as 83 / 81 until gh #276).
 Only mechanism + iteration count are reported, never salts or keys.
 
 **Deviations from Apache 3.7**:
@@ -249,7 +251,7 @@ derives the RFC 5802 stored/server keys and patches them into
 `KafkaUser.spec.authentication.scram`. The operator materialises the change
 into `credentials.json` on reconcile and every broker hot-reloads it, so
 the rotation is **asynchronous** (typically a few seconds) and cluster-wide.
-The CR must already exist (`RESOURCE_NOT_FOUND` (83) otherwise) and its
+The CR must already exist (`RESOURCE_NOT_FOUND` (91) otherwise) and its
 `authentication.type` must be `scram-sha-512` or unset — rotating a `tls`
 user's SCRAM credential would silently flip its auth mechanism, so that
 answers `INVALID_REQUEST` (42). Iterations below 4096 or empty
