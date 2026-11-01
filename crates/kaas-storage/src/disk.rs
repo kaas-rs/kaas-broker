@@ -704,6 +704,11 @@ impl StorageEngine for DiskStorageEngine {
 /// all-or-nothing from the placement record's point of view (the
 /// record only flips after this returns Ok — NFS rule 2: the compound
 /// op is idempotent and re-drivable).
+/// Copy a partition directory to its new root. Returns only once the
+/// copy is durable (gh #231): the caller flips the placement record and
+/// then deletes the source, so a copy still in the page cache — ext4's
+/// delayed allocation writes a fresh file's blocks seconds later — would
+/// let a crash in that window lose the partition on both roots.
 fn copy_dir_fresh(src: &Path, dst: &Path) -> Result<(), StorageError> {
     if dst.exists() {
         std::fs::remove_dir_all(dst)?;
@@ -711,22 +716,44 @@ fn copy_dir_fresh(src: &Path, dst: &Path) -> Result<(), StorageError> {
     if !src.exists() {
         // Empty partition (never opened): nothing to copy; the target
         // dir is created so the opener finds a valid home.
-        std::fs::create_dir_all(dst)?;
+        create_dir_all_durable(dst)?;
         return Ok(());
     }
+    create_dir_all_durable(dst)?;
     copy_dir_recursive(src, dst)?;
     Ok(())
 }
 
+/// Copy `src` into the existing directory `dst`, fsyncing every file and,
+/// once its entries are written, `dst` itself.
 fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)?.flatten() {
         let ty = entry.file_type()?;
         let to = dst.join(entry.file_name());
         if ty.is_dir() {
+            std::fs::create_dir(&to)?;
             copy_dir_recursive(&entry.path(), &to)?;
         } else if ty.is_file() {
             std::fs::copy(entry.path(), &to)?;
+            crate::fs::fsync_path(&to)?;
+        }
+    }
+    crate::fs::fsync_dir(dst)
+}
+
+/// `create_dir_all`, then fsync the parent of every directory it had to
+/// create, so the new entries survive a crash on a local filesystem.
+fn create_dir_all_durable(dir: &Path) -> std::io::Result<()> {
+    let mut missing = Vec::new();
+    let mut cur = Some(dir);
+    while let Some(d) = cur.filter(|d| !d.exists()) {
+        missing.push(d.to_path_buf());
+        cur = d.parent();
+    }
+    std::fs::create_dir_all(dir)?;
+    for d in &missing {
+        if let Some(parent) = d.parent() {
+            crate::fs::fsync_dir(parent)?;
         }
     }
     Ok(())
@@ -745,6 +772,23 @@ mod tests {
             .enable_all()
             .build()
             .unwrap()
+    }
+
+    /// gh #231: the migration copy reproduces nested contents under a
+    /// target whose ancestors don't exist yet (a topic's first partition
+    /// on a new pool root), and leaves the source alone.
+    #[test]
+    fn copy_dir_fresh_copies_nested_contents_under_new_ancestors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("default/t/0");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("manifest.json"), b"{}").unwrap();
+        std::fs::write(src.join("sub/x.log"), b"abc").unwrap();
+        let dst = tmp.path().join("fast/t/0");
+        copy_dir_fresh(&src, &dst).unwrap();
+        assert_eq!(std::fs::read(dst.join("manifest.json")).unwrap(), b"{}");
+        assert_eq!(std::fs::read(dst.join("sub/x.log")).unwrap(), b"abc");
+        assert!(src.join("sub/x.log").exists());
     }
 
     /// Build a v2 batch carrying (num_records). Producer ID = -1
