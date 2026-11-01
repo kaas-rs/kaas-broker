@@ -160,8 +160,10 @@ gh #268); the topic exists and the partition is inside its count (else
 `assignment.json` (else `NOT_LEADER_OR_FOLLOWER`, 6). The leadership gate is
 skipped for `replica_id = -2`, Apache's debugging replica, which any broker
 may answer. The handler then translates the request timestamp: `-2` (EARLIEST) returns the partition's
-`log_start_offset`, `-1` (LATEST) returns the high watermark — both echoed
-with `timestamp = -1`, matching Apache's sentinel-response shape. Any other
+`log_start_offset`, `-1` (LATEST) returns the last offset the client may
+fetch — the last stable offset for `read_committed`, the high watermark
+otherwise (gh #296) — both echoed with `timestamp = -1`, matching Apache's
+sentinel-response shape. Any other
 timestamp is passed to the engine's `offset_for_timestamp`.
 
 **Deviations from Apache 3.7**:
@@ -174,9 +176,6 @@ timestamp is passed to the engine's `offset_for_timestamp`.
   `MAX_TIMESTAMP` (`-3`, nominally in the registered v7 range) — gets
   `offset = -1, timestamp = -1` with `error_code = 0`. Only the `-1`/`-2`
   sentinels resolve.
-- `isolation_level` is decoded but ignored: LATEST returns the high
-  watermark even for `read_committed` clients, where Apache returns the last
-  stable offset.
 - The tiered-storage-only sentinels (`EARLIEST_LOCAL_TIMESTAMP`,
   `EARLIEST_PENDING_UPLOAD_OFFSET`) are deliberately unsupported — clients
   only send them when configured for a remote tier
@@ -191,7 +190,8 @@ lookup in `crates/kaas-storage/src/disk.rs`.
 **Verified by**: handler unit tests `latest_returns_high_watermark`,
 `earliest_returns_log_start_offset`, `unknown_topic_returns_3`,
 `topic_without_describe_returns_29_existing_or_not`,
-`existence_and_range_before_leadership`. Shell suite:
+`existence_and_range_before_leadership`,
+`latest_is_the_lso_for_read_committed`. Shell suite:
 `scripts/kafka-get-offsets.sh` (exercises the `-2`/`-1` sentinels before and
 after producing — the paths clients actually use).
 

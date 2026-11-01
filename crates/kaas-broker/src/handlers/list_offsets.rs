@@ -2,7 +2,8 @@
 //!
 //! Translates special timestamps to engine queries:
 //! - `-2` (EARLIEST) → `log_start_offset`
-//! - `-1` (LATEST)   → `high_watermark`
+//! - `-1` (LATEST)   → the last fetchable offset: `last_stable_offset`
+//!   for a `read_committed` client, `high_watermark` otherwise (gh #296)
 //! - otherwise       → `engine.offset_for_timestamp(ts)`
 //!
 //! Gates run per partition, as in Apache's `handleListOffsetRequest` and
@@ -36,6 +37,8 @@ const TS_EARLIEST: i64 = -2;
 const TS_LATEST: i64 = -1;
 /// `ListOffsetsRequest.DEBUGGING_REPLICA_ID`: answered from any broker.
 const DEBUGGING_REPLICA_ID: i32 = -2;
+/// `IsolationLevel.READ_COMMITTED` (request v2+).
+const READ_COMMITTED: i8 = 1;
 
 #[derive(Debug)]
 pub struct ListOffsetsHandler {
@@ -72,7 +75,7 @@ impl Handler for ListOffsetsHandler {
             let mut parts = Vec::with_capacity(t.partitions.len());
             for p in &t.partitions {
                 parts.push(if authorized {
-                    self.resolve_one(&t.name, p, req.replica_id)
+                    self.resolve_one(&t.name, p, &req)
                 } else {
                     error_partition(p.partition_index, ERR_TOPIC_AUTHZ_FAILED)
                 });
@@ -98,7 +101,7 @@ impl ListOffsetsHandler {
         &self,
         topic: &str,
         p: &list_offsets::Partition,
-        replica_id: i32,
+        req: &list_offsets::Request,
     ) -> list_offsets::PartitionResponse {
         if !self
             .broker
@@ -108,7 +111,7 @@ impl ListOffsetsHandler {
         {
             return error_partition(p.partition_index, ERR_UNKNOWN_TOPIC_OR_PARTITION);
         }
-        if replica_id != DEBUGGING_REPLICA_ID {
+        if req.replica_id != DEBUGGING_REPLICA_ID {
             if let Some(c) = self.broker.coordinator() {
                 if !c.owns(topic, p.partition_index) {
                     return error_partition(p.partition_index, ERR_NOT_LEADER_OR_FOLLOWER);
@@ -124,13 +127,17 @@ impl ListOffsetsHandler {
                     .unwrap_or(0);
                 (-1, off)
             }
+            // Apache's `fetchOffsetForTimestamp`: LATEST is the last
+            // offset this client may fetch. A read_committed client must
+            // not be pointed past an open transaction's first record.
             TS_LATEST => {
-                let off = self
-                    .broker
-                    .engine
-                    .high_watermark(topic, p.partition_index)
-                    .unwrap_or(0);
-                (-1, off)
+                let engine = &self.broker.engine;
+                let off = if req.isolation_level == READ_COMMITTED {
+                    engine.last_stable_offset(topic, p.partition_index)
+                } else {
+                    engine.high_watermark(topic, p.partition_index)
+                };
+                (-1, off.unwrap_or(0))
             }
             ts => match self
                 .broker
@@ -349,5 +356,63 @@ mod tests {
         // The debugging replica may ask any broker, but never for a
         // partition that doesn't exist.
         assert_eq!(codes(DEBUGGING_REPLICA_ID).await, [0, 0, 3, 3, 3]);
+    }
+
+    /// gh #296: LATEST is the last fetchable offset. An open transaction
+    /// holds the LSO at its first record (offset 1 here, after one plain
+    /// batch), so read_committed gets 1 while read_uncommitted gets the
+    /// high watermark, 2.
+    #[tokio::test]
+    async fn latest_is_the_lso_for_read_committed() {
+        use kaas_storage::{DiskStorageEngine, Fs, PartitionConfig, RealFs};
+        let tmp = tempfile::tempdir().unwrap();
+        let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+        let engine: Arc<dyn StorageEngine> = Arc::new(DiskStorageEngine::new(
+            fs,
+            tmp.path().to_path_buf(),
+            PartitionConfig::default(),
+        ));
+        engine.create_partition("t", 0).await.unwrap();
+        // One plain batch, then a transactional data batch left open.
+        for (attrs, pid, seq) in [(0i16, -1i64, -1i32), (0x10, 7, 0)] {
+            let mut b = crate::control_batch::build_control_batch(pid, 0, true, 0);
+            b[21..23].copy_from_slice(&attrs.to_be_bytes());
+            b[53..57].copy_from_slice(&seq.to_be_bytes());
+            let crc = kaas_codec::crc::compute(&b[21..]);
+            b[17..21].copy_from_slice(&crc.to_be_bytes());
+            engine.append("t", 0, 0, -1, Bytes::from(b)).await.unwrap();
+        }
+        assert_eq!(engine.high_watermark("t", 0).unwrap(), 2);
+        assert_eq!(engine.last_stable_offset("t", 0).unwrap(), 1);
+
+        let topics = Arc::new(TopicRegistry::new());
+        topics.insert(TopicMeta {
+            name: "t".to_owned(),
+            partition_count: 1,
+            topic_id: [0; 16],
+        });
+        let h = ListOffsetsHandler::new(Arc::new(Broker::new(engine, topics, "test", 0)));
+        for (isolation_level, want) in [(0, 2), (READ_COMMITTED, 1)] {
+            let req = list_offsets::Request {
+                replica_id: -1,
+                isolation_level,
+                topics: vec![list_offsets::Topic {
+                    name: "t".to_owned(),
+                    partitions: vec![list_offsets::Partition {
+                        partition_index: 0,
+                        current_leader_epoch: -1,
+                        timestamp: TS_LATEST,
+                    }],
+                }],
+            };
+            let out = h.handle(&conn(), 6, encode_v6(&req)).await.unwrap();
+            let resp = list_offsets::decode_response(&mut out.freeze(), 6).unwrap();
+            let p = &resp.topics[0].partitions[0];
+            assert_eq!(
+                (p.error_code, p.offset),
+                (0, want),
+                "isolation {isolation_level}"
+            );
+        }
     }
 }
