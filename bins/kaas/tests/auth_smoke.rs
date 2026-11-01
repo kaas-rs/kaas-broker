@@ -24,6 +24,7 @@ use kaas_auth::{
     AclEngine, AuthEngine, Authorizer, CredentialLoader, PrincipalMapper, QuotaChecker,
     QuotaEnforcer, Quotas,
 };
+use kaas_broker::topic_cr_writer::{ConfigOpWithValue, TopicCRWriter, TopicWriteError};
 use kaas_broker::{
     ApiVersionsHandler, Broker, FetchHandler, InitProducerIdHandler, ListOffsetsHandler,
     ListenerEntry, MetadataHandler, ProduceHandler, SaslAuthenticateHandler, SaslHandshakeHandler,
@@ -32,7 +33,7 @@ use kaas_broker::{
 use kaas_codec::api::common::{
     write_array_len, write_nullable_bytes, write_nullable_str, write_str,
 };
-use kaas_codec::api::{produce, sasl_authenticate, sasl_handshake};
+use kaas_codec::api::{metadata, produce, sasl_authenticate, sasl_handshake};
 use kaas_codec::headers::{encode_request_header, HeaderVersion};
 use kaas_codec::primitives::{write_bytes, write_compact_bytes, write_i16, write_i32};
 use kaas_codec::tagged;
@@ -178,6 +179,15 @@ fn build_dispatcher(
     listeners: &[ListenerEntry],
     engines: Arc<PerListenerAuthEngine>,
 ) -> Arc<Dispatcher> {
+    build_dispatcher_with(broker, listeners, engines, false)
+}
+
+fn build_dispatcher_with(
+    broker: Arc<Broker>,
+    listeners: &[ListenerEntry],
+    engines: Arc<PerListenerAuthEngine>,
+    auto_create_topics: bool,
+) -> Arc<Dispatcher> {
     let mut d = Dispatcher::new();
     d.register(0, 3, 9, Arc::new(ProduceHandler::new(broker.clone())));
     d.register(1, 4, 12, Arc::new(FetchHandler::new(broker.clone())));
@@ -186,7 +196,9 @@ fn build_dispatcher(
         3,
         1,
         10,
-        Arc::new(MetadataHandler::new(broker.clone(), listeners)),
+        Arc::new(
+            MetadataHandler::new(broker.clone(), listeners).with_auto_create(auto_create_topics, 3),
+        ),
     );
     d.register(
         17,
@@ -552,4 +564,121 @@ async fn drive_scram_to_done(sock: &mut TcpStream) {
     let mut b = body;
     let r = sasl_authenticate::decode_response(&mut b, 2).unwrap();
     assert_eq!(r.error_code, 0, "SASL must complete");
+}
+
+/// Records every `create_topic` call, so a test can see whether
+/// Metadata minted a `KafkaTopic` CR.
+#[derive(Debug, Default)]
+struct RecordingCrWriter {
+    created: parking_lot::Mutex<Vec<(String, i32)>>,
+}
+
+#[async_trait::async_trait]
+impl TopicCRWriter for RecordingCrWriter {
+    async fn create_topic(
+        &self,
+        name: &str,
+        partitions: i32,
+        _configs: &[(String, String)],
+    ) -> Result<(), TopicWriteError> {
+        self.created.lock().push((name.to_owned(), partitions));
+        Ok(())
+    }
+    async fn expand_topic(&self, _: &str, _: i32) -> Result<(), TopicWriteError> {
+        unreachable!("Metadata never expands a topic")
+    }
+    async fn update_topic_config(
+        &self,
+        _: &str,
+        _: &[ConfigOpWithValue],
+    ) -> Result<(), TopicWriteError> {
+        unreachable!("Metadata never edits topic config")
+    }
+    async fn delete_topic(&self, _: &str) -> Result<(), TopicWriteError> {
+        unreachable!("Metadata never deletes a topic")
+    }
+    async fn set_partition_log_dir(&self, _: &str, _: i32, _: &str) -> Result<(), TopicWriteError> {
+        unreachable!("Metadata never moves a partition")
+    }
+}
+
+/// Metadata v9 for one topic, asking the broker to auto-create it.
+fn metadata_frame_v9_auto_create(topic: &str, correlation_id: i32) -> Vec<u8> {
+    let mut w = header(3, 9, correlation_id, HeaderVersion::V2);
+    write_array_len(&mut w, 1, true).unwrap();
+    write_str(&mut w, topic, true).unwrap();
+    tagged::write_empty(&mut w); // topic tag
+    w.extend_from_slice(&[1, 0, 0]); // allow_auto_topic_creation, both include_* flags
+    tagged::write_empty(&mut w); // request tag
+    w.to_vec()
+}
+
+/// gh #244: auto-creation's `Create` check is the guard whose regression
+/// is a security bug. Metadata would mint topics CreateTopics refuses.
+/// The handler unit test pins its logic against a stub authorizer; this
+/// drives it over TCP as a SCRAM-authenticated principal against the
+/// real ACL engine, which is where `Write` implies `Describe` but not
+/// `Create`.
+#[tokio::test]
+async fn metadata_auto_create_requires_the_create_acl() {
+    let creds = loader_with_alice();
+    let (engines, _, quotas) = build_auth(creds);
+    let acls = AclEngine::new("/tmp/auth-smoke-auto-create-acl");
+    acls.install_for_test(
+        r#"{"acls":[
+            {"principal":"User:alice",
+             "resource":{"type":"topic","name":"writable","patternType":"literal"},
+             "operations":["Write"],"permission":"Allow"},
+            {"principal":"User:alice",
+             "resource":{"type":"topic","name":"creatable","patternType":"literal"},
+             "operations":["Create","Describe"],"permission":"Allow"}]}"#,
+    );
+    let broker = broker_with(&[], Arc::new(acls), quotas);
+    let writer = Arc::new(RecordingCrWriter::default());
+    broker.install_cr_writer(writer.clone());
+    let listeners = vec![ListenerEntry {
+        name: "authed".to_owned(),
+        addr: "127.0.0.1:0".to_owned(),
+        advertised_host: Some("127.0.0.1".to_owned()),
+        tls: None,
+        authentication_type: Some("scram-sha-512".to_owned()),
+        oauth: None,
+    }];
+    let dispatcher = build_dispatcher_with(broker, &listeners, engines, true);
+    let (cancel, port) = spawn_server(dispatcher).await;
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    drive_scram_to_done(&mut sock).await;
+
+    let mut topic_error = async |topic: &str, correlation_id: i32| {
+        let resp = send(
+            &mut sock,
+            &metadata_frame_v9_auto_create(topic, correlation_id),
+        )
+        .await;
+        let mut b = strip_response_header(&resp, HeaderVersion::V2);
+        let r = metadata::decode_response(&mut b, 9).unwrap();
+        assert_eq!(r.topics.len(), 1);
+        assert_eq!(r.topics[0].name, topic);
+        r.topics[0].error_code
+    };
+
+    // Describe (implied by Write) but no Create: refused, nothing minted.
+    assert_eq!(topic_error("writable", 30).await, 29);
+    // No ACL at all: refused at Describe, before Create is considered.
+    assert_eq!(topic_error("ungranted", 31).await, 29);
+    assert!(
+        writer.created.lock().is_empty(),
+        "a principal without Create must not mint a KafkaTopic CR: {:?}",
+        writer.created.lock()
+    );
+
+    // Create granted: the CR is minted and the client told to retry.
+    assert_eq!(
+        topic_error("creatable", 32).await,
+        5,
+        "LEADER_NOT_AVAILABLE"
+    );
+    assert_eq!(*writer.created.lock(), [("creatable".to_owned(), 3)]);
+
+    cancel.cancel();
 }

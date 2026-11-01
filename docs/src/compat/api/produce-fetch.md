@@ -239,12 +239,18 @@ Auto-creation's `Create` check runs only for a topic that passed `Describe`.
 callback in `bins/kaas/src/main.rs`.
 
 **Verified by**: handler unit tests `per_listener_port_echoed_back`,
-`returns_self_as_only_broker_and_leader`, `empty_topic_list_returns_all_known`,
+`returns_self_as_only_broker_and_leader`, `null_topic_list_returns_all_known`,
+`empty_topic_list_returns_brokers_and_no_topics`,
+`v10_rejects_a_topic_named_only_by_id`,
 `unknown_topic_returns_per_topic_error_3`,
 `all_topics_omits_what_the_principal_cannot_describe`,
 `named_topic_without_describe_is_29_existing_or_not`,
-`auto_create_checks_describe_before_create`;
+`auto_create_checks_describe_before_create`; the codec's byte-pinned
+null/empty request tests (gh #274);
 `crates/kaas-broker/tests/discovery_and_group_authz.rs` (the gh #268
 live-cluster ACL, end to end);
+`metadata_auto_create_requires_the_create_acl` in
+`bins/kaas/tests/auth_smoke.rs` (auto-create's `Create` guard over TCP, as a
+SCRAM principal against the real ACL engine, gh #244);
 `produce_fetch_metadata_roundtrip` in `bins/kaas/tests/smoke.rs`. Shell
 suite: `scripts/kafka-topics.sh` (`--list` / `--describe` ride Metadata).
