@@ -184,10 +184,15 @@ fn read_snapshot(
         out.extend_from_slice(&chunk);
     }
 
-    // Cap to max_bytes (read_batches may overshoot the last batch).
-    if out.len() > max_bytes {
-        out.truncate(max_bytes);
-    }
+    // read_batches returns whole batches and may overshoot by the last
+    // one; trim back to whole batches within max_bytes — but never below
+    // the first batch. KIP-74: a batch larger than the limit is returned
+    // whole, or the consumer could never get past it. Cutting it to
+    // max_bytes (until gh #287) left read_uncommitted consumers failing
+    // "Failed to make progress" and read_committed ones stalled with no
+    // records and no error.
+    let keep = segment::whole_batches_within(&out, max_bytes);
+    out.truncate(keep);
 
     Ok(out.freeze())
 }
@@ -1158,10 +1163,10 @@ impl Partition {
             .unwrap_or(guard.high_water)
     }
 
-    /// gh #176 — aborted transactions whose first-offset falls in
-    /// `[start_offset, end_offset)`. Used to populate the Fetch
-    /// response's `AbortedTransactions[]` list for `read_committed`
-    /// consumers.
+    /// gh #176 — aborted transactions that overlap `[start_offset,
+    /// end_offset)` (Apache's `collectAbortedTxns` rule, gh #277). Used to
+    /// populate the Fetch response's `AbortedTransactions[]` list for
+    /// `read_committed` consumers.
     pub fn aborted_in_range(&self, start_offset: i64, end_offset: i64) -> Vec<AbortedTxn> {
         let guard = self.inner.lock();
         guard.aborted_txns.in_range(start_offset, end_offset)
@@ -3630,6 +3635,33 @@ mod tests {
                 "an unverified checkpoint must not drive the torn-tail truncation"
             );
             p2.close().await.unwrap();
+        });
+    }
+
+    /// gh #287 (KIP-74): a batch larger than the fetch limit comes back
+    /// whole. Cut to the limit, the consumer could never get past it.
+    #[test]
+    fn a_batch_larger_than_max_bytes_is_returned_whole() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Partition::open(
+                fs,
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            let big = build_batch(1, 1_000); // 77 bytes
+            p.append(0, -1, big.clone()).await.unwrap();
+            p.append(0, -1, build_batch(1, 2_000)).await.unwrap();
+            let got = p.read(0, 50).await.unwrap();
+            assert_eq!(got.len(), big.len(), "the first batch, whole, and only it");
+            let got = p.read(0, 1 << 20).await.unwrap();
+            assert_eq!(got.len(), 2 * big.len());
+            p.close().await.unwrap();
         });
     }
 

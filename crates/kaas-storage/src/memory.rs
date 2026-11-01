@@ -147,6 +147,10 @@ impl StorageEngine for MemoryStorage {
             if b.base_offset + i64::from(b.last_offset_delta) < guard.log_start {
                 continue;
             }
+            // Whole batches only, at least the first (KIP-74, gh #287).
+            if !out.is_empty() && out.len() + b.raw.len() > max_bytes {
+                break;
+            }
             out.extend_from_slice(&b.raw);
             if out.len() >= max_bytes {
                 break;

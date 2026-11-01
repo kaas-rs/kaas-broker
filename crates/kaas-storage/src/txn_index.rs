@@ -243,7 +243,7 @@ mod tests {
     }
 
     #[test]
-    fn in_range_filters_by_first_offset() {
+    fn in_range_selects_only_overlapping_txns() {
         let mut idx = AbortedTxnIndex::new();
         idx.record(aborted(1, 100, 101));
         idx.record(aborted(2, 200, 201));

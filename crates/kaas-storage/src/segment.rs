@@ -195,6 +195,26 @@ pub fn list_segments(fs: &dyn Fs, dir: &Path) -> io::Result<Vec<SegmentMeta>> {
 /// Returns `(base_offset, last_offset_delta, max_timestamp)`. Reads
 /// only the first 43 bytes of the batch — records payload is never
 /// touched. Byte-opacity preserved.
+/// Bytes of the longest prefix of whole batches in `batches` that fits in
+/// `max_bytes` — but at least the first batch, whatever its size (KIP-74,
+/// gh #287). A trailing partial batch is never counted.
+pub fn whole_batches_within(batches: &[u8], max_bytes: usize) -> usize {
+    let mut end = 0usize;
+    while let Some(head) = batches.get(end..end + 12) {
+        let mut len4 = [0u8; 4];
+        len4.copy_from_slice(&head[8..12]);
+        let Ok(len) = usize::try_from(i32::from_be_bytes(len4)) else {
+            break;
+        };
+        let next = end + 12 + len;
+        if next > batches.len() || (end > 0 && next > max_bytes) {
+            break;
+        }
+        end = next;
+    }
+    end
+}
+
 /// Records in a run of concatenated v2 batches, from each header's
 /// `lastOffsetDelta + 1` — the same derivation the produce metric uses
 /// (gh #218), reading headers only. Stops at a batch too short to hold
@@ -1082,6 +1102,34 @@ mod tests {
         buf[35..43].copy_from_slice(&max_timestamp.to_be_bytes());
         crate::segment::stamp_crc(&mut buf);
         buf
+    }
+
+    /// gh #287: whole batches within the limit, at least the first whole
+    /// one however big, and never a trailing partial batch.
+    #[test]
+    fn whole_batches_within_keeps_the_first_batch_and_whole_batches_only() {
+        let a = build_batch(0, 0, 0, 40); // 101 bytes
+        let b = build_batch(1, 0, 0, 10); // 71 bytes
+        let mut run = a.clone();
+        run.extend(&b);
+        assert_eq!(
+            whole_batches_within(&run, 50),
+            a.len(),
+            "first batch kept whole"
+        );
+        assert_eq!(
+            whole_batches_within(&run, 150),
+            a.len(),
+            "second doesn't fit"
+        );
+        assert_eq!(whole_batches_within(&run, 172), a.len() + b.len());
+        run.extend(&b[..20]);
+        assert_eq!(
+            whole_batches_within(&run, 10_000),
+            a.len() + b.len(),
+            "partial tail dropped"
+        );
+        assert_eq!(whole_batches_within(&[], 10), 0);
     }
 
     /// gh #261 follow-up: the fetch metric counts records from batch

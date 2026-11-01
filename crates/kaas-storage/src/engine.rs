@@ -372,10 +372,10 @@ pub trait StorageEngine: Send + Sync + 'static {
         self.high_watermark(topic, partition)
     }
 
-    /// gh #176 — aborted transactions whose first-offset falls in
-    /// `[start_offset, end_offset)`. `read_committed` Fetch handler
-    /// uses this to build the response's `AbortedTransactions[]`
-    /// list. Default returns an empty list.
+    /// gh #176 — aborted transactions that overlap `[start_offset,
+    /// end_offset)` (Apache's `collectAbortedTxns` rule, gh #277). The
+    /// `read_committed` Fetch handler uses this to build the response's
+    /// `AbortedTransactions[]` list. Default returns an empty list.
     fn aborted_transactions_in_range(
         &self,
         _topic: &str,
