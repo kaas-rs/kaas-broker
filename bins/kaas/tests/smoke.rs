@@ -106,13 +106,23 @@ async fn send(sock: &mut TcpStream, body: &[u8]) -> Vec<u8> {
 }
 
 fn produce_v9_request(topic: &str, partition: i32, batch: &[u8]) -> Vec<u8> {
+    produce_v9_request_with_acks(topic, partition, batch, -1, 1)
+}
+
+fn produce_v9_request_with_acks(
+    topic: &str,
+    partition: i32,
+    batch: &[u8],
+    acks: i16,
+    correlation_id: i32,
+) -> Vec<u8> {
     let mut body = BytesMut::new();
     encode_request_header(
         &mut body,
         &RequestHeader {
             api_key: 0,
             api_version: 9,
-            correlation_id: 1,
+            correlation_id,
             client_id: Some("smoke".to_owned()),
         },
         HeaderVersion::V2,
@@ -120,7 +130,7 @@ fn produce_v9_request(topic: &str, partition: i32, batch: &[u8]) -> Vec<u8> {
     .unwrap();
     // request body
     write_nullable_str(&mut body, None, true).unwrap(); // transactional_id
-    write_i16(&mut body, -1); // acks
+    write_i16(&mut body, acks);
     write_i32(&mut body, 1000); // timeout_ms
     write_array_len(&mut body, 1, true).unwrap();
     write_str(&mut body, topic, true).unwrap();
@@ -326,4 +336,83 @@ async fn produce_fetch_metadata_roundtrip() {
     cancel.cancel();
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server_task).await;
     broker.engine.drain().await.unwrap();
+}
+
+/// Write one request frame without waiting for a response.
+async fn send_only(sock: &mut TcpStream, body: &[u8]) {
+    let len = i32::try_from(body.len()).unwrap();
+    sock.write_all(&len.to_be_bytes()).await.unwrap();
+    sock.write_all(body).await.unwrap();
+    sock.flush().await.unwrap();
+}
+
+/// gh #200: Apache answers an acks=0 Produce with nothing, and closes the
+/// connection when a partition failed. A response the client isn't
+/// waiting for is read as the answer to its next request — the Java
+/// client fails the correlation-id check and drops the connection.
+#[tokio::test]
+async fn acks_zero_produce_is_not_answered_and_a_failed_one_closes() {
+    let topic = "events";
+    let listeners = vec![ListenerEntry {
+        name: "internal".to_owned(),
+        addr: "127.0.0.1:0".to_owned(),
+        advertised_host: Some("127.0.0.1".to_owned()),
+        tls: None,
+        authentication_type: None,
+        oauth: None,
+    }];
+    let broker = build_test_broker(topic, 1);
+    let server = Server::new(
+        ServerConfigBuilder::new(vec![ListenerConfig {
+            name: "internal".to_owned(),
+            addr: "127.0.0.1:0".parse().unwrap(),
+            pre_bound: None,
+            tls_config: None,
+            mtls: None,
+        }]),
+        build_dispatcher(broker.clone(), &listeners),
+    );
+    let (bound, dispatcher) = server.bind().await.unwrap();
+    let port = bound.local_addrs()[0].1.port();
+    let cancel = CancellationToken::new();
+    let serve_cancel = cancel.clone();
+    let server_task = tokio::spawn(async move { bound.serve(dispatcher, serve_cancel).await });
+
+    let mut sock = TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+    let batch = build_record_batch(2, 1_700_000_000_000);
+    send_only(
+        &mut sock,
+        &produce_v9_request_with_acks(topic, 0, &batch, 0, 77),
+    )
+    .await;
+    // The next frame on the wire must answer the Metadata request.
+    let resp = send(&mut sock, &metadata_v9_request(topic)).await;
+    assert_eq!(
+        i32::from_be_bytes(resp[..4].try_into().unwrap()),
+        3,
+        "the first response must be Metadata's, not the acks=0 Produce's"
+    );
+    assert_eq!(
+        broker.engine.high_watermark(topic, 0).unwrap(),
+        2,
+        "the acks=0 batch was still appended"
+    );
+
+    // A failed acks=0 Produce: no response, the connection closes.
+    send_only(
+        &mut sock,
+        &produce_v9_request_with_acks("no-such-topic", 0, &batch, 0, 78),
+    )
+    .await;
+    let mut buf = [0u8; 4];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(5), sock.read(&mut buf))
+        .await
+        .expect("the broker must close, not hang");
+    assert!(
+        matches!(read, Ok(0) | Err(_)),
+        "expected EOF, got {read:?} {buf:?}"
+    );
+
+    cancel.cancel();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(5), server_task).await;
 }

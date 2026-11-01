@@ -15,7 +15,7 @@ pub mod dispatch;
 pub mod frame;
 pub mod server;
 
-pub use connstate::{ConnState, Principal};
+pub use connstate::{ConnState, Principal, Reply};
 pub use dispatch::{
     is_pre_auth, Dispatcher, Handler, HandlerError, ERR_CLUSTER_AUTHORIZATION_FAILED,
     ERR_UNSUPPORTED_VERSION, PRE_AUTH_KEYS,

@@ -22,7 +22,7 @@ use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::connstate::ConnState;
+use crate::connstate::{ConnState, Reply};
 use crate::dispatch::Dispatcher;
 use crate::frame::{Connection, ProtoError};
 
@@ -381,6 +381,13 @@ where
                 };
                 let correlation_id = hdr.correlation_id;
                 let (body, hv) = dispatcher.dispatch(state.as_ref(), hdr, body).await;
+                // gh #200: a handler can ask for no response, or for the
+                // connection to be closed instead of answered.
+                match std::mem::take(&mut state.lock().reply) {
+                    Reply::Send => {}
+                    Reply::None => continue,
+                    Reply::Close => return Ok(()),
+                }
                 if let Err(e) = conn.write_response(correlation_id, &body, hv).await {
                     error!(%e, "response write failed; closing connection");
                     return Err(e);

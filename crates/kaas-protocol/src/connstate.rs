@@ -47,6 +47,27 @@ pub struct ConnState {
     /// it the dispatcher serves only the SASL APIs until the client
     /// re-authenticates. `None` = unbounded session.
     pub session_deadline: Option<std::time::Instant>,
+    /// What the request loop does with the response of the request being
+    /// handled. A handler sets it; the loop takes it (resetting it to
+    /// [`Reply::Send`]) after every dispatch.
+    pub reply: Reply,
+}
+
+/// How the request loop answers one request (gh #200).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Reply {
+    /// Write the response. Every API but `acks=0` Produce.
+    #[default]
+    Send,
+    /// Write nothing: the client doesn't expect a response. Apache's
+    /// `acks=0` Produce, when every partition succeeded. A response the
+    /// Java client isn't waiting for gets matched against its next
+    /// in-flight request and fails the correlation-id check.
+    None,
+    /// Write nothing and close the connection. Apache's `acks=0` Produce
+    /// with any partition error: the disconnect is the only way to tell
+    /// the producer, which then refreshes its metadata.
+    Close,
 }
 
 impl ConnState {
@@ -60,6 +81,7 @@ impl ConnState {
             sasl_mechanism: None,
             sasl_state: None,
             session_deadline: None,
+            reply: Reply::Send,
         }
     }
 }

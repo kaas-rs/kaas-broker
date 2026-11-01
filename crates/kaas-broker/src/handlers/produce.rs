@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use kaas_auth::{Operation, Principal, Resource};
 use kaas_codec::api::produce;
-use kaas_protocol::{ConnState, Handler, HandlerError};
+use kaas_protocol::{ConnState, Handler, HandlerError, Reply};
 use kaas_storage::StorageError;
 use parking_lot::Mutex;
 
@@ -105,6 +105,19 @@ impl Handler for ProduceHandler {
             .broker
             .quotas
             .check_produce_quota(&principal, total_bytes);
+
+        // gh #200: an acks=0 producer reads no response, so Apache sends
+        // none — and when a partition failed, closes the connection
+        // instead, the only signal such a producer gets to refresh its
+        // metadata (KafkaApis.handleProduceRequest). The body is still
+        // built: the quota above is recorded either way, as in Apache.
+        if acks == 0 {
+            let failed = responses
+                .iter()
+                .flat_map(|t| &t.partition_responses)
+                .any(|p| p.error_code != 0);
+            conn.lock().reply = if failed { Reply::Close } else { Reply::None };
+        }
 
         let resp = produce::Response {
             responses,
@@ -364,5 +377,28 @@ mod tests {
         let mut r = out.freeze();
         let resp = produce::decode_response(&mut r, 9).unwrap();
         assert_eq!(resp.responses[0].partition_responses[0].error_code, 3);
+    }
+
+    /// gh #200: the reply directive the request loop acts on.
+    #[tokio::test]
+    async fn only_acks_zero_withholds_the_response() {
+        let h = ProduceHandler::new(broker_with_topic("known", 1));
+        let req = |acks| produce::Request {
+            transactional_id: None,
+            acks,
+            timeout_ms: 1000,
+            topic_data: vec![produce::TopicData {
+                name: "unknown".to_owned(),
+                partition_data: vec![produce::PartitionData {
+                    index: 0,
+                    records: Some(Bytes::from_static(&[0; 64])),
+                }],
+            }],
+        };
+        for (acks, want) in [(0, Reply::Close), (1, Reply::Send), (-1, Reply::Send)] {
+            let c = conn();
+            h.handle(&c, 9, encode_request(&req(acks), 9)).await.unwrap();
+            assert_eq!(c.lock().reply, want, "acks={acks}");
+        }
     }
 }
