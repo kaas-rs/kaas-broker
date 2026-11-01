@@ -212,6 +212,12 @@ topics the principal can't describe — `kafka-topics.sh --list` shows only
 what it may see — while a named topic answers `TOPIC_AUTHORIZATION_FAILED`
 (29) whether or not it exists, so the error code never confirms a name.
 Auto-creation's `Create` check runs only for a topic that passed `Describe`.
+The v8+ `topic_authorized_operations` / `cluster_authorized_operations`
+bitfields are computed only when the request's flags ask for them, as in
+Apache: otherwise both carry the schema default `i32::MIN` ("not computed"),
+and so does a row that failed authorization. The cluster field uses
+DescribeCluster's computation (gh #278). Duplicate requested names are
+answered once.
 
 **Deviations from Apache 3.7**:
 
@@ -229,9 +235,6 @@ Auto-creation's `Create` check runs only for a topic that passed `Describe`.
   `LEADER_NOT_AVAILABLE` (5) until the operator materializes it. It needs
   `Create` on the topic; Apache also accepts `Create` on the cluster, which
   kaas does not consult.
-- `topic_authorized_operations` / `cluster_authorized_operations` are always
-  `0`, even when the v8+ request flags ask for them — the ACL bitsets are
-  not computed.
 - `rack` is always null and `is_internal` always false — kaas advertises no
   internal topics (there is no on-wire `__consumer_offsets`).
 - v11+ is not registered; clients negotiate down to v10 via ApiVersions.

@@ -55,12 +55,15 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use kaas_auth::{Operation, Principal, Resource};
+use kaas_codec::api::acl_types::operation as acl_op;
+use kaas_codec::api::describe_cluster::NOT_REQUESTED;
 use kaas_codec::api::metadata;
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
 
 use crate::broker::Broker;
 use crate::cli::ListenerEntry;
+use crate::handlers::describe_cluster::cluster_authorized_operations;
 use crate::listener_advert::{
     advertised_brokers, controller_id, trailing_ordinal, ListenerAdverts,
 };
@@ -70,6 +73,20 @@ const ERR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 const ERR_LEADER_NOT_AVAILABLE: i16 = 5;
 const ERR_TOPIC_AUTHZ_FAILED: i16 = 29;
 const ERR_INVALID_REQUEST: i16 = 42;
+
+/// Apache's supported operations for the TOPIC resource
+/// (`AclEntry.supportedOperations`), with the `AclOperation` bit each sets
+/// in `topic_authorized_operations` (gh #278).
+const TOPIC_OPS: &[(Operation, i8)] = &[
+    (Operation::Read, acl_op::READ),
+    (Operation::Write, acl_op::WRITE),
+    (Operation::Create, acl_op::CREATE),
+    (Operation::Delete, acl_op::DELETE),
+    (Operation::Alter, acl_op::ALTER),
+    (Operation::Describe, acl_op::DESCRIBE),
+    (Operation::DescribeConfigs, acl_op::DESCRIBE_CONFIGS),
+    (Operation::AlterConfigs, acl_op::ALTER_CONFIGS),
+];
 
 /// Apache reserves the `__` prefix for internal topics
 /// (`__consumer_offsets`, `__transaction_state`). kaas has no such
@@ -187,7 +204,15 @@ impl Handler for MetadataHandler {
                 {
                     return invalid_request_response(topics, version);
                 }
-                Some(topics.into_iter().filter_map(|t| t.name).collect())
+                // Apache de-duplicates the requested names (gh #278).
+                let mut seen = std::collections::HashSet::new();
+                Some(
+                    topics
+                        .into_iter()
+                        .filter_map(|t| t.name)
+                        .filter(|n| seen.insert(n.clone()))
+                        .collect(),
+                )
             }
         };
 
@@ -242,6 +267,24 @@ impl Handler for MetadataHandler {
             Some(names) => names,
         };
 
+        // gh #278: Apache fills this per topic only when asked, and only
+        // for topics that passed `Describe` (an authorization-failure row
+        // keeps the schema default, `i32::MIN` = "not computed").
+        let topic_ops = |name: &str| -> i32 {
+            if !req.include_topic_authorized_operations {
+                return NOT_REQUESTED;
+            }
+            let resource = Resource::topic(name);
+            TOPIC_OPS
+                .iter()
+                .filter(|(op, _)| {
+                    self.broker
+                        .authorizer
+                        .authorize_quietly(&principal, &resource, *op)
+                })
+                .fold(0, |bits, (_, code)| bits | (1 << code))
+        };
+
         let mut topics = Vec::with_capacity(topic_names.len());
         for name in topic_names {
             // gh #268: before the registry lookup, so an unauthorized
@@ -283,11 +326,11 @@ impl Handler for MetadataHandler {
                     }
                     topics.push(metadata::Topic {
                         error_code: 0,
+                        topic_authorized_operations: topic_ops(&meta.name),
                         name: meta.name,
                         topic_id: meta.topic_id,
                         is_internal: false,
                         partitions,
-                        topic_authorized_operations: 0,
                     });
                 }
                 None => {
@@ -301,7 +344,15 @@ impl Handler for MetadataHandler {
                     } else {
                         ERR_UNKNOWN_TOPIC_OR_PARTITION
                     };
-                    topics.push(error_topic(name, error_code));
+                    let ops = if error_code == ERR_TOPIC_AUTHZ_FAILED {
+                        NOT_REQUESTED
+                    } else {
+                        topic_ops(&name)
+                    };
+                    topics.push(metadata::Topic {
+                        topic_authorized_operations: ops,
+                        ..error_topic(name, error_code)
+                    });
                 }
             }
         }
@@ -312,7 +363,11 @@ impl Handler for MetadataHandler {
             cluster_id: Some(self.broker.cluster_id.clone()),
             controller_id,
             topics,
-            cluster_authorized_operations: 0,
+            cluster_authorized_operations: cluster_authorized_operations(
+                &self.broker,
+                &principal,
+                req.include_cluster_authorized_operations,
+            ),
         };
 
         let mut out = BytesMut::new();
@@ -340,14 +395,15 @@ fn invalid_request_response(
                 ..error_topic(t.name.unwrap_or_default(), ERR_INVALID_REQUEST)
             })
             .collect(),
-        cluster_authorized_operations: 0,
+        cluster_authorized_operations: NOT_REQUESTED,
     };
     let mut out = BytesMut::new();
     metadata::encode_response(&mut out, &resp, version)?;
     Ok(out)
 }
 
-/// A topic entry that carries only an error: no partitions, nil id.
+/// A topic entry that carries only an error: no partitions, nil id, and
+/// authorized operations left at the schema default.
 fn error_topic(name: String, error_code: i16) -> metadata::Topic {
     metadata::Topic {
         error_code,
@@ -355,7 +411,7 @@ fn error_topic(name: String, error_code: i16) -> metadata::Topic {
         topic_id: [0; 16],
         is_internal: false,
         partitions: Vec::new(),
-        topic_authorized_operations: 0,
+        topic_authorized_operations: NOT_REQUESTED,
     }
 }
 
@@ -822,5 +878,82 @@ mod tests {
         let resp = metadata::decode_response(&mut out.freeze(), 10).unwrap();
         assert_eq!(resp.topics[0].error_code, 0);
         assert_eq!(resp.topics[0].partitions.len(), 2);
+    }
+
+    /// Metadata v9 with both authorized-operations flags.
+    fn encode_request_v9_ops(topics: &[&str], include_cluster: bool, include_topic: bool) -> Bytes {
+        let mut w = BytesMut::new();
+        write_nullable_array_len(&mut w, Some(topics.len()), true).unwrap();
+        for n in topics {
+            write_str(&mut w, n, true).unwrap();
+            tagged::write_empty(&mut w);
+        }
+        write_i8(&mut w, 0); // allow_auto_topic_creation
+        write_i8(&mut w, i8::from(include_cluster));
+        write_i8(&mut w, i8::from(include_topic));
+        tagged::write_empty(&mut w);
+        w.freeze()
+    }
+
+    async fn metadata_v9(h: &MetadataHandler, body: Bytes) -> metadata::Response {
+        let out = h.handle(&conn("internal"), 9, body).await.unwrap();
+        metadata::decode_response(&mut out.freeze(), 9).unwrap()
+    }
+
+    /// gh #278: `i32::MIN` ("not computed") unless the client asks; 0
+    /// would tell it the principal may do nothing.
+    #[tokio::test]
+    async fn authorized_operations_are_omitted_unless_asked() {
+        let h = MetadataHandler::new(broker_with(vec![("a", 1)]), &listeners());
+        let resp = metadata_v9(&h, encode_request_v9_ops(&["a", "nope"], false, false)).await;
+        assert_eq!(resp.cluster_authorized_operations, i32::MIN);
+        for t in &resp.topics {
+            assert_eq!(t.topic_authorized_operations, i32::MIN, "{}", t.name);
+        }
+    }
+
+    /// gh #278: asked for, the fields carry Apache's bitfields — every
+    /// supported topic op, and the cluster set DescribeCluster reports.
+    #[tokio::test]
+    async fn authorized_operations_are_computed_when_asked() {
+        let h = MetadataHandler::new(broker_with(vec![("a", 1)]), &listeners());
+        let resp = metadata_v9(&h, encode_request_v9_ops(&["a", "nope"], true, true)).await;
+        let topic_bits = TOPIC_OPS.iter().fold(0, |b, (_, c)| b | (1 << c));
+        assert_eq!(resp.topics[0].topic_authorized_operations, topic_bits);
+        assert_eq!(
+            resp.topics[1].topic_authorized_operations, topic_bits,
+            "an unknown topic that passed Describe gets the field too, as in Apache"
+        );
+        assert_eq!(resp.topics[1].error_code, ERR_UNKNOWN_TOPIC_OR_PARTITION);
+        let cluster_bits = [
+            acl_op::CREATE,
+            acl_op::ALTER,
+            acl_op::DESCRIBE,
+            acl_op::DESCRIBE_CONFIGS,
+            acl_op::ALTER_CONFIGS,
+        ]
+        .iter()
+        .fold(0, |b, c| b | (1 << c));
+        assert_eq!(resp.cluster_authorized_operations, cluster_bits);
+    }
+
+    /// gh #278: an authorization-failure row keeps the schema default.
+    #[tokio::test]
+    async fn a_denied_topic_row_leaves_authorized_operations_unset() {
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        let broker = broker_with_auth(vec![("secret", 1)], Arc::new(DenyNamedAuthorizer("secret")));
+        let h = MetadataHandler::new(broker, &listeners());
+        let resp = metadata_v9(&h, encode_request_v9_ops(&["secret"], false, true)).await;
+        assert_eq!(resp.topics[0].error_code, ERR_TOPIC_AUTHZ_FAILED);
+        assert_eq!(resp.topics[0].topic_authorized_operations, i32::MIN);
+    }
+
+    /// gh #278: Apache de-duplicates the requested names.
+    #[tokio::test]
+    async fn duplicate_topic_names_are_answered_once() {
+        let h = MetadataHandler::new(broker_with(vec![("a", 1)]), &listeners());
+        let resp = metadata_v9(&h, encode_request_v9(&["a", "a", "nope", "nope"])).await;
+        let names: Vec<&str> = resp.topics.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["a", "nope"]);
     }
 }

@@ -94,37 +94,45 @@ impl DescribeClusterHandler {
         }
     }
 
-    /// The 32-bit `AclOperation` bitfield for this principal on the
-    /// cluster resource.
-    ///
-    /// Three distinct answers, and clients read them differently:
-    /// [`NOT_REQUESTED`] (`i32::MIN`) when the client didn't ask, `0`
-    /// when it asked but lacks `Describe` on the cluster, and the
-    /// computed field otherwise. Collapsing the first two would tell a
-    /// client that never asked that it is authorized for nothing.
     fn authorized_operations(&self, principal: &Principal, requested: bool) -> i32 {
-        if !requested {
-            return NOT_REQUESTED;
-        }
-        let cluster = Resource::cluster();
-        if !self
-            .broker
-            .authorizer
-            .authorize(principal, &cluster, Operation::Describe)
-        {
-            return 0;
-        }
-        // Each op the principal lacks is a clear bit, not a denial, so
-        // the bitfield checks quietly (Apache's `authorizedOperations`).
-        CLUSTER_OPS
-            .iter()
-            .filter(|(op, _)| {
-                self.broker
-                    .authorizer
-                    .authorize_quietly(principal, &cluster, *op)
-            })
-            .fold(0, |bits, (_, code)| bits | (1 << code))
+        cluster_authorized_operations(&self.broker, principal, requested)
     }
+}
+
+/// The 32-bit `AclOperation` bitfield for this principal on the cluster
+/// resource. Metadata v8–v10 reports the same field, computed the same
+/// way in Apache (gh #278).
+///
+/// Three distinct answers, and clients read them differently:
+/// [`NOT_REQUESTED`] (`i32::MIN`) when the client didn't ask, `0` when it
+/// asked but lacks `Describe` on the cluster, and the computed field
+/// otherwise. Collapsing the first two would tell a client that never
+/// asked that it is authorized for nothing.
+pub(crate) fn cluster_authorized_operations(
+    broker: &Broker,
+    principal: &Principal,
+    requested: bool,
+) -> i32 {
+    if !requested {
+        return NOT_REQUESTED;
+    }
+    let cluster = Resource::cluster();
+    if !broker
+        .authorizer
+        .authorize(principal, &cluster, Operation::Describe)
+    {
+        return 0;
+    }
+    // Each op the principal lacks is a clear bit, not a denial, so the
+    // bitfield checks quietly (Apache's `authorizedOperations`).
+    CLUSTER_OPS
+        .iter()
+        .filter(|(op, _)| {
+            broker
+                .authorizer
+                .authorize_quietly(principal, &cluster, *op)
+        })
+        .fold(0, |bits, (_, code)| bits | (1 << code))
 }
 
 #[async_trait]
