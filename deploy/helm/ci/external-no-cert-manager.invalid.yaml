@@ -1,0 +1,17 @@
+# gh #291 CI case: an external listener with no certManager block. Must
+# fail with a message naming the value, not a nil-pointer error: the
+# StatefulSet mounts a Secret that only cert-manager would create.
+listeners:
+  - name: plain
+    port: 9092
+    type: internal
+    tls: false
+    authentication:
+      type: none
+  - name: external
+    port: 9093
+    type: external
+    tls: true
+    hostnamePattern: "broker-%d.kafka.example.com"
+    authentication:
+      type: none

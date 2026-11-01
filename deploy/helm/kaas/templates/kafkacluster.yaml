@@ -34,30 +34,45 @@ spec:
       port: {{ $internal.port | default 9092 }}
     {{- if $external }}
     external:
-      enabled: {{ default false $external.enabled }}
+      {{- /* kaas.firstByType returns only an enabled listener, and a
+      listener without an `enabled` key is enabled (gh #126). Until
+      gh #291 this read the key itself, so such a listener rendered as
+      `enabled: false` and the operator never made its Certificate. */}}
+      enabled: true
       port: {{ $external.port }}
       hostnamePattern: {{ $external.hostnamePattern | quote }}
       {{- with $external.bootstrapHostname }}
       bootstrapHostname: {{ . | quote }}
       {{- end }}
+      {{- /*
+      gh #291: the StatefulSet mounts the external listener's cert from
+      the <fullname>-broker-tls Secret, which only the operator's
+      cert-manager Certificate creates. A missing certManager block is
+      therefore a configuration error, not "off": fail with a message
+      instead of a nil-pointer, and keep an explicit `enabled: false`
+      (bring your own Secret) working. gateway and service are optional.
+      */}}
+      {{- $cm := required (printf "listeners[%s].certManager is required for an external listener: set certManager.enabled: true with an issuerRef, or certManager.enabled: false and provide the %s-broker-tls Secret yourself" $external.name (include "kaas.fullname" .)) $external.certManager }}
+      {{- $gw := $external.gateway | default dict }}
       tls:
         certManager:
-          enabled: {{ $external.certManager.enabled }}
-          {{- if $external.certManager.enabled }}
+          enabled: {{ $cm.enabled | default false }}
+          {{- if $cm.enabled }}
+          {{- $issuer := required (printf "listeners[%s].certManager.issuerRef is required when certManager.enabled is true" $external.name) $cm.issuerRef }}
           issuerRef:
-            name: {{ $external.certManager.issuerRef.name | quote }}
-            kind: {{ $external.certManager.issuerRef.kind | quote }}
+            name: {{ required (printf "listeners[%s].certManager.issuerRef.name is required" $external.name) $issuer.name | quote }}
+            kind: {{ $issuer.kind | default "Issuer" | quote }}
           {{- end }}
       gateway:
-        enabled: {{ $external.gateway.enabled }}
-        {{- if $external.gateway.enabled }}
+        enabled: {{ $gw.enabled | default false }}
+        {{- if $gw.enabled }}
         gatewayRef:
-          name: {{ $external.gateway.gatewayRef.name | quote }}
-          {{- with $external.gateway.gatewayRef.namespace }}
+          name: {{ required (printf "listeners[%s].gateway.gatewayRef.name is required when gateway.enabled is true" $external.name) (dig "gatewayRef" "name" "" $gw) | quote }}
+          {{- with dig "gatewayRef" "namespace" "" $gw }}
           namespace: {{ . | quote }}
           {{- end }}
         {{- end }}
-      {{- with $external.service.annotations }}
+      {{- with dig "service" "annotations" dict $external }}
       service:
         annotations: {{- toYaml . | nindent 10 }}
       {{- end }}

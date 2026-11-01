@@ -13,9 +13,14 @@ Operator image:     {{ include "kaas.operatorImage" . }}
 {{- if $external }}
 
 External access is enabled with end-to-end TLS.
+{{- if dig "certManager" "enabled" false $external }}
 Wait for the cert-manager Certificate to be ready:
 
   kubectl get certificate {{ include "kaas.fullname" . }}-broker-tls -n {{ .Release.Namespace }}
+{{- else }}
+cert-manager is off for this listener: the brokers mount the TLS Secret
+{{ include "kaas.fullname" . }}-broker-tls, which you must create in {{ .Release.Namespace }}.
+{{- end }}
 
 {{- with $external.bootstrapHostname }}
 Configure your Kafka clients with the bootstrap address:

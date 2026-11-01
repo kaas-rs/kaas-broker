@@ -1,0 +1,29 @@
+# gh #291 CI case: an external listener with the full cert-manager +
+# Gateway block. Must render.
+listeners:
+  - name: plain
+    port: 9092
+    type: internal
+    tls: false
+    authentication:
+      type: none
+  - name: external
+    port: 9093
+    type: external
+    tls: true
+    hostnamePattern: "broker-%d.kafka.example.com"
+    certManager:
+      enabled: true
+      issuerRef:
+        name: letsencrypt-prod
+        kind: ClusterIssuer
+    gateway:
+      enabled: true
+      gatewayRef:
+        name: kaas-gateway
+        namespace: kafka
+    service:
+      annotations:
+        example.com/owner: kafka
+    authentication:
+      type: none
