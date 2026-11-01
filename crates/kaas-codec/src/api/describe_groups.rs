@@ -175,7 +175,12 @@ pub fn decode_response(buf: &mut Bytes, version: i16) -> Result<Response, CodecE
                 member_assignment,
             });
         }
-        let authorized_operations = if version >= 3 { read_i32(buf)? } else { 0 };
+        // Apache's schema default below v3 is INT_MIN ("not computed").
+        let authorized_operations = if version >= 3 {
+            read_i32(buf)?
+        } else {
+            i32::MIN
+        };
         if flexible {
             tagged::read(buf)?;
         }
@@ -242,7 +247,7 @@ mod tests {
                     member_metadata: Bytes::from_static(b"meta"),
                     member_assignment: Bytes::from_static(b"asg"),
                 }],
-                authorized_operations: 0,
+                authorized_operations: if version >= 3 { 328 } else { i32::MIN },
             }],
         }
     }

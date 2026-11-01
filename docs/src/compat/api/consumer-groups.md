@@ -347,6 +347,10 @@ unions results across brokers (without the filter, one broker's stale
 in-memory entry reappeared cluster-wide). Owned groups return their live
 snapshot; group-state strings match Apache's exactly (`Empty`,
 `PreparingRebalance`, `CompletingRebalance`, `Stable`, `Dead`).
+`authorized_operations` (v3+) is Apache's: `-2147483648` ("not computed")
+unless the request sets `include_authorized_operations`, and on every error
+row; otherwise the bitfield over the group operations `Read`, `Delete` and
+`Describe` — `328` for a principal holding `All` (gh #284).
 
 **Deviations from Apache 3.7**:
 
@@ -355,17 +359,17 @@ snapshot; group-state strings match Apache's exactly (`Empty`,
 - Per-member `client_host` and `member_metadata` are returned empty (the
   coordinator tracks the host but the snapshot doesn't carry it yet);
   `member_assignment` is populated.
-- `authorized_operations` (v3+) is always 0 — kaas neither computes the
-  operations bitmap nor returns Apache's `INT32_MIN` "not requested"
-  sentinel.
 
 **Source**: `crates/kaas-broker/src/handlers/describe_groups.rs`,
 `crates/kaas-codec/src/api/describe_groups.rs`,
 `crates/kaas-coordinator/src/manager.rs`.
 
-**Verified by**: `scripts/kafka-consumer-groups.sh` (`--describe` scenario).
-There is no dedicated unit test for the DescribeGroups handler; the
-underlying `Group::describe` snapshot is exercised by the lifecycle tests in
+**Verified by**: `scripts/kafka-consumer-groups.sh` (`--describe` scenario);
+the handler's authorization and `authorized_operations` are pinned by
+`describe_another_group_is_30` and
+`describe_group_authorized_operations_are_apaches_bitfield` in
+`crates/kaas-broker/tests/discovery_and_group_authz.rs`; the underlying
+`Group::describe` snapshot is exercised by the lifecycle tests in
 `crates/kaas-coordinator/src/group.rs`.
 
 ## ListGroups

@@ -86,7 +86,12 @@ any authenticated principal. The optional `ClusterAuthorizedOperations`
 bitfield is: it needs `Describe` on the cluster resource, and then each
 supported operation is evaluated in turn. Three distinct answers, which clients
 read differently: `-2147483648` when the client didn't ask, `0` when it asked
-but lacks `Describe`, and the computed bitfield otherwise.
+but lacks `Describe`, and the computed bitfield otherwise. The bitfield covers
+Apache's full set of cluster operations — `Create`, `Alter`, `Describe`,
+`ClusterAction`, `DescribeConfigs`, `AlterConfigs`, `IdempotentWrite` — so a
+principal holding `All` reads back `8096`, as on Apache (gh #284).
+`ClusterAction` is what WriteTxnMarkers requires; nothing in kaas gates on
+`IdempotentWrite`, but an `All` or explicit grant answers it.
 
 kaas serves broker endpoints only — controller election runs on a Kubernetes
 Lease rather than a KRaft quorum (see [Non-goals](../non-goals.md)) — so a v1
@@ -96,12 +101,6 @@ carries no endpoint-type field, so neither error can reach a v0 client.
 
 **Deviations from Apache 3.7**:
 
-- The `ClusterAuthorizedOperations` bitfield never sets the `ClusterAction` or
-  `IdempotentWrite` bits. Apache lists both as cluster-scoped operations; kaas
-  models neither — there is no Kafka-RPC inter-broker surface for
-  `ClusterAction` to guard (peers talk gRPC heartbeats), and idempotent produce
-  is gated by `Write` on the topic rather than by a cluster-level grant.
-  Reporting a bit the authorizer cannot evaluate would be a guess.
 - `Rack` is always null — kaas has no rack awareness (it has no replicas to
   place).
 - `IsFenced` is derived from EndpointSlice readiness, not from a KRaft-style

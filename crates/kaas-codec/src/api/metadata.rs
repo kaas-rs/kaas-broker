@@ -326,7 +326,13 @@ pub fn decode_response(buf: &mut Bytes, version: i16) -> Result<Response, CodecE
             });
         }
 
-        let topic_authorized_operations = if version >= 8 { read_i32(buf)? } else { 0 };
+        // Below v8 the field isn't on the wire; Apache's schema default is
+        // INT_MIN ("not computed"), not 0 ("nothing authorized") (gh #284).
+        let topic_authorized_operations = if version >= 8 {
+            read_i32(buf)?
+        } else {
+            i32::MIN
+        };
         if flexible {
             tagged::read(buf)?;
         }
@@ -343,7 +349,7 @@ pub fn decode_response(buf: &mut Bytes, version: i16) -> Result<Response, CodecE
     let cluster_authorized_operations = if (8..=10).contains(&version) {
         read_i32(buf)?
     } else {
-        0
+        i32::MIN
     };
 
     if flexible {
@@ -469,9 +475,13 @@ mod tests {
                     isr_nodes: vec![0],
                     offline_replicas: Vec::new(),
                 }],
-                topic_authorized_operations: 0,
+                topic_authorized_operations: if version >= 8 { 3576 } else { i32::MIN },
             }],
-            cluster_authorized_operations: 0,
+            cluster_authorized_operations: if (8..=10).contains(&version) {
+                8096
+            } else {
+                i32::MIN
+            },
         }
     }
 

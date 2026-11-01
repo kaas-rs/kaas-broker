@@ -62,22 +62,20 @@ use crate::listener_advert::{advertised_brokers, controller_id, ListenerAdverts}
 const ERR_MISMATCHED_ENDPOINT_TYPE: i16 = 114;
 const ERR_UNSUPPORTED_ENDPOINT_TYPE: i16 = 115;
 
-/// Cluster-scoped operations kaas can actually decide, paired with the
-/// wire `AclOperation` code whose bit they set.
-///
-/// Apache's supported set for the CLUSTER resource also carries
-/// `ClusterAction` and `IdempotentWrite`. kaas models neither: there is
-/// no Kafka-RPC inter-broker surface for `ClusterAction` to guard
-/// (peers talk gRPC heartbeats), and idempotent produce is gated by
-/// `Write` on the topic, not by a cluster-level grant. Reporting a bit
-/// the authorizer can't evaluate would be a guess, so those two are
-/// left clear.
+/// Apache's supported operations for the CLUSTER resource
+/// (`AclEntry.supportedOperations`), paired with the wire `AclOperation`
+/// code whose bit they set: 8096 for a principal holding them all.
+/// `ClusterAction` gates WriteTxnMarkers (gh #199) and `IdempotentWrite`
+/// is answered by an `All` or explicit grant; until gh #284 both were
+/// left out, so an all-access principal read back 3488.
 const CLUSTER_OPS: &[(Operation, i8)] = &[
     (Operation::Create, acl_op::CREATE),
     (Operation::Alter, acl_op::ALTER),
     (Operation::Describe, acl_op::DESCRIBE),
+    (Operation::ClusterAction, acl_op::CLUSTER_ACTION),
     (Operation::DescribeConfigs, acl_op::DESCRIBE_CONFIGS),
     (Operation::AlterConfigs, acl_op::ALTER_CONFIGS),
+    (Operation::IdempotentWrite, acl_op::IDEMPOTENT_WRITE),
 ];
 
 #[derive(Debug)]
@@ -388,18 +386,11 @@ mod tests {
         let resp = describe(&h, "internal", false, endpoint_type::BROKER, 1).await;
         assert_eq!(resp.cluster_authorized_operations, NOT_REQUESTED);
 
-        // Asked, allow-all authorizer (the default) → every op kaas
-        // can decide, and nothing it can't.
+        // Asked, allow-all authorizer (the default) → Apache's full
+        // CLUSTER set {5,7,8,9,10,11,12}, written out so a drift in
+        // CLUSTER_OPS can't hide (gh #284).
         let resp = describe(&h, "internal", true, endpoint_type::BROKER, 1).await;
-        let expected = CLUSTER_OPS.iter().fold(0, |bits, (_, c)| bits | (1 << c));
-        assert_eq!(resp.cluster_authorized_operations, expected);
-        for code in [acl_op::CLUSTER_ACTION, acl_op::IDEMPOTENT_WRITE] {
-            assert_eq!(
-                resp.cluster_authorized_operations & (1 << code),
-                0,
-                "op {code} isn't modelled and must stay clear"
-            );
-        }
+        assert_eq!(resp.cluster_authorized_operations, 8096);
     }
 
     #[tokio::test]

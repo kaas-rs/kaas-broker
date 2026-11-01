@@ -914,22 +914,16 @@ mod tests {
     async fn authorized_operations_are_computed_when_asked() {
         let h = MetadataHandler::new(broker_with(vec![("a", 1)]), &listeners());
         let resp = metadata_v9(&h, encode_request_v9_ops(&["a", "nope"], true, true)).await;
-        let topic_bits = TOPIC_OPS.iter().fold(0, |b, (_, c)| b | (1 << c));
+        // Apache's TOPIC set {3,4,5,6,7,8,10,11} = 3576, written out so a
+        // drift in TOPIC_OPS can't hide (gh #284).
+        let topic_bits = 3576;
         assert_eq!(resp.topics[0].topic_authorized_operations, topic_bits);
         assert_eq!(
             resp.topics[1].topic_authorized_operations, topic_bits,
             "an unknown topic that passed Describe gets the field too, as in Apache"
         );
         assert_eq!(resp.topics[1].error_code, ERR_UNKNOWN_TOPIC_OR_PARTITION);
-        let cluster_bits = [
-            acl_op::CREATE,
-            acl_op::ALTER,
-            acl_op::DESCRIBE,
-            acl_op::DESCRIBE_CONFIGS,
-            acl_op::ALTER_CONFIGS,
-        ]
-        .iter()
-        .fold(0, |b, c| b | (1 << c));
+        let cluster_bits = 8096; // Apache's CLUSTER set, as DescribeCluster (gh #284)
         assert_eq!(resp.cluster_authorized_operations, cluster_bits);
     }
 

@@ -425,9 +425,17 @@ async fn leave_group_as(c: &Cluster, user: &str, member: &Member) -> leave_group
 }
 
 async fn describe_group_as(c: &Cluster, user: &str) -> describe_groups::DescribedGroup {
+    describe_group_with_ops_as(c, user, false).await
+}
+
+async fn describe_group_with_ops_as(
+    c: &Cluster,
+    user: &str,
+    include_authorized_operations: bool,
+) -> describe_groups::DescribedGroup {
     let req = describe_groups::Request {
         groups: vec![GROUP.to_owned()],
-        include_authorized_operations: false,
+        include_authorized_operations,
     };
     let mut body = BytesMut::new();
     describe_groups::encode_request(&mut body, &req, 5).unwrap();
@@ -675,6 +683,42 @@ async fn describe_another_group_is_30() {
     let group = describe_group_as(&c, BOB).await;
     assert_eq!(group.error_code, ERR_GROUP_AUTHZ_FAILED);
     assert!(group.members.is_empty(), "alice's membership leaked to bob");
+}
+
+/// gh #284: DescribeGroups v3+ `authorized_operations` is Apache's
+/// bitfield over the GROUP resource's supported operations {READ(3),
+/// DELETE(6), DESCRIBE(8)}, computed only when asked and only for a
+/// group that described successfully. The literals are Apache's, not
+/// derived from the handler's own table, so drift in it can't hide.
+#[tokio::test(start_paused = true)]
+async fn describe_group_authorized_operations_are_apaches_bitfield() {
+    let c = cluster();
+    alice_joins_and_commits(&c).await;
+
+    // All on the group: READ | DELETE | DESCRIBE.
+    let g = describe_group_with_ops_as(&c, ALICE, true).await;
+    assert_eq!(g.error_code, 0);
+    assert_eq!(g.authorized_operations, 328);
+    // Read alone, which implies Describe.
+    let g = describe_group_with_ops_as(&c, CAROL, true).await;
+    assert_eq!(g.error_code, 0);
+    assert_eq!(g.authorized_operations, 264);
+    // Delete alone, which implies Describe too.
+    let g = describe_group_with_ops_as(&c, OPS, true).await;
+    assert_eq!(g.error_code, 0);
+    assert_eq!(g.authorized_operations, 320);
+
+    // Not asked: INT_MIN ("not computed"), never 0 ("nothing allowed").
+    let g = describe_group_with_ops_as(&c, ALICE, false).await;
+    assert_eq!(g.authorized_operations, i32::MIN);
+    // A denied group keeps the default even when asked.
+    let g = describe_group_with_ops_as(&c, BOB, true).await;
+    assert_eq!(g.error_code, ERR_GROUP_AUTHZ_FAILED);
+    assert_eq!(g.authorized_operations, i32::MIN);
+
+    // The bits carol and ops lack are clear bits, not audited denials;
+    // only bob's named request is reported.
+    assert_eq!(c.reported_denials().len(), 1, "{:?}", c.reported_denials());
 }
 
 /// Without `Describe` on the cluster, Apache lists only the groups the

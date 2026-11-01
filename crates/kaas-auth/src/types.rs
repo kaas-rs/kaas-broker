@@ -144,6 +144,12 @@ pub enum Operation {
     /// this to broker principals only; a client holding it can inject
     /// control batches, so treat it like a super-user bit (gh #199).
     ClusterAction,
+    /// Cluster-level idempotent-produce grant. Nothing in kaas gates on it
+    /// (since KIP-679 Apache's InitProducerId accepts `Write` on any topic
+    /// in its place), but it is a CLUSTER operation Apache reports in the
+    /// authorized-operations bitfields, so an `All` or explicit grant must
+    /// answer it (gh #284).
+    IdempotentWrite,
 }
 
 impl Operation {
@@ -158,6 +164,7 @@ impl Operation {
             Self::DescribeConfigs => "DescribeConfigs",
             Self::AlterConfigs => "AlterConfigs",
             Self::ClusterAction => "ClusterAction",
+            Self::IdempotentWrite => "IdempotentWrite",
         }
     }
 
@@ -175,6 +182,7 @@ impl Operation {
             "DescribeConfigs" => Some(Self::DescribeConfigs),
             "AlterConfigs" => Some(Self::AlterConfigs),
             "ClusterAction" => Some(Self::ClusterAction),
+            "IdempotentWrite" => Some(Self::IdempotentWrite),
             _ => None,
         }
     }
@@ -224,6 +232,7 @@ mod tests {
             Operation::DescribeConfigs,
             Operation::AlterConfigs,
             Operation::ClusterAction,
+            Operation::IdempotentWrite,
         ] {
             assert_eq!(Operation::parse(op.as_str()), Some(op));
         }
