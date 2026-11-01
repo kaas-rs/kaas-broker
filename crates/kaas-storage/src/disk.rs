@@ -416,19 +416,31 @@ impl StorageEngine for DiskStorageEngine {
         max_bytes: usize,
     ) -> Result<Bytes, StorageError> {
         let started = std::time::Instant::now();
+        let key = (topic.to_owned(), partition);
         // Read on an unknown partition returns empty (matches
-        // MemoryStorage —
-        // clients receive an empty Fetch response, not an error).
-        let out = if let Some(entry) = self.partitions.get(&(topic.to_owned(), partition)) {
-            entry.value().read(start_offset, max_bytes).await
-        } else {
-            Ok(Bytes::new())
+        // MemoryStorage — clients receive an empty Fetch response, not
+        // an error). The Arc is cloned out so no map guard is held
+        // across the read.
+        let Some(p) = self.partitions.get(&key).map(|e| Arc::clone(e.value())) else {
+            return Ok(Bytes::new());
         };
+        let out = p.read(start_offset, max_bytes).await;
         let m = kaas_observability::metrics::global();
         m.read_latency.record(started.elapsed().as_secs_f64(), &[]);
+        // Count only reads of a partition this engine still holds. A
+        // topic delete abandons its partitions before it drops the
+        // topic's traffic series (gh #261), so a read that straddles the
+        // delete must not record — that would re-create the series the
+        // delete just dropped. An empty read of a held partition still
+        // records, keeping an idle topic's series alive (gh #115).
         if let Ok(bytes) = &out {
-            m.topic_traffic
-                .record_fetch(topic, 1, i64::try_from(bytes.len()).unwrap_or(0));
+            if self.partitions.contains_key(&key) {
+                m.topic_traffic.record_fetch(
+                    topic,
+                    crate::segment::count_records(bytes),
+                    i64::try_from(bytes.len()).unwrap_or(0),
+                );
+            }
         }
         out
     }
@@ -864,6 +876,40 @@ mod tests {
                 "metric must count 9 records across 3 batches, not 3 batches"
             );
             e.relinquish_all().await.unwrap();
+        });
+    }
+
+    /// gh #261 follow-up: the fetch metric counts records, not reads, and
+    /// a read of a partition the engine no longer holds — an abandoned
+    /// topic — records nothing, so it can't re-create the traffic series
+    /// a topic delete just dropped.
+    #[test]
+    fn fetch_metric_counts_records_and_skips_partitions_not_held() {
+        rt().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let e =
+                DiskStorageEngine::new(fs, tmp.path().to_path_buf(), PartitionConfig::default());
+            // Unique topic: the meter is process-global.
+            let topic = "gh261-fetch-metric";
+            let tt = kaas_observability::metrics::global().topic_traffic.clone();
+            e.append(topic, 0, 0, -1, build_batch(3, 1_000))
+                .await
+                .unwrap();
+            e.append(topic, 0, 0, -1, build_batch(4, 2_000))
+                .await
+                .unwrap();
+            let before = tt.fetch_records(topic);
+            e.read(topic, 0, 0, 1 << 20).await.unwrap();
+            assert_eq!(tt.fetch_records(topic) - before, 7, "7 records, not 1 read");
+
+            assert_eq!(e.abandon_topic(topic).await, 1);
+            tt.forget(topic);
+            assert!(e.read(topic, 0, 0, 1 << 20).await.unwrap().is_empty());
+            assert!(
+                !tt.tracks(topic),
+                "a read after the abandon must not re-create the series"
+            );
         });
     }
 

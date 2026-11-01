@@ -67,6 +67,15 @@ impl TopicTrafficMeter {
         self.counters.contains_key(topic)
     }
 
+    /// Current cumulative fetch record count for `topic`, for
+    /// assertions like [`Self::produce_records`].
+    #[must_use]
+    pub fn fetch_records(&self, topic: &str) -> i64 {
+        self.counters
+            .get(topic)
+            .map_or(0, |tc| tc.fetch_records.load(Ordering::Relaxed))
+    }
+
     /// Hot-path from the Produce handler. Auto-touches the topic.
     pub fn record_produce(&self, topic: &str, records: i64, bytes: i64) {
         let tc = self.ensure(topic);

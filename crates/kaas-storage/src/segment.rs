@@ -195,6 +195,32 @@ pub fn list_segments(fs: &dyn Fs, dir: &Path) -> io::Result<Vec<SegmentMeta>> {
 /// Returns `(base_offset, last_offset_delta, max_timestamp)`. Reads
 /// only the first 43 bytes of the batch — records payload is never
 /// touched. Byte-opacity preserved.
+/// Records in a run of concatenated v2 batches, from each header's
+/// `lastOffsetDelta + 1` — the same derivation the produce metric uses
+/// (gh #218), reading headers only. Stops at a batch too short to hold
+/// its header or its declared length.
+pub fn count_records(batches: &[u8]) -> i64 {
+    let mut pos = 0usize;
+    let mut records = 0i64;
+    while let Some(rest) = batches.get(pos..) {
+        let Ok((_, last_offset_delta, _)) = parse_batch_offsets(rest) else {
+            break;
+        };
+        let mut len4 = [0u8; 4];
+        len4.copy_from_slice(&rest[8..12]);
+        let Ok(batch_len) = usize::try_from(i32::from_be_bytes(len4)) else {
+            break;
+        };
+        let end = 12 + batch_len;
+        if rest.len() < end {
+            break;
+        }
+        records += i64::from(last_offset_delta) + 1;
+        pos += end;
+    }
+    records
+}
+
 pub fn parse_batch_offsets(raw: &[u8]) -> Result<(i64, i32, i64), io::Error> {
     if raw.len() < 43 {
         return Err(io::Error::new(
@@ -1025,6 +1051,19 @@ mod tests {
         buf[35..43].copy_from_slice(&max_timestamp.to_be_bytes());
         crate::segment::stamp_crc(&mut buf);
         buf
+    }
+
+    /// gh #261 follow-up: the fetch metric counts records from batch
+    /// headers, stopping at a trailing batch that is cut short.
+    #[test]
+    fn count_records_sums_last_offset_deltas_and_ignores_a_partial_tail() {
+        let mut run = build_batch(0, 2, 0, 10); // 3 records
+        run.extend(build_batch(3, 4, 0, 10)); // 5 records
+        assert_eq!(count_records(&run), 8);
+        let partial = build_batch(8, 9, 0, 10);
+        run.extend(&partial[..partial.len() - 1]);
+        assert_eq!(count_records(&run), 8);
+        assert_eq!(count_records(&[]), 0);
     }
 
     #[test]
