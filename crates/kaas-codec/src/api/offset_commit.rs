@@ -1,6 +1,7 @@
 //! OffsetCommit — API key 8.
 //!
-//! Versions 0..=8. Flexible (KIP-482) from v8. v1+ adds
+//! Versions 2..=8 (v0/v1 are not advertised: v1's per-partition
+//! `commit_timestamp` is not decoded). Flexible (KIP-482) from v8. v1+ adds
 //! `generation_id` + `member_id` on the request; v3+ adds
 //! `throttle_time_ms` on the response; v2–v4 carry a top-level
 //! `retention_time_ms` (decoded and ignored, gh #189); v6+ adds
