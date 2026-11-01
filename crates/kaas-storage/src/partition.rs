@@ -2280,6 +2280,12 @@ mod tests {
             assert_eq!(aborted[0].producer_id, 42);
             assert_eq!(aborted[0].first_offset, 0);
             assert_eq!(p.last_stable_offset(), p.high_watermark());
+            // gh #277: a read_committed fetch resuming at offset 2, inside
+            // the txn (data 0..=2, ABORT marker at 3), must still be told
+            // it was aborted, or the consumer delivers offset 2.
+            let from_inside = p.aborted_in_range(2, p.high_watermark());
+            assert_eq!(from_inside.len(), 1);
+            assert_eq!(from_inside[0].producer_id, 42);
             p.close().await.unwrap();
         });
     }

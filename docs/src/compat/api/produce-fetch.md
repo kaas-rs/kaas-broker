@@ -79,8 +79,10 @@ engine copies batch bytes from the segment files into memory; for
 `read_committed` the result is trimmed to whole batches strictly below the
 LSO — a batch that straddles the cap is dropped along with everything after
 it, since batches are atomic — and `aborted_transactions` is populated from
-the partition's aborted-txn index over the returned range, so the client can
-filter aborted records. A reader already at or past the cap gets an
+the partition's aborted-txn index with every aborted txn that *overlaps* the
+returned range (its ABORT marker at or after the fetch offset, its first
+offset before the cap — Apache's `collectAbortedTxns`), so the client can
+filter aborted records even when the fetch resumes mid-transaction (gh #277). A reader already at or past the cap gets an
 empty response. Out-of-range offsets map to `OFFSET_OUT_OF_RANGE` (1). The
 fetch quota is checked once over the summed response bytes and feeds
 `throttle_time_ms`.

@@ -130,13 +130,18 @@ impl AbortedTxnIndex {
         }
     }
 
-    /// Aborted txns whose `first_offset` falls in `[start, end)`.
-    /// Used to populate the Fetch response's `AbortedTransactions[]`
-    /// list.
+    /// Aborted txns that overlap the fetched range `[start, end)`: the
+    /// txn ends (`last_offset`, its ABORT marker) at or after `start` and
+    /// begins before `end`. Populates the Fetch response's
+    /// `AbortedTransactions[]`. This is Apache's
+    /// `TransactionIndex.collectAbortedTxns`. Filtering on `first_offset`
+    /// alone (until gh #277) dropped a txn the fetch starts inside — which
+    /// every fetch cut short by `max.partition.fetch.bytes` can do — and a
+    /// read_committed consumer then delivered its aborted records.
     pub fn in_range(&self, start: i64, end: i64) -> Vec<AbortedTxn> {
         self.entries
             .iter()
-            .filter(|e| e.first_offset >= start && e.first_offset < end)
+            .filter(|e| e.last_offset >= start && e.first_offset < end)
             .copied()
             .collect()
     }
@@ -246,6 +251,19 @@ mod tests {
         let got = idx.in_range(150, 250);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].producer_id, 2);
+    }
+
+    /// gh #277: a fetch that resumes inside an aborted txn still gets its
+    /// abort entry; one that starts after the ABORT marker doesn't.
+    #[test]
+    fn in_range_includes_a_txn_the_fetch_starts_inside() {
+        let mut idx = AbortedTxnIndex::new();
+        idx.record(aborted(7, 100, 150));
+        let got = idx.in_range(120, 200);
+        assert_eq!(got.len(), 1, "fetch from 120 lies inside txn 100..=150");
+        assert_eq!(got[0].first_offset, 100);
+        assert_eq!(idx.in_range(150, 200).len(), 1, "marker itself is in range");
+        assert!(idx.in_range(151, 200).is_empty(), "fetch past the marker");
     }
 
     #[test]
