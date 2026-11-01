@@ -73,8 +73,11 @@ section).
 
 ## Other levers
 
-- `broker.controllerLease.durationSeconds` (default 15) — controller
-  failover latency vs API-server write rate.
+- `broker.controllerLease.durationSeconds` / `renewDeadlineSeconds` /
+  `retryPeriodSeconds` (defaults 15 / 10 / 2) — controller failover
+  latency vs API-server write rate. They must satisfy lease > renew >
+  retry; a set that doesn't is logged at boot and replaced by the
+  defaults, as is any value that isn't a positive number of seconds.
 - `broker.minReadySeconds` (default 60) — how long a freshly Ready broker
   must stay Ready before the rollout proceeds to the next pod.
 - `broker.retentionCheckIntervalSeconds` (default 300) — the retention

@@ -226,6 +226,8 @@ See `values.yaml` for the full set of tunables. Common overrides:
 | `broker.maxMessageBytes` | 1048588 | Apache `message.max.bytes` — broker-wide cap on one Produce batch (gh #253) |
 | `broker.fsyncMaxLatencyMs` | 30000 | fsync watchdog deadline; `0` disables (gh #256) |
 | `broker.controllerLease.durationSeconds` | 15 | Cluster-controller Lease lifetime; lower = faster failover, more etcd writes |
+| `broker.controllerLease.renewDeadlineSeconds` | 10 | How long the holder keeps retrying a renew before giving the Lease up; must be below `durationSeconds` |
+| `broker.controllerLease.retryPeriodSeconds` | 2 | Interval between renew / acquire attempts; must be below `renewDeadlineSeconds`. An inconsistent set is logged and replaced by 15/10/2 |
 | `podDisruptionBudget.maxUnavailable` | 1 | Equivalent to Kafka min-ISR guarantee |
 
 ## Smoke test

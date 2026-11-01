@@ -242,6 +242,11 @@ pub struct TlsConfig {
 
 #[derive(Debug)]
 pub struct Cli {
+    /// Malformed or out-of-range env values `from_env` replaced with a
+    /// default (gh #281). `from_env` runs before the log subscriber
+    /// exists, so the binary logs these once tracing is up — a knob that
+    /// parses wrong must say so, not silently do something else.
+    pub config_warnings: Vec<String>,
     pub listeners: Vec<ListenerEntry>,
     pub data_dir: Option<PathBuf>,
     /// `KAAS_CLUSTER_DIR` — where cluster-wide coordination state
@@ -315,6 +320,7 @@ pub struct Cli {
 
 impl Cli {
     pub fn from_env() -> Result<Self, ConfigError> {
+        let mut config_warnings = Vec::new();
         let listeners_json =
             env::var("KAAS_LISTENERS").unwrap_or_else(|_| default_listeners().to_owned());
         let mut listeners: Vec<ListenerEntry> =
@@ -397,7 +403,8 @@ impl Cli {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "info".to_owned());
 
-        let auth_disabled = parse_bool_env("KAAS_AUTH_DISABLED").unwrap_or(false);
+        let auth_disabled =
+            parse_bool_env("KAAS_AUTH_DISABLED", &mut config_warnings).unwrap_or(false);
         let authorization_type = env::var("KAAS_AUTHORIZATION_TYPE").unwrap_or_default();
         let super_users = env::var("KAAS_SUPER_USERS")
             .unwrap_or_default()
@@ -412,15 +419,24 @@ impl Cli {
         // num.partitions=1. A non-positive or unparseable partition
         // count degrades to 1 rather than failing boot — the chart
         // always sets it, so a bad value is an operator typo and a
-        // dead broker is the worse outcome.
-        let auto_create_topics = parse_bool_env("KAAS_AUTO_CREATE_TOPICS_ENABLE").unwrap_or(true);
-        let num_partitions = env::var("KAAS_NUM_PARTITIONS")
-            .ok()
-            .and_then(|s| s.trim().parse::<i32>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(1);
+        // dead broker is the worse outcome — but it is reported.
+        let auto_create_topics =
+            parse_bool_env("KAAS_AUTO_CREATE_TOPICS_ENABLE", &mut config_warnings).unwrap_or(true);
+        let num_partitions = match env::var("KAAS_NUM_PARTITIONS") {
+            Err(_) => 1,
+            Ok(s) => match s.trim().parse::<i32>() {
+                Ok(n) if n > 0 => n,
+                _ => {
+                    config_warnings.push(format!(
+                        "KAAS_NUM_PARTITIONS={s:?} is not a positive integer; using 1"
+                    ));
+                    1
+                }
+            },
+        };
 
-        let require_sasl = parse_bool_env("KAAS_REQUIRE_SASL").unwrap_or(false);
+        let require_sasl =
+            parse_bool_env("KAAS_REQUIRE_SASL", &mut config_warnings).unwrap_or(false);
 
         // Unlike num_partitions above, a bad value here fails boot:
         // these three change durability/limit semantics, and silently
@@ -451,6 +467,7 @@ impl Cli {
             .unwrap_or(30_000);
 
         Ok(Self {
+            config_warnings,
             listeners,
             data_dir,
             cluster_dir,
@@ -490,13 +507,23 @@ impl Cli {
 /// through [`Cli::max_message_bytes`].
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 1_048_588;
 
-fn parse_bool_env(name: &str) -> Option<bool> {
-    env::var(name).ok().map(|s| {
-        matches!(
-            s.trim().to_ascii_lowercase().as_str(),
-            "1" | "true" | "yes" | "on"
-        )
-    })
+/// `None` when unset or empty. A value that is neither true-ish nor
+/// false-ish is reported in `warnings` and also yields `None`, so the
+/// caller's default applies: a typo like `flase` used to read as `false`
+/// silently (gh #281).
+fn parse_bool_env(name: &str, warnings: &mut Vec<String>) -> Option<bool> {
+    let raw = env::var(name).ok()?;
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" => None,
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => {
+            warnings.push(format!(
+                "{name}={raw:?} is not a boolean (true/false, 1/0, yes/no, on/off); using the default"
+            ));
+            None
+        }
+    }
 }
 
 fn default_listeners() -> &'static str {
@@ -699,6 +726,33 @@ mod tests {
         assert_eq!(
             mtls.client_ca_path.as_deref(),
             Some(std::path::Path::new("/tls-client-ca/mtls/ca.crt"))
+        );
+    }
+
+    /// gh #281: a value that is neither true-ish nor false-ish is
+    /// reported and falls back to the caller's default, instead of
+    /// silently reading as `false`. Each case uses its own variable name:
+    /// the environment is process-global and tests run in parallel.
+    #[test]
+    fn parse_bool_env_reports_values_it_cannot_read() {
+        let mut w = Vec::new();
+        for (name, val, want) in [
+            ("KAAS_TEST_GH281_TRUE", "On", Some(true)),
+            ("KAAS_TEST_GH281_FALSE", " no ", Some(false)),
+            ("KAAS_TEST_GH281_EMPTY", "", None),
+        ] {
+            std::env::set_var(name, val);
+            assert_eq!(parse_bool_env(name, &mut w), want, "{name}={val:?}");
+        }
+        assert!(w.is_empty(), "{w:?}");
+        assert_eq!(parse_bool_env("KAAS_TEST_GH281_UNSET", &mut w), None);
+
+        std::env::set_var("KAAS_TEST_GH281_TYPO", "flase");
+        assert_eq!(parse_bool_env("KAAS_TEST_GH281_TYPO", &mut w), None);
+        assert_eq!(w.len(), 1);
+        assert!(
+            w[0].contains("KAAS_TEST_GH281_TYPO") && w[0].contains("flase"),
+            "{w:?}"
         );
     }
 }

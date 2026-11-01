@@ -634,13 +634,57 @@ fn env_or(key: &str, default: &str) -> String {
         .unwrap_or_else(|| default.to_owned())
 }
 
-fn env_secs(key: &str, default: u64) -> Duration {
-    Duration::from_secs(
-        std::env::var(key)
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|&v| v > 0)
-            .unwrap_or(default),
+/// A positive whole number of seconds from `key`, else `default` — with
+/// a warning when the variable is set but malformed or zero (gh #281).
+fn env_secs(key: &str, default: Duration) -> Duration {
+    let Ok(raw) = std::env::var(key) else {
+        return default;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(v) if v > 0 => Duration::from_secs(v),
+        _ => {
+            warn!(
+                key,
+                value = %raw,
+                default_secs = default.as_secs(),
+                "not a positive number of seconds; using the default"
+            );
+            default
+        }
+    }
+}
+
+/// The controller-Lease timings from the chart's env, refusing an
+/// inconsistent set the way client-go does: the lease must outlast the
+/// renew deadline, and the renew deadline the retry period, or the
+/// holder loses the Lease while still renewing it. A refused set falls
+/// back to the defaults as a whole (gh #281).
+fn lease_timings_from_env() -> (Duration, Duration, Duration) {
+    use kaas_controller::kube_election::{
+        DEFAULT_LEASE_DURATION, DEFAULT_RENEW_DEADLINE, DEFAULT_RETRY_PERIOD,
+    };
+    let lease = env_secs(
+        "KAAS_CONTROLLER_LEASE_DURATION_SECONDS",
+        DEFAULT_LEASE_DURATION,
+    );
+    let renew = env_secs(
+        "KAAS_CONTROLLER_RENEW_DEADLINE_SECONDS",
+        DEFAULT_RENEW_DEADLINE,
+    );
+    let retry = env_secs("KAAS_CONTROLLER_RETRY_PERIOD_SECONDS", DEFAULT_RETRY_PERIOD);
+    if renew < lease && retry < renew {
+        return (lease, renew, retry);
+    }
+    warn!(
+        lease_secs = lease.as_secs(),
+        renew_secs = renew.as_secs(),
+        retry_secs = retry.as_secs(),
+        "controller-Lease timings need lease > renew deadline > retry period; using the defaults"
+    );
+    (
+        DEFAULT_LEASE_DURATION,
+        DEFAULT_RENEW_DEADLINE,
+        DEFAULT_RETRY_PERIOD,
     )
 }
 
@@ -704,11 +748,7 @@ fn prepare_cluster_wiring(
         lease_epoch,
         heart,
         heartbeat_bind: env_or("KAAS_CONTROLLER_HEARTBEAT_ADDR", "0.0.0.0:9094"),
-        lease_timings: (
-            env_secs("KAAS_CONTROLLER_LEASE_DURATION_SECONDS", 15),
-            env_secs("KAAS_CONTROLLER_RENEW_DEADLINE_SECONDS", 10),
-            env_secs("KAAS_CONTROLLER_RETRY_PERIOD_SECONDS", 2),
-        ),
+        lease_timings: lease_timings_from_env(),
     })
 }
 

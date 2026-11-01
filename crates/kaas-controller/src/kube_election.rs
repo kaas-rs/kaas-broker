@@ -76,8 +76,9 @@ use tracing::{debug, info, warn};
 
 use crate::election::LeaseElection;
 
-/// Default lease duration. Matches Apache Kafka's controller-Lease
-/// shape (15 s lease, 10 s renew, 2 s retry — gh #61).
+/// Default lease timings: 15 s lease, 10 s renew deadline, 2 s retry.
+/// These are client-go's leader-election defaults — Apache Kafka has no
+/// controller Lease to match (gh #61, gh #281).
 pub const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(15);
 pub const DEFAULT_RENEW_DEADLINE: Duration = Duration::from_secs(10);
 pub const DEFAULT_RETRY_PERIOD: Duration = Duration::from_secs(2);

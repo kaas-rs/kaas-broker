@@ -182,6 +182,11 @@ async fn main() -> Result<()> {
     // initialised") is not dropped for want of a subscriber.
     let log_format = std::env::var("KAAS_LOG_FORMAT").unwrap_or_else(|_| "json".into());
     kaas_observability::install_tracing(&cli.log_level, &log_format);
+    // gh #281: values `from_env` replaced with a default, reported now
+    // that there is a subscriber to report them to.
+    for w in &cli.config_warnings {
+        warn!("{w}");
+    }
     let obs_cancel = CancellationToken::new();
     let providers = kaas_observability::bootstrap("kaas", obs_cancel.clone())
         .await
