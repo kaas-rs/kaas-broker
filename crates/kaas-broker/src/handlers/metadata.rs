@@ -33,10 +33,11 @@
 //! the principal needs `Create` on the topic — otherwise Metadata would
 //! be a way around the authorizer that `CreateTopics` enforces.
 //!
-//! A request with an empty topic list can't trip any of this: it's the
-//! "all topics" form, so every name comes from the registry and the
-//! unknown-topic branch is unreachable. Apache carves the same case out
-//! explicitly via `!metadataRequest.isAllTopics`.
+//! An all-topics request (a null list) can't trip any of this: every
+//! name comes from the registry, so the unknown-topic branch is
+//! unreachable. Apache carves the same case out explicitly via
+//! `!metadataRequest.isAllTopics`. An empty list asks for no topics
+//! (gh #274), so it can't trip it either.
 //!
 //! ## Authorization (gh #268)
 //!
@@ -291,10 +292,10 @@ impl Handler for MetadataHandler {
                 }
                 None => {
                     // gh #242: only when the broker has the feature on
-                    // AND the client asked for it. A client that didn't
-                    // set the flag (or a v0-v3 request, where the field
-                    // doesn't exist and decodes false) keeps the plain
-                    // UNKNOWN_TOPIC_OR_PARTITION answer.
+                    // AND the client asked for it. A v4+ client that
+                    // cleared the flag keeps the plain
+                    // UNKNOWN_TOPIC_OR_PARTITION answer; a v1-v3 request
+                    // has no flag and decodes to Apache's `true` default.
                     let error_code = if self.auto_create && req.allow_auto_topic_creation {
                         self.auto_create_topic(&principal, &name).await
                     } else {

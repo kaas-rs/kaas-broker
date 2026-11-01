@@ -1,9 +1,10 @@
 //! Metadata — API key 3. v1–v10, flexible from v9 (KIP-482).
 //!
 //! Clamped to the version range the broker registers (v1–v10). v11 dropped
-//! `IncludeClusterAuthorizedOperations`; v12 made topic names a
-//! compact nullable string. Both are out of scope for Phase 3 —
-//! clients negotiating to v11+ fall back to v10 via ApiVersions.
+//! `IncludeClusterAuthorizedOperations`; v12 lets a request name topics
+//! by id alone. Both are out of scope — clients negotiating to v11+ fall
+//! back to v10 via ApiVersions. The topic array is nullable from v1
+//! (null = all topics, empty = none, gh #274).
 //!
 //! # Version map
 //!
@@ -17,7 +18,7 @@
 //! | 7 | `leader_epoch` (partition) resp                               |
 //! | 8 | `include_cluster_authorized_operations` + `include_topic_authorized_operations` req · `topic_authorized_operations` + `cluster_authorized_operations` resp |
 //! | 9 | KIP-482 flexible encoding                                     |
-//! | 10| `topic_id` (UUID, 16 raw bytes) on each topic response (gh #105) |
+//! | 10| `topic_id` (UUID, 16 raw bytes) on each request and response topic (gh #105); request topic `name` nullable. Apache still rejects a null name or non-zero id below v12 |
 
 use bytes::BytesMut;
 
