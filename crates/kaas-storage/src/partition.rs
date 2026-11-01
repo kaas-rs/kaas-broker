@@ -332,27 +332,43 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
     // rewinding a phantom HWM the manifest claimed but the log
     // doesn't back).
     //
-    // gh #recovery-checkpoint: if a durable checkpoint refers to *this*
-    // active segment and its byte position is within the log, resume
-    // the scan from there — everything before it was fsynced and is
-    // trusted, so a graceful restart (checkpoint at EOF) reads nothing.
-    // Otherwise — no checkpoint, or a roll happened since it was
-    // written, or the log was truncated below it — fall back to a full
-    // scan of the active segment, which is always correct and, with a
-    // bounded segment size, cheap.
-    let (scan_start, scan_seed) = match recovery_checkpoint::read(fs, dir) {
-        Some(cp)
-            if cp.segment_base == active.meta.base_offset
-                && cp.byte_pos >= 0
-                && u64::try_from(cp.byte_pos).unwrap_or(u64::MAX) <= active.log_size() =>
-        {
-            (u64::try_from(cp.byte_pos).unwrap_or(0), cp.high_watermark)
+    // A recovery checkpoint that refers to *this* active segment lets
+    // the scan skip the fsynced prefix: it resumes on the last batch
+    // before the checkpoint's `byte_pos`, so a graceful restart
+    // (checkpoint at EOF) reads one batch. The checkpoint carries no
+    // offsets (gh #230): the HWM always comes from the batch headers the
+    // scan reads, and the resumed scan counts only if it parses cleanly
+    // at least as far as `byte_pos`. That rules out a stale checkpoint —
+    // another incarnation of the segment, a copied directory — whose
+    // position lands mid-batch: its scan stops early, and trusting it
+    // would also have truncated real data at that position below.
+    // Anything else — no checkpoint, a roll since it was written, a log
+    // shorter than it, or a failed resume — scans the whole active
+    // segment, which is always correct and, with a bounded segment
+    // size, cheap.
+    let base = active.meta.base_offset;
+    let resumed = match recovery_checkpoint::read(fs, dir) {
+        Some(cp) if cp.segment_base == base => {
+            match (
+                cp.last_batch_pos.and_then(|p| u64::try_from(p).ok()),
+                u64::try_from(cp.byte_pos).ok(),
+            ) {
+                (Some(from), Some(upto)) if from < upto && upto <= active.log_size() => {
+                    let mut f = fs.open_read(&active.meta.log_path)?;
+                    let scan = segment::scan_high_watermark_from(&mut f, from, base)?;
+                    (scan.valid_end >= upto).then_some(scan)
+                }
+                _ => None,
+            }
         }
-        _ => (0, active.meta.base_offset),
+        _ => None,
     };
-    let scan = {
-        let mut f = fs.open_read(&active.meta.log_path)?;
-        segment::scan_high_watermark_from(&mut f, scan_start, scan_seed)?
+    let scan = match resumed {
+        Some(scan) => scan,
+        None => {
+            let mut f = fs.open_read(&active.meta.log_path)?;
+            segment::scan_high_watermark_from(&mut f, 0, base)?
+        }
     };
     let hwm = scan.high_watermark;
 
@@ -370,6 +386,8 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
     if scan.stop != segment::ScanStop::Eof {
         active.truncate_to(fs, scan.valid_end)?;
     }
+    // The next checkpoint names this batch as its resume point (gh #230).
+    active.set_last_batch_start(scan.last_batch_start);
 
     // Restore the idempotence window.
     let producer_states = read_producer_snapshot(fs, dir)
@@ -719,17 +737,20 @@ impl Partition {
             // the checkpoint and let the next open fall back to a scan.
             //
             // Also skipped when a higher-epoch leader superseded us
-            // (gh #227): the checkpoint seeds the recovered high
-            // watermark, so writing one for a manifest we were just
-            // barred from updating would smuggle this broker's stale
-            // offsets back in through the side door.
+            // (gh #227): the directory is the successor's now. The
+            // checkpoint no longer carries offsets (gh #230), so a stray
+            // one would cost the successor a full scan rather than its
+            // HWM, but a fenced leader still has no business writing it.
             let checkpoint = if persisted && guard.active.sync_log().is_ok() {
                 let durable = i64::try_from(guard.active.log_size()).unwrap_or(i64::MAX);
                 guard.last_checkpoint_byte = durable;
                 Some(RecoveryCheckpoint {
                     segment_base: guard.active.meta.base_offset,
                     byte_pos: durable,
-                    high_watermark: guard.high_water,
+                    last_batch_pos: guard
+                        .active
+                        .last_batch_start()
+                        .and_then(|p| i64::try_from(p).ok()),
                 })
             } else {
                 None
@@ -1582,7 +1603,10 @@ fn spawn_committer(
                             RecoveryCheckpoint {
                                 segment_base: guard.active.meta.base_offset,
                                 byte_pos: durable,
-                                high_watermark: guard.high_water,
+                                last_batch_pos: guard
+                                    .active
+                                    .last_batch_start()
+                                    .and_then(|p| i64::try_from(p).ok()),
                             },
                             guard.dir.clone(),
                         ))
@@ -3454,11 +3478,13 @@ mod tests {
             }
             p.close().await.unwrap();
 
-            // The checkpoint exists, sits at EOF, and carries the HWM.
+            // The checkpoint exists, sits at EOF, and names the start of
+            // the last batch — one batch length before EOF.
             let cp = recovery_checkpoint::read(fs.as_ref(), &dir)
                 .expect("clean close writes a recovery checkpoint");
-            assert_eq!(cp.high_watermark, 5);
             assert_eq!(cp.segment_base, 0);
+            let one = i64::try_from(build_batch(1, 1_000).len()).unwrap();
+            assert_eq!(cp.last_batch_pos, Some(cp.byte_pos - one));
             let log_len = std::fs::metadata(dir.join("00000000-00000000000000000000.log"))
                 .unwrap()
                 .len();
@@ -3506,8 +3532,8 @@ mod tests {
                 &dir,
                 &RecoveryCheckpoint {
                     segment_base: 999,
-                    byte_pos: 0,
-                    high_watermark: 12345,
+                    byte_pos: 1,
+                    last_batch_pos: Some(0),
                 },
             )
             .unwrap();
@@ -3520,6 +3546,107 @@ mod tests {
                 3,
                 "fell back to a full scan, not the bogus HWM"
             );
+            p2.close().await.unwrap();
+        });
+    }
+
+    /// gh #230: a checkpoint that names *this* segment but positions
+    /// that don't fall on its batches — another incarnation's, a copied
+    /// directory's — must neither supply the HWM nor truncate the log.
+    /// Before the fix recovery trusted its HWM and resumed mid-batch, so
+    /// the scan "proved" garbage at that position and the torn-tail
+    /// truncation cut real, acked batches off the log.
+    #[test]
+    fn a_checkpoint_off_the_batch_boundaries_is_ignored_and_truncates_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Partition::open(
+                fs.clone(),
+                "t".into(),
+                0,
+                dir.clone(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            for _ in 0..4 {
+                p.append(0, -1, build_batch(1, 1_000)).await.unwrap();
+            }
+            p.close().await.unwrap();
+            let log = dir.join("00000000-00000000000000000000.log");
+            let len_before = std::fs::metadata(&log).unwrap().len();
+
+            // Same segment base, plausible sizes, but mid-batch.
+            let one = i64::try_from(build_batch(1, 1_000).len()).unwrap();
+            recovery_checkpoint::write(
+                fs.as_ref(),
+                &dir,
+                &RecoveryCheckpoint {
+                    segment_base: 0,
+                    byte_pos: one + 7,
+                    last_batch_pos: Some(7),
+                },
+            )
+            .unwrap();
+
+            let p2 = Partition::open(fs, "t".into(), 0, dir.clone(), PartitionConfig::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                p2.high_watermark(),
+                4,
+                "HWM from the batches, not the checkpoint"
+            );
+            assert_eq!(
+                std::fs::metadata(&log).unwrap().len(),
+                len_before,
+                "an unverified checkpoint must not drive the torn-tail truncation"
+            );
+            p2.close().await.unwrap();
+        });
+    }
+
+    /// gh #230: after a crash, recovery resumes on the checkpointed batch
+    /// and still counts what was appended after the checkpoint.
+    #[test]
+    fn a_crash_after_the_checkpoint_resumes_and_keeps_later_batches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Partition::open(
+                fs.clone(),
+                "t".into(),
+                0,
+                dir.clone(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            for _ in 0..3 {
+                p.append(0, -1, build_batch(2, 1_000)).await.unwrap();
+            }
+            p.close().await.unwrap(); // checkpoint after batch 3: HWM 6
+            let p = Partition::open(
+                fs.clone(),
+                "t".into(),
+                0,
+                dir.clone(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            for _ in 0..2 {
+                p.append(0, -1, build_batch(2, 1_000)).await.unwrap();
+            }
+            drop(p); // crash: the checkpoint still says "after batch 3"
+
+            let p2 = Partition::open(fs, "t".into(), 0, dir.clone(), PartitionConfig::default())
+                .await
+                .unwrap();
+            assert_eq!(p2.high_watermark(), 10);
             p2.close().await.unwrap();
         });
     }

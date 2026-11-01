@@ -226,26 +226,31 @@ Re-scanning the whole active segment on every takeover is the dominant
 cost of broker startup on NFS (O(active segment) at the substrate's
 read bandwidth). A per-partition **recovery checkpoint** — Kafka's
 recovery-point idea — bounds it. `recovery-checkpoint.json` records
-`{segment_base, byte_pos, high_watermark}`: everything up to `byte_pos`
-of the named active segment is fsynced, with that log-end-offset. The
-committer refreshes it once the fsynced log grows a threshold (64 MiB)
-past the last one, and a clean close writes it at EOF. On open,
-recovery resumes the scan from `byte_pos` instead of byte 0 whenever
-the checkpoint still names the current active segment; if it doesn't (a
-roll happened since, or the file is missing/stale/truncated) it falls
-back to a full scan — always correct, and cheap with a bounded segment
-size.
+`{segment_base, byte_pos, last_batch_pos}`: everything up to `byte_pos`
+of the named active segment is fsynced, and the last batch before it
+starts at `last_batch_pos`. The committer refreshes it once the fsynced
+log grows a threshold (64 MiB) past the last one, and a clean close
+writes it at EOF. On open, recovery resumes the scan on the batch at
+`last_batch_pos` instead of byte 0 whenever the checkpoint still names
+the current active segment, and keeps the result only if the scan
+parses cleanly at least as far as `byte_pos`. Otherwise (a roll
+happened since, the file is missing/stale/truncated, or its positions
+don't fall on this log's batches) it falls back to a full scan — always
+correct, and cheap with a bounded segment size.
 
 The clean-shutdown fast path falls out for free and on **one** code
-path: a graceful close leaves the checkpoint at EOF, so "scan from
-checkpoint to EOF" reads zero bytes — the same path a crash takes,
-which scans only the gap. A *missing* checkpoint is harmless (full
-scan), but the checkpoint is not purely advisory: it seeds the
-recovered high watermark, and the scan trusts everything before its
-`byte_pos` without re-verifying it. That is why a fenced leader's
-close deliberately skips writing the checkpoint — a stale one from a
-superseded leader could seed the wrong watermark — and why corruption
-*before* the checkpointed position is trusted, not detected.
+path: a graceful close leaves the checkpoint at EOF, so the resumed
+scan reads one batch — the same path a crash takes, which scans only
+the gap. The checkpoint carries no offsets (gh #230): the high
+watermark always comes from batch headers the scan reads, so a missing
+or wrong checkpoint costs a full scan and nothing else. Until gh #230
+it carried the watermark, recovery trusted it, and a stale checkpoint
+that named this segment but landed mid-batch made the resumed scan stop
+"torn" at once — so the torn-tail truncation cut acked batches off the
+log at that position. What remains trusted is the prefix before the
+checkpointed batch: corruption there is not detected. A fenced
+leader's close still skips writing a checkpoint, since the directory
+belongs to its successor.
 
 The index is **sparse**: one `(rel_offset: i32, file_pos: i32)` entry
 every `index.interval.bytes` of log data (4 KiB default). Lookup

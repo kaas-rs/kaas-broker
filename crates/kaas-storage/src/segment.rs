@@ -267,6 +267,10 @@ pub struct ScanResult {
     /// appended to again (gh #226), or writes land past it and the next
     /// recovery silently drops them.
     pub valid_end: u64,
+    /// Byte position where the last *valid* batch starts; `None` when the
+    /// scan found none. A recovery checkpoint records this so the next
+    /// recovery can resume on a batch it can verify (gh #230).
+    pub last_batch_start: Option<u64>,
     /// Why the scan stopped.
     pub stop: ScanStop,
 }
@@ -305,6 +309,7 @@ pub fn scan_high_watermark_from<R: Read + Seek>(
 
     let mut hwm = start_hwm;
     let mut valid_end = start_byte;
+    let mut last_batch_start = None;
     let mut header = [0u8; 12];
     let mut body_head = [0u8; 16];
 
@@ -356,11 +361,13 @@ pub fn scan_high_watermark_from<R: Read + Seek>(
         // Only now is the batch known-good, so only now does the valid
         // region grow. 12 = baseOffset + batchLength fields, which
         // batch_length itself does not cover.
+        last_batch_start = Some(valid_end);
         valid_end += u64::from(u32::try_from(batch_length).unwrap_or(0)) + 12;
     };
     Ok(ScanResult {
         high_watermark: hwm,
         valid_end,
+        last_batch_start,
         stop,
     })
 }
@@ -454,6 +461,10 @@ pub struct ActiveSegment {
     /// entry is emitted when `log_size - last_indexed_log_pos >=
     /// index_interval_bytes`.
     last_indexed_log_pos: u64,
+    /// Byte position where the last batch in the log starts, for the
+    /// recovery checkpoint (gh #230). `None` until a batch is appended or
+    /// recovery reports one ([`Self::set_last_batch_start`]).
+    last_batch_start: Option<u64>,
     /// Highest `max_timestamp` seen across appended batches. Used by
     /// the cleaner's retention.ms check and reported in
     /// [`SegmentMeta`] when this segment is closed.
@@ -518,6 +529,7 @@ impl ActiveSegment {
             log_size: 0,
             last_offset: base_offset - 1,
             last_indexed_log_pos: 0,
+            last_batch_start: None,
             // gh #267: UNKNOWN, not 0 — this value gets stamped into
             // the closed SegmentMeta on roll, and the cleaner treats
             // any value >= 0 as a real timestamp. A 0 dates the
@@ -542,6 +554,7 @@ impl ActiveSegment {
             log_size,
             last_offset: 0,
             last_indexed_log_pos: 0,
+            last_batch_start: None,
             // gh #267: UNKNOWN, not 0. This is the arm that ate data:
             // the takeover roll on every restart closed the adopted
             // active segment with this value stamped as its largest
@@ -665,6 +678,9 @@ impl ActiveSegment {
             Err(e) => return Err(e),
         }
         self.log_size = valid_end;
+        if self.last_batch_start.is_some_and(|p| p >= valid_end) {
+            self.last_batch_start = None;
+        }
         self.meta.size = valid_end;
         Ok(())
     }
@@ -687,6 +703,17 @@ impl ActiveSegment {
     /// Total log file size in bytes.
     pub fn log_size(&self) -> u64 {
         self.log_size
+    }
+
+    /// Where the last batch in the log starts (gh #230).
+    pub fn last_batch_start(&self) -> Option<u64> {
+        self.last_batch_start
+    }
+
+    /// Adopt the last valid batch position a recovery scan found, so the
+    /// first checkpoint after open can name it.
+    pub fn set_last_batch_start(&mut self, pos: Option<u64>) {
+        self.last_batch_start = pos;
     }
 
     /// Highest `max_timestamp` seen so far.
@@ -734,6 +761,7 @@ impl ActiveSegment {
         }
 
         let raw_len = u64::try_from(raw.len()).unwrap_or(u64::MAX);
+        self.last_batch_start = Some(self.log_size);
         self.log_size = self.log_size.saturating_add(raw_len);
         self.meta.size = self.log_size;
         self.last_offset = base_offset + i64::from(last_offset_delta);
@@ -1549,8 +1577,14 @@ mod tests {
         let _seg = ActiveSegment::create(&fs, tmp.path(), 0, 1).unwrap();
         let ops = fs.ops.lock();
         assert_eq!(ops.len(), 3, "{ops:?}");
-        assert!(ops[0].starts_with("create ") && ops[0].ends_with(".log"), "{ops:?}");
-        assert!(ops[1].starts_with("create ") && ops[1].ends_with(".index"), "{ops:?}");
+        assert!(
+            ops[0].starts_with("create ") && ops[0].ends_with(".log"),
+            "{ops:?}"
+        );
+        assert!(
+            ops[1].starts_with("create ") && ops[1].ends_with(".index"),
+            "{ops:?}"
+        );
         assert_eq!(ops[2], "fsync_dir");
     }
 
