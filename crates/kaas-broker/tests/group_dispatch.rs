@@ -179,6 +179,7 @@ async fn full_consumer_group_lifecycle_through_handlers() {
         generation_id: join_resp.generation_id,
         member_id: join_resp.member_id.clone(),
         group_instance_id: None,
+        retention_time_ms: offset_commit::DEFAULT_RETENTION_TIME_MS,
         topics: vec![offset_commit::OffsetCommitTopic {
             name: "t1".to_owned(),
             partitions: vec![offset_commit::OffsetCommitPartition {
@@ -276,6 +277,7 @@ async fn null_topic_offset_fetch_lists_every_committed_partition_after_a_restart
         generation_id: -1,
         member_id: String::new(),
         group_instance_id: None,
+        retention_time_ms: offset_commit::DEFAULT_RETENTION_TIME_MS,
         topics: vec![
             commit("t2", 1, 3, None),
             commit("t1", 2, 7, None),

@@ -2,7 +2,8 @@
 //!
 //! Versions 0..=8. Flexible (KIP-482) from v8. v1+ adds
 //! `generation_id` + `member_id` on the request; v3+ adds
-//! `throttle_time_ms` on the response; v6+ adds
+//! `throttle_time_ms` on the response; v2–v4 carry a top-level
+//! `retention_time_ms` (decoded and ignored, gh #189); v6+ adds
 //! `committed_leader_epoch` per partition; v7+ adds nullable
 //! `group_instance_id` (KIP-345).
 
@@ -17,11 +18,8 @@ use crate::primitives::{read_i16, read_i32, read_i64, write_i16, write_i32, writ
 use crate::tagged;
 use crate::Bytes;
 
-// Min 2: v1's per-partition
-// `commit_timestamp` (and v2–4's `retention_time_ms`) are not
-// decoded here, so don't advertise v0/v1 shapes
-// this module never parsed correctly. (v2–4 retention remains a
-// known divergence from Apache; tracked as follow-up.)
+// Min 2: v1's per-partition `commit_timestamp` is not decoded here, so
+// don't advertise the v0/v1 shapes.
 pub const VERSIONS: (i16, i16) = (2, 8);
 pub const MIN_FLEXIBLE: i16 = 8;
 
@@ -41,8 +39,15 @@ pub struct Request {
     pub member_id: String,
     /// v7+. `None` ↔ wire null.
     pub group_instance_id: Option<String>,
+    /// v2–v4 only; `-1` (Apache's "broker default") otherwise. Decoded
+    /// so the topics after it parse (gh #189), then ignored: kaas
+    /// expires no committed offsets, so there is no retention to set.
+    pub retention_time_ms: i64,
     pub topics: Vec<OffsetCommitTopic>,
 }
+
+/// Apache's `OffsetCommitRequest.DEFAULT_RETENTION_TIME`.
+pub const DEFAULT_RETENTION_TIME_MS: i64 = -1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OffsetCommitTopic {
@@ -83,6 +88,7 @@ pub fn decode_request(buf: &mut Bytes, version: i16) -> Result<Request, CodecErr
     let flexible = version >= MIN_FLEXIBLE;
     let mut req = Request {
         group_id: read_str(buf, flexible)?,
+        retention_time_ms: DEFAULT_RETENTION_TIME_MS,
         ..Request::default()
     };
     if version >= 1 {
@@ -91,6 +97,9 @@ pub fn decode_request(buf: &mut Bytes, version: i16) -> Result<Request, CodecErr
     }
     if version >= 7 {
         req.group_instance_id = read_nullable_str(buf, flexible)?;
+    }
+    if (2..=4).contains(&version) {
+        req.retention_time_ms = read_i64(buf)?;
     }
     let nt = read_array_len(buf, flexible)?;
     for _ in 0..nt {
@@ -197,6 +206,9 @@ pub fn encode_request(buf: &mut BytesMut, req: &Request, version: i16) -> Result
     if version >= 7 {
         write_nullable_str(buf, req.group_instance_id.as_deref(), flexible)?;
     }
+    if (2..=4).contains(&version) {
+        write_i64(buf, req.retention_time_ms);
+    }
     write_array_len(buf, req.topics.len(), flexible)?;
     for t in &req.topics {
         write_str(buf, &t.name, flexible)?;
@@ -239,6 +251,11 @@ mod tests {
                 Some("inst-1".to_owned())
             } else {
                 None
+            },
+            retention_time_ms: if (2..=4).contains(&version) {
+                86_400_000
+            } else {
+                DEFAULT_RETENTION_TIME_MS
             },
             topics: vec![OffsetCommitTopic {
                 name: "t1".to_owned(),
@@ -294,6 +311,33 @@ mod tests {
     #[test]
     fn v2_roundtrip() {
         roundtrip(2);
+    }
+
+    /// gh #189: v2–v4 carry RetentionTimeMs between MemberId and Topics.
+    /// Hand-written bytes in the layout of Apache's
+    /// OffsetCommitRequest.json, not encoder output (gh #272): before the
+    /// fix the decoder read the retention as the topic array.
+    #[test]
+    fn v2_to_v4_skip_retention_time_before_the_topics() {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&[0, 1, b'g']); // group_id
+        raw.extend_from_slice(&5i32.to_be_bytes()); // generation_id
+        raw.extend_from_slice(&[0, 1, b'm']); // member_id
+        raw.extend_from_slice(&86_400_000i64.to_be_bytes()); // retention_time_ms
+        raw.extend_from_slice(&1i32.to_be_bytes()); // topics: 1
+        raw.extend_from_slice(&[0, 1, b't']); // name
+        raw.extend_from_slice(&1i32.to_be_bytes()); // partitions: 1
+        raw.extend_from_slice(&0i32.to_be_bytes()); // partition_index
+        raw.extend_from_slice(&42i64.to_be_bytes()); // committed_offset
+        raw.extend_from_slice(&(-1i16).to_be_bytes()); // committed_metadata: null
+        for v in 2..=4 {
+            let mut b = Bytes::from(raw.clone());
+            let got = decode_request(&mut b, v).unwrap();
+            assert_eq!(got.retention_time_ms, 86_400_000, "v{v}");
+            assert_eq!(got.topics[0].name, "t", "v{v}");
+            assert_eq!(got.topics[0].partitions[0].committed_offset, 42, "v{v}");
+            assert!(b.is_empty(), "v{v}");
+        }
     }
 
     #[test]

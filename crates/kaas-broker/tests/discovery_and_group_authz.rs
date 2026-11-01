@@ -368,6 +368,7 @@ async fn offset_commit_as(
         generation_id: member.generation,
         member_id: member.id.clone(),
         group_instance_id: None,
+        retention_time_ms: offset_commit::DEFAULT_RETENTION_TIME_MS,
         topics: offsets
             .iter()
             .map(|(topic, offset)| offset_commit::OffsetCommitTopic {

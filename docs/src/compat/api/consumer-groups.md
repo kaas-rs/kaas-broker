@@ -74,12 +74,12 @@ on an idle group wiped the group's other topics.
 
 **Deviations from Apache 3.7**:
 
-- The advertised floor is v2, not v0 — the v0/v1 shapes were never decoded
-  correctly and are not offered. Additionally, v2–v4's `retention_time_ms`
-  field is **not decoded**, so v2–v4 requests that carry it mis-parse; this is
-  an acknowledged divergence tracked as follow-up in the codec module. In
-  practice every modern client negotiates v8 via ApiVersions and never hits
-  it.
+- The advertised floor is v2, not v0 — v1's per-partition
+  `commit_timestamp` is not decoded, so the v0/v1 shapes are not offered.
+- v2–v4's `retention_time_ms` is decoded and ignored (gh #189; until then it
+  wasn't read at all, so every field after it misparsed). kaas expires no
+  committed offsets, so there is no per-commit retention to apply. Modern
+  clients negotiate v8 and never send it.
 - `generation_id`, `member_id`, and `group.instance.id` are decoded but not
   validated against the group state machine — no `ILLEGAL_GENERATION`,
   `UNKNOWN_MEMBER_ID`, or `FENCED_INSTANCE_ID` fencing on the commit path. A
