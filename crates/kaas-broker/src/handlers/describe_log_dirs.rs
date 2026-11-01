@@ -202,10 +202,11 @@ mod tests {
     /// 31 at the top level; v0–v2 have no field to carry it.
     #[tokio::test]
     async fn denied_describe_lists_nothing() {
-        for authorizer in [
-            Arc::new(DenyAllAuthorizer) as Arc<dyn Authorizer>,
+        let authorizers: [Arc<dyn Authorizer>; 2] = [
+            Arc::new(DenyAllAuthorizer),
             Arc::new(DenyOpAuthorizer(Operation::Describe)),
-        ] {
+        ];
+        for authorizer in authorizers {
             let resp = describe(authorizer.clone(), 4).await;
             assert_eq!(resp.error_code, 31);
             assert!(resp.results.is_empty(), "log dirs leaked");

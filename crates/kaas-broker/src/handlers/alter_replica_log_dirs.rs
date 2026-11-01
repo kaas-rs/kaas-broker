@@ -303,10 +303,11 @@ mod tests {
     /// an unknown path is 31 too, not `LOG_DIR_NOT_FOUND`.
     #[tokio::test]
     async fn denied_alter_is_31_and_moves_nothing() {
-        for authorizer in [
-            Arc::new(DenyAllAuthorizer) as Arc<dyn Authorizer>,
+        let authorizers: [Arc<dyn Authorizer>; 2] = [
+            Arc::new(DenyAllAuthorizer),
             Arc::new(DenyOpAuthorizer(Operation::Alter)),
-        ] {
+        ];
+        for authorizer in authorizers {
             let p = pool(authorizer).await;
             let fast = p.fast_root.clone();
             assert_eq!(alter(&p, &fast).await, 31);
