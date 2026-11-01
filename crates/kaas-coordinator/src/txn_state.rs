@@ -257,13 +257,16 @@ pub trait TxnOffsetHook: Send + Sync + 'static {
 /// without leaking codec types into this crate.
 #[derive(Debug, Error)]
 pub enum TxnStateError {
-    /// Wire code 71 — INVALID_TRANSACTIONAL_ID.
+    /// Wire code 42 — INVALID_REQUEST (what the handlers send; Apache has
+    /// no dedicated code for an empty transactional id).
     #[error("txn state: empty transactional id")]
     EmptyTxnId,
-    /// Wire code 49 — UNKNOWN_PRODUCER_ID.
+    /// Wire code 49 — INVALID_PRODUCER_ID_MAPPING.
     #[error("txn state: unknown txn id or pid mismatch")]
     UnknownProducer,
-    /// Wire code 47 — INVALID_PRODUCER_EPOCH.
+    /// Wire code 90 — PRODUCER_FENCED, the txn-coordinator convention
+    /// (KIP-588); Produce answers a stale epoch with 47
+    /// INVALID_PRODUCER_EPOCH instead.
     #[error("txn state: producer epoch fenced")]
     EpochFenced,
     /// Wire code 51 — CONCURRENT_TRANSACTIONS.

@@ -199,13 +199,12 @@ transitions the entry to `Ongoing` and stamps `ongoingSinceMs` — either
 `Add*` API can open the transaction. The recorded group list is what
 `EndTxn`'s offset hook later walks to commit or discard the pending
 offsets staged by `TxnOffsetCommit`. The response is a single top-level
-error code. An empty `group_id` is rejected through the
-invalid-transition mapping (wire 50 — see the preamble wart).
+error code. An empty `group_id` is rejected with `INVALID_TXN_STATE` (48).
 
 **Deviations from Apache 3.7**:
 
-- None known beyond the shared warts in the preamble (wire 50 where
-  Apache uses 48).
+- The empty-`group_id` rejection is kaas's own; Apache authorizes `Read` on
+  the group and adds it like any other.
 
 **Source**: `crates/kaas-broker/src/handlers/add_offsets_to_txn.rs`
 (handler), `crates/kaas-codec/src/api/add_offsets_to_txn.rs` (codec),
@@ -249,8 +248,8 @@ dispatch set and finishes the job.
 
 A retried `EndTxn` in the matching `Complete*` state is answered
 idempotently (error 0, no second marker); a direction mismatch or
-`EndTxn` against `Empty` returns wire 50 (intended
-`INVALID_TXN_STATE`); an epoch mismatch returns `PRODUCER_FENCED`.
+`EndTxn` against `Empty` returns `INVALID_TXN_STATE` (48); an epoch
+mismatch returns `PRODUCER_FENCED`.
 The queue file name makes producer retries overwrite rather than pile
 up.
 
