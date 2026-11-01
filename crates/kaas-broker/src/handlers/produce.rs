@@ -3,6 +3,18 @@
 //! Iterates `req.topic_data`, calls `engine.append` per partition,
 //! maps `StorageError` variants to wire error codes. Records bytes
 //! flow through as opaque `Option<Bytes>` — no decode, no re-encode.
+//!
+//! Two checks read batch headers (attributes only, gh #294), as Apache
+//! does:
+//! - A request carrying any transactional batch needs a
+//!   `transactional_id` the principal may `Write`
+//!   (`handleProduceRequest`). Otherwise every partition answers
+//!   `TRANSACTIONAL_ID_AUTHORIZATION_FAILED` (53) and nothing is
+//!   appended.
+//! - A client may not write control batches (`LogValidator`). Only the
+//!   transaction coordinator writes COMMIT/ABORT markers, and it appends
+//!   them straight to the engine, not through Produce. A client-sent
+//!   control batch answers `INVALID_RECORD` (87).
 
 use std::sync::Arc;
 
@@ -31,6 +43,12 @@ const ERR_MESSAGE_TOO_LARGE: i16 = 10;
 /// from `KAAS_MAX_MESSAGE_BYTES` (gh #253).
 const DEFAULT_MAX_MESSAGE_BYTES: usize = 1_048_588;
 const ERR_TOPIC_AUTHORIZATION_FAILED: i16 = 29;
+const ERR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
+const ERR_INVALID_RECORD: i16 = 87;
+/// v2 RecordBatch attribute bits (`RecordBatch.isTransactional` /
+/// `isControlBatch`).
+const ATTR_TRANSACTIONAL: i16 = 0x10;
+const ATTR_CONTROL: i16 = 0x20;
 const ERR_OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = 45;
 const ERR_DUPLICATE_SEQUENCE_NUMBER: i16 = 46;
 const ERR_INVALID_PRODUCER_EPOCH: i16 = 47;
@@ -91,11 +109,25 @@ impl Handler for ProduceHandler {
             .filter_map(|p| p.records.as_ref().map(|b| b.len()))
             .sum();
 
+        // gh #294: checked before anything per-topic. Without it, a
+        // principal with only topic Write could open a transaction under
+        // a PID no coordinator knows. Nothing would ever abort it, and it
+        // would pin the partition's LSO for every read_committed consumer.
+        let txn_denied = self.transactional_id_denied(&principal, &req);
+
         let mut responses = Vec::with_capacity(req.topic_data.len());
         for t in &req.topic_data {
             let mut partition_responses = Vec::with_capacity(t.partition_data.len());
             for p in &t.partition_data {
-                let pr = self.append_one(&principal, &t.name, p, acks).await;
+                let pr = if txn_denied {
+                    error_partition_bumped(
+                        &t.name,
+                        p.index,
+                        ERR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
+                    )
+                } else {
+                    self.append_one(&principal, &t.name, p, acks).await
+                };
                 partition_responses.push(pr);
             }
             responses.push(produce::TopicResponse {
@@ -104,10 +136,16 @@ impl Handler for ProduceHandler {
             });
         }
 
-        let throttle_time_ms = self
-            .broker
-            .quotas
-            .check_produce_quota(&principal, total_bytes);
+        // A refused request appended nothing, so it isn't charged
+        // against the produce byte quota (Apache answers it before
+        // recording the quota).
+        let throttle_time_ms = if txn_denied {
+            0
+        } else {
+            self.broker
+                .quotas
+                .check_produce_quota(&principal, total_bytes)
+        };
 
         // gh #200: an acks=0 producer reads no response, so Apache sends
         // none — and when a partition failed, closes the connection
@@ -133,6 +171,29 @@ impl Handler for ProduceHandler {
 }
 
 impl ProduceHandler {
+    /// Apache's `handleProduceRequest` gate: a request with any
+    /// transactional batch must name a `transactional_id` the principal
+    /// may `Write`. A request with no transactional batches passes,
+    /// whatever its `transactional_id`.
+    fn transactional_id_denied(&self, principal: &Principal, req: &produce::Request) -> bool {
+        let transactional = req
+            .topic_data
+            .iter()
+            .flat_map(|t| &t.partition_data)
+            .filter_map(|p| p.records.as_deref())
+            .any(|r| has_batch_with(r, ATTR_TRANSACTIONAL));
+        if !transactional {
+            return false;
+        }
+        !req.transactional_id.as_deref().is_some_and(|id| {
+            self.broker.authorizer.authorize(
+                principal,
+                &Resource::transactional_id(id),
+                Operation::Write,
+            )
+        })
+    }
+
     async fn append_one(
         &self,
         principal: &Principal,
@@ -207,6 +268,13 @@ impl ProduceHandler {
             return error_partition_bumped(topic, p.index, ERR_MESSAGE_TOO_LARGE);
         }
 
+        // gh #294: control batches are the coordinator's to write. The
+        // append path takes any control batch as a COMMIT/ABORT marker,
+        // so a client-sent one would forge a transaction outcome.
+        if has_batch_with(&records, ATTR_CONTROL) {
+            return error_partition_bumped(topic, p.index, ERR_INVALID_RECORD);
+        }
+
         // Ensure the partition is open (create_partition is idempotent
         // on the engine side).
         if let Err(err) = self.broker.engine.create_partition(topic, p.index).await {
@@ -241,6 +309,11 @@ impl ProduceHandler {
             }
         }
     }
+}
+
+/// Whether any whole batch in `records` has the attribute bit `flag` set.
+fn has_batch_with(records: &[u8], flag: i16) -> bool {
+    kaas_storage::batch_attributes(records).any(|a| a & flag != 0)
 }
 
 fn ok_partition(index: i32, base_offset: i64, log_start_offset: i64) -> produce::PartitionResponse {
@@ -462,5 +535,140 @@ mod tests {
             .append_one(&Principal::anonymous(), "known", &part, -1)
             .await;
         assert_eq!(r.error_code, 10);
+    }
+
+    /// A v2 batch with the given attributes, producer id and base
+    /// sequence. The body is a COMMIT marker's, which is opaque to every
+    /// check here; the CRC is recomputed so the batch stays valid.
+    fn batch(attrs: i16, producer_id: i64, base_sequence: i32) -> Bytes {
+        let mut b = crate::control_batch::build_control_batch(producer_id, 0, true, 0);
+        b[21..23].copy_from_slice(&attrs.to_be_bytes());
+        b[53..57].copy_from_slice(&base_sequence.to_be_bytes());
+        let crc = kaas_codec::crc::compute(&b[21..]);
+        b[17..21].copy_from_slice(&crc.to_be_bytes());
+        Bytes::from(b)
+    }
+
+    fn txn_broker(authorizer: Arc<dyn kaas_auth::Authorizer>) -> Arc<Broker> {
+        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let topics = Arc::new(TopicRegistry::new());
+        for name in ["orders", "audit"] {
+            topics.insert(TopicMeta {
+                name: name.to_owned(),
+                partition_count: 1,
+                topic_id: [0; 16],
+            });
+        }
+        Arc::new(Broker::with_auth(
+            engine,
+            topics,
+            "test",
+            0,
+            authorizer,
+            Arc::new(kaas_auth::NoQuotaChecker),
+        ))
+    }
+
+    /// Produce `orders`'s batch and `audit`'s batch in one request; the
+    /// per-partition error codes, in that order.
+    async fn produce_two(
+        broker: &Arc<Broker>,
+        transactional_id: Option<&str>,
+        orders: Bytes,
+        audit: Bytes,
+    ) -> Vec<i16> {
+        let req = produce::Request {
+            transactional_id: transactional_id.map(str::to_owned),
+            acks: -1,
+            timeout_ms: 1000,
+            topic_data: [("orders", orders), ("audit", audit)]
+                .into_iter()
+                .map(|(name, records)| produce::TopicData {
+                    name: name.to_owned(),
+                    partition_data: vec![produce::PartitionData {
+                        index: 0,
+                        records: Some(records),
+                    }],
+                })
+                .collect(),
+        };
+        let h = ProduceHandler::new(broker.clone());
+        let out = h.handle(&conn(), 9, encode_request(&req, 9)).await.unwrap();
+        let resp = produce::decode_response(&mut out.freeze(), 9).unwrap();
+        resp.responses
+            .iter()
+            .map(|t| t.partition_responses[0].error_code)
+            .collect()
+    }
+
+    fn appended(broker: &Broker, topic: &str) -> i64 {
+        broker.engine.high_watermark(topic, 0).unwrap_or(0)
+    }
+
+    /// gh #294: one transactional batch makes the whole request need
+    /// Write on its transactional id (Apache's literal 53, for every
+    /// partition, nothing appended). The plain batch next to it is
+    /// refused too, as in Apache.
+    #[tokio::test]
+    async fn a_transactional_batch_needs_write_on_the_transactional_id() {
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        let plain = || batch(0, -1, -1);
+        let txn = || batch(ATTR_TRANSACTIONAL, 7, 0);
+
+        // No transactional id at all.
+        let b = txn_broker(Arc::new(DenyNamedAuthorizer("nobody")));
+        assert_eq!(produce_two(&b, None, plain(), txn()).await, [53, 53]);
+        // A transactional id the principal may not Write.
+        assert_eq!(
+            produce_two(&b, Some("nobody"), txn(), plain()).await,
+            [53, 53]
+        );
+        assert_eq!((appended(&b, "orders"), appended(&b, "audit")), (0, 0));
+
+        // Allowed: both land.
+        assert_eq!(
+            produce_two(&b, Some("payments-tx"), txn(), plain()).await,
+            [0, 0]
+        );
+        assert_eq!((appended(&b, "orders"), appended(&b, "audit")), (1, 1));
+    }
+
+    /// Control: no transactional batch, no transactional-id check, even
+    /// when the request names one the principal can't use.
+    #[tokio::test]
+    async fn a_non_transactional_request_skips_the_transactional_id_check() {
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        let b = txn_broker(Arc::new(DenyNamedAuthorizer("nobody")));
+        let plain = || batch(0, -1, -1);
+        assert_eq!(produce_two(&b, None, plain(), plain()).await, [0, 0]);
+        assert_eq!(
+            produce_two(&b, Some("nobody"), plain(), plain()).await,
+            [0, 0]
+        );
+    }
+
+    /// gh #294: a client may not write a control batch. Apache's
+    /// `LogValidator` answers INVALID_RECORD (87). It is refused per
+    /// partition, nothing is appended, and the other partition is
+    /// unaffected.
+    #[tokio::test]
+    async fn a_client_control_batch_is_invalid_record_87() {
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        let b = txn_broker(Arc::new(DenyNamedAuthorizer("nobody")));
+        // A forged COMMIT marker, transactional id and all.
+        let marker = batch(ATTR_TRANSACTIONAL | ATTR_CONTROL, 7, -1);
+        let plain = batch(0, -1, -1);
+        assert_eq!(
+            produce_two(&b, Some("payments-tx"), marker, plain).await,
+            [87, 0]
+        );
+        assert_eq!((appended(&b, "orders"), appended(&b, "audit")), (0, 1));
+        // A control batch behind a data batch in the same records blob.
+        let mut run = BytesMut::from(&batch(0, -1, -1)[..]);
+        run.extend_from_slice(&batch(ATTR_CONTROL, -1, -1));
+        assert_eq!(
+            produce_two(&b, None, run.freeze(), batch(0, -1, -1)).await,
+            [87, 0]
+        );
     }
 }

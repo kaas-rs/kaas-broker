@@ -10,6 +10,13 @@ mechanics end to end; this section covers the wire contract.
 
 **Versions**: v3–v9 (flexible from v9)
 
+One gate covers the whole request (gh #294). If any batch in it is
+transactional, the request must name a `transactional_id` the principal may
+`Write`. Otherwise every partition answers
+`TRANSACTIONAL_ID_AUTHORIZATION_FAILED` (53) and nothing is appended, as in
+Apache's `handleProduceRequest`. A request without transactional batches
+skips the check, whatever `transactional_id` it carries.
+
 Four gates run before any byte reaches the engine, per partition, in this
 order: the cluster-wide authorizer must grant topic Write (else
 `TOPIC_AUTHORIZATION_FAILED`, 29 — first, so a denied principal learns
@@ -24,6 +31,11 @@ than Apache's `message.max.bytes` default (1 MiB + 12 bytes batch overhead)
 is rejected with `MESSAGE_TOO_LARGE` (10) before it hits storage — Apache's
 code for a batch over `max.message.bytes`, which the Java producer answers by
 splitting the batch (until gh #285 kaas sent 18, `RECORD_LIST_TOO_LARGE`).
+A control batch from a client is refused with `INVALID_RECORD` (87), as in
+Apache's `LogValidator`: COMMIT/ABORT markers are the transaction
+coordinator's to write, and it appends them to the engine directly, not
+through Produce (gh #294). Both checks read only the batch-header
+attributes.
 
 Inside the engine, under the partition mutex: idempotent-producer
 classification runs first — a duplicate (PID/epoch/sequence already in the
@@ -40,13 +52,15 @@ with `KAAS_FLUSH_INTERVAL_MESSAGES` (default 1) as the durability dial,
 overridable per topic via the `flush.messages` topic config.
 
 The produce quota is checked once per request over the summed record bytes,
-after the appends, and feeds `throttle_time_ms` in the response.
+after the appends, and feeds `throttle_time_ms` in the response. A request
+refused by the transactional-id gate appended nothing and isn't charged.
+
+An `acks = 0` request gets no response, as in Apache. If any partition
+failed, the connection is closed instead, the only signal such a producer
+gets to refresh its metadata (gh #200).
 
 **Deviations from Apache 3.7**:
 
-- `acks = 0` still gets a wire response. Apache sends nothing for acks=0
-  produce requests; kaas's dispatcher has no response-suppression path, so the
-  handler's response is always written back.
 - The `message.max.bytes` cap is the fixed Apache default — the per-topic
   `max.message.bytes` config override is not consulted.
 - `log_append_time_ms` is always `-1`: the broker never stamps append time,
@@ -59,7 +73,10 @@ after the appends, and feeds `throttle_time_ms` in the response.
 `crates/kaas-storage/src/partition.rs` and
 `crates/kaas-storage/src/idempotence.rs`.
 
-**Verified by**: `unknown_topic_returns_error_code_3` (handler unit test),
+**Verified by**: `unknown_topic_returns_error_code_3`,
+`a_transactional_batch_needs_write_on_the_transactional_id`,
+`a_non_transactional_request_skips_the_transactional_id_check` and
+`a_client_control_batch_is_invalid_record_87` (handler unit tests),
 `produce_fetch_metadata_roundtrip` in `bins/kaas/tests/smoke.rs` (which
 also asserts the fetched batch is byte-identical to the produced one),
 `append_then_read_byte_identical` in `crates/kaas-storage/src/disk.rs`,

@@ -190,11 +190,6 @@ pub fn list_segments(fs: &dyn Fs, dir: &Path) -> io::Result<Vec<SegmentMeta>> {
 // parse_batch_offsets
 // ---------------------------------------------------------------------------
 
-/// Pull the offset-bearing fields out of a v2 RecordBatch header.
-///
-/// Returns `(base_offset, last_offset_delta, max_timestamp)`. Reads
-/// only the first 43 bytes of the batch — records payload is never
-/// touched. Byte-opacity preserved.
 /// Bytes of the longest prefix of whole batches in `batches` that fits in
 /// `max_bytes` — but at least the first batch, whatever its size (KIP-74,
 /// gh #287). A trailing partial batch is never counted.
@@ -241,6 +236,33 @@ pub fn count_records(batches: &[u8]) -> i64 {
     records
 }
 
+/// The `attributes` field (header bytes 21..23) of each whole batch in a
+/// run of concatenated v2 batches. It reads headers only, so byte opacity
+/// holds. Produce uses it to find transactional and control batches
+/// (gh #294). Stops at a batch too short to hold its attributes or its
+/// declared length.
+pub fn batch_attributes(batches: &[u8]) -> impl Iterator<Item = i16> + '_ {
+    let mut pos = 0usize;
+    std::iter::from_fn(move || {
+        let rest = batches.get(pos..)?;
+        let head = rest.get(..23)?;
+        let mut len4 = [0u8; 4];
+        len4.copy_from_slice(&head[8..12]);
+        let len = usize::try_from(i32::from_be_bytes(len4)).ok()?;
+        // The batch must cover its own attributes and fit in the buffer.
+        if len < 11 || rest.len() < 12 + len {
+            return None;
+        }
+        pos += 12 + len;
+        Some(i16::from_be_bytes([head[21], head[22]]))
+    })
+}
+
+/// Pull the offset-bearing fields out of a v2 RecordBatch header.
+///
+/// Returns `(base_offset, last_offset_delta, max_timestamp)`. Reads
+/// only the first 43 bytes of the batch — records payload is never
+/// touched. Byte-opacity preserved.
 pub fn parse_batch_offsets(raw: &[u8]) -> Result<(i64, i32, i64), io::Error> {
     if raw.len() < 43 {
         return Err(io::Error::new(
@@ -1143,6 +1165,26 @@ mod tests {
         run.extend(&partial[..partial.len() - 1]);
         assert_eq!(count_records(&run), 8);
         assert_eq!(count_records(&[]), 0);
+    }
+
+    /// gh #294: every whole batch's attributes, in order, so a
+    /// transactional or control batch after the first is seen too.
+    #[test]
+    fn batch_attributes_reads_every_whole_batch() {
+        let mut a = build_batch(0, 0, 0, 10);
+        a[21..23].copy_from_slice(&0x10i16.to_be_bytes());
+        let mut b = build_batch(1, 0, 0, 10);
+        b[21..23].copy_from_slice(&0x30i16.to_be_bytes());
+        let mut run = a.clone();
+        run.extend(&b);
+        assert_eq!(batch_attributes(&run).collect::<Vec<_>>(), [0x10, 0x30]);
+        run.extend(&b[..30]);
+        assert_eq!(
+            batch_attributes(&run).count(),
+            2,
+            "a partial tail is not a batch"
+        );
+        assert_eq!(batch_attributes(&[]).count(), 0);
     }
 
     #[test]

@@ -67,7 +67,10 @@ Cluster resource (31). The one deliberate exception is the *idempotent*
 `InitProducerId` path (empty `transactional.id`), which is not gated —
 the Java client enables idempotence by default and Apache relaxed the
 same gate in KIP-679; Produce's per-topic `WRITE` check is the
-enforcement point.
+enforcement point. A Produce request that carries transactional batches
+also needs `WRITE` on its `TransactionalId` (53), and a client-sent control
+batch is `INVALID_RECORD` (87), so only the coordinator writes markers
+(gh #294).
 
 ## InitProducerId
 
