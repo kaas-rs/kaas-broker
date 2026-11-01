@@ -403,8 +403,7 @@ impl Cli {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "info".to_owned());
 
-        let auth_disabled =
-            parse_bool_env("KAAS_AUTH_DISABLED", &mut config_warnings).unwrap_or(false);
+        let auth_disabled = parse_bool_env("KAAS_AUTH_DISABLED", false, &mut config_warnings);
         let authorization_type = env::var("KAAS_AUTHORIZATION_TYPE").unwrap_or_default();
         let super_users = env::var("KAAS_SUPER_USERS")
             .unwrap_or_default()
@@ -421,7 +420,7 @@ impl Cli {
         // always sets it, so a bad value is an operator typo and a
         // dead broker is the worse outcome — but it is reported.
         let auto_create_topics =
-            parse_bool_env("KAAS_AUTO_CREATE_TOPICS_ENABLE", &mut config_warnings).unwrap_or(true);
+            parse_bool_env("KAAS_AUTO_CREATE_TOPICS_ENABLE", true, &mut config_warnings);
         let num_partitions = match env::var("KAAS_NUM_PARTITIONS") {
             Err(_) => 1,
             Ok(s) => match s.trim().parse::<i32>() {
@@ -435,8 +434,7 @@ impl Cli {
             },
         };
 
-        let require_sasl =
-            parse_bool_env("KAAS_REQUIRE_SASL", &mut config_warnings).unwrap_or(false);
+        let require_sasl = parse_bool_env("KAAS_REQUIRE_SASL", false, &mut config_warnings);
 
         // Unlike num_partitions above, a bad value here fails boot:
         // these three change durability/limit semantics, and silently
@@ -507,21 +505,23 @@ impl Cli {
 /// through [`Cli::max_message_bytes`].
 pub const DEFAULT_MAX_MESSAGE_BYTES: usize = 1_048_588;
 
-/// `None` when unset or empty. A value that is neither true-ish nor
-/// false-ish is reported in `warnings` and also yields `None`, so the
-/// caller's default applies: a typo like `flase` used to read as `false`
+/// `default` when unset or empty. A value that is neither true-ish nor
+/// false-ish is reported in `warnings`, naming the value used, and also
+/// yields `default`: a typo like `flase` used to read as `false`
 /// silently (gh #281).
-fn parse_bool_env(name: &str, warnings: &mut Vec<String>) -> Option<bool> {
-    let raw = env::var(name).ok()?;
+fn parse_bool_env(name: &str, default: bool, warnings: &mut Vec<String>) -> bool {
+    let Ok(raw) = env::var(name) else {
+        return default;
+    };
     match raw.trim().to_ascii_lowercase().as_str() {
-        "" => None,
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
+        "" => default,
+        "1" | "true" | "yes" | "on" => true,
+        "0" | "false" | "no" | "off" => false,
         _ => {
             warnings.push(format!(
-                "{name}={raw:?} is not a boolean (true/false, 1/0, yes/no, on/off); using the default"
+                "{name}={raw:?} is not a boolean (true/false, 1/0, yes/no, on/off); using the default, {default}"
             ));
-            None
+            default
         }
     }
 }
@@ -737,19 +737,20 @@ mod tests {
     fn parse_bool_env_reports_values_it_cannot_read() {
         let mut w = Vec::new();
         for (name, val, want) in [
-            ("KAAS_TEST_GH281_TRUE", "On", Some(true)),
-            ("KAAS_TEST_GH281_FALSE", " no ", Some(false)),
-            ("KAAS_TEST_GH281_EMPTY", "", None),
+            ("KAAS_TEST_GH281_TRUE", "On", true),
+            ("KAAS_TEST_GH281_FALSE", " no ", false),
+            ("KAAS_TEST_GH281_EMPTY", "", true),
         ] {
             std::env::set_var(name, val);
-            assert_eq!(parse_bool_env(name, &mut w), want, "{name}={val:?}");
+            assert_eq!(parse_bool_env(name, true, &mut w), want, "{name}={val:?}");
         }
         assert!(w.is_empty(), "{w:?}");
-        assert_eq!(parse_bool_env("KAAS_TEST_GH281_UNSET", &mut w), None);
+        assert!(!parse_bool_env("KAAS_TEST_GH281_UNSET", false, &mut w));
 
         std::env::set_var("KAAS_TEST_GH281_TYPO", "flase");
-        assert_eq!(parse_bool_env("KAAS_TEST_GH281_TYPO", &mut w), None);
+        assert!(parse_bool_env("KAAS_TEST_GH281_TYPO", true, &mut w));
         assert_eq!(w.len(), 1);
+        assert!(w[0].ends_with("using the default, true"), "{w:?}");
         assert!(
             w[0].contains("KAAS_TEST_GH281_TYPO") && w[0].contains("flase"),
             "{w:?}"

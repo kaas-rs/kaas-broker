@@ -654,11 +654,10 @@ fn env_secs(key: &str, default: Duration) -> Duration {
     }
 }
 
-/// The controller-Lease timings from the chart's env, refusing an
-/// inconsistent set the way client-go does: the lease must outlast the
-/// renew deadline, and the renew deadline the retry period, or the
-/// holder loses the Lease while still renewing it. A refused set falls
-/// back to the defaults as a whole (gh #281).
+/// The controller-Lease timings from the chart's env, refusing a set
+/// client-go's own elector would refuse
+/// ([`kaas_controller::kube_election::validate_timings`]). A refused set
+/// falls back to the defaults as a whole (gh #281).
 fn lease_timings_from_env() -> (Duration, Duration, Duration) {
     use kaas_controller::kube_election::{
         DEFAULT_LEASE_DURATION, DEFAULT_RENEW_DEADLINE, DEFAULT_RETRY_PERIOD,
@@ -672,14 +671,15 @@ fn lease_timings_from_env() -> (Duration, Duration, Duration) {
         DEFAULT_RENEW_DEADLINE,
     );
     let retry = env_secs("KAAS_CONTROLLER_RETRY_PERIOD_SECONDS", DEFAULT_RETRY_PERIOD);
-    if renew < lease && retry < renew {
+    let Err(rule) = kaas_controller::kube_election::validate_timings(lease, renew, retry) else {
         return (lease, renew, retry);
-    }
+    };
     warn!(
         lease_secs = lease.as_secs(),
         renew_secs = renew.as_secs(),
         retry_secs = retry.as_secs(),
-        "controller-Lease timings need lease > renew deadline > retry period; using the defaults"
+        rule,
+        "inconsistent controller-Lease timings; using the defaults (15/10/2)"
     );
     (
         DEFAULT_LEASE_DURATION,

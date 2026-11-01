@@ -49,14 +49,11 @@ const DEFAULT_LOG_LEVEL: &str = "info";
 const DEFAULT_LOG_FORMAT: &str = "json";
 const DEFAULT_PROBE_ADDR: &str = "0.0.0.0:8081";
 const LEADER_LEASE: &str = "kaas-operator-leader";
-const LEASE_DURATION: Duration = Duration::from_secs(15);
 /// gh #205: cadence of the resumable orphan sweep re-run. Slow — the
 /// steady-state reclaim is reconcile-time; this only mops up orphans a
 /// prior pass couldn't remove (FDs held) or that the operator missed
 /// while down.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
-const RENEW_DEADLINE: Duration = Duration::from_secs(10);
-const RETRY_PERIOD: Duration = Duration::from_secs(2);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -159,8 +156,9 @@ async fn main() -> Result<()> {
         namespace.clone(),
         LEADER_LEASE,
         identity.clone(),
-    )
-    .with_timings(LEASE_DURATION, RENEW_DEADLINE, RETRY_PERIOD);
+    );
+    // Timings: KubeLeaseElection's defaults (15/10/2), the one source of
+    // truth shared with the broker's controller Lease (gh #281).
     info!(%identity, lease = LEADER_LEASE, "waiting for leader-election");
     let epoch = election.acquire().await;
     info!(%epoch, %identity, "elected leader; starting reconcilers");

@@ -83,6 +83,36 @@ pub const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(15);
 pub const DEFAULT_RENEW_DEADLINE: Duration = Duration::from_secs(10);
 pub const DEFAULT_RETRY_PERIOD: Duration = Duration::from_secs(2);
 
+/// client-go's leader-election jitter factor: the renew deadline must
+/// leave room for more than one jittered retry.
+const JITTER_FACTOR: f64 = 1.2;
+
+/// client-go's `NewLeaderElector` checks, so a timing set kaas accepts is
+/// one Kubernetes' own elector would (gh #281): the lease must outlast
+/// the renew deadline, and the renew deadline must exceed
+/// `1.2 × retry period`, or the holder loses the Lease while still
+/// renewing it.
+///
+/// # Errors
+///
+/// The rule the set breaks, for the caller's log line.
+pub fn validate_timings(
+    lease_duration: Duration,
+    renew_deadline: Duration,
+    retry_period: Duration,
+) -> Result<(), &'static str> {
+    if retry_period.is_zero() {
+        return Err("retry period must be positive");
+    }
+    if lease_duration <= renew_deadline {
+        return Err("lease duration must be greater than the renew deadline");
+    }
+    if renew_deadline.as_secs_f64() <= JITTER_FACTOR * retry_period.as_secs_f64() {
+        return Err("renew deadline must be greater than 1.2 × the retry period");
+    }
+    Ok(())
+}
+
 /// Annotation stamped on the Lease by [`KubeLeaseElection::release`]
 /// recording who held it before `holderIdentity` was blanked. Lets a
 /// subsequent acquire distinguish "same broker re-acquiring after its
@@ -220,8 +250,8 @@ impl KubeLeaseElection {
     }
 
     /// Compute the canonical RFC3339 microtime stamp we write into
-    /// `spec.renewTime`. Same shape Apache's controller-runtime
-    /// uses.
+    /// `spec.renewTime`. Same shape client-go's leader election
+    /// writes.
     fn now_microtime() -> MicroTime {
         MicroTime(chrono::Utc::now())
     }
@@ -590,6 +620,28 @@ impl LeaseElection for KubeLeaseElection {
 
 #[cfg(test)]
 mod tests {
+
+    /// gh #281: client-go's rules, including the 1.2 jitter factor.
+    #[test]
+    fn validate_timings_matches_client_go() {
+        let s = std::time::Duration::from_secs;
+        assert!(validate_timings(s(15), s(10), s(2)).is_ok(), "the defaults");
+        assert!(validate_timings(s(30), s(20), s(2)).is_ok());
+        assert!(
+            validate_timings(s(15), s(15), s(2)).is_err(),
+            "lease == renew"
+        );
+        assert!(
+            validate_timings(s(15), s(20), s(2)).is_err(),
+            "lease < renew"
+        );
+        assert!(
+            validate_timings(s(12), s(10), s(9)).is_err(),
+            "10 <= 1.2 × 9"
+        );
+        assert!(validate_timings(s(60), s(6), s(5)).is_err(), "6 <= 1.2 × 5");
+        assert!(validate_timings(s(15), s(10), s(0)).is_err());
+    }
     use super::*;
 
     use std::convert::Infallible;

@@ -71,7 +71,7 @@ the broker's built-in defaults (also 15 / 10 / 2,
 outside the chart. To see what a cluster actually runs, read those env
 vars off the StatefulSet, not this table. The broker logs a warning and
 uses the defaults when a value isn't a positive number of seconds, or
-when the set doesn't satisfy lease > renew deadline > retry period
+when the set fails client-go's checks (lease > renew deadline > 1.2 × retry period)
 (gh #281). The operator's own
 leader-election Lease is separate and not configurable: it is fixed at
 15 / 10 / 2 in `bins/kaas-operator/src/main.rs`.
