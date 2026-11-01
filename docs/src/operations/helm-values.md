@@ -63,6 +63,16 @@ Tighter = faster failover, more API-server writes. On an API server with
 high tail latency (small shared nodes), widen the ratios — a lease that
 flaps during pod churn moves the controller for no reason.
 
+Which value is live: your values file, else these chart defaults. The
+chart always renders all three as `KAAS_CONTROLLER_LEASE_DURATION_SECONDS`
+/ `_RENEW_DEADLINE_SECONDS` / `_RETRY_PERIOD_SECONDS` on the broker, so
+the broker's built-in defaults (also 15 / 10 / 2,
+`crates/kaas-controller/src/kube_election.rs`) only apply when it runs
+outside the chart. To see what a cluster actually runs, read those env
+vars off the StatefulSet, not this table. The operator's own
+leader-election Lease is separate and not configurable: it is fixed at
+15 / 10 / 2 in `bins/kaas-operator/src/main.rs`.
+
 ### Durability, retention, limits
 
 | Key | Default | Kafka equivalent | Meaning |
