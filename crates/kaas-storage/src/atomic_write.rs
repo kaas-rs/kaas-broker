@@ -23,6 +23,7 @@ use crate::fs::{fsync_path, Fs};
 /// 3. Write into `dir/<name>.tmp`
 /// 4. `fsync` the tmp file
 /// 5. `rename(<name>.tmp, <name>)`
+/// 6. `fsync` the directory, so the rename itself is durable (gh #231)
 ///
 /// On any failure after the tmp file is opened, the tmp file is
 /// removed before the error is propagated so a partial write never
@@ -101,7 +102,11 @@ fn atomic_write_json_inner<T: Serialize>(
         return Err(e);
     }
 
-    Ok(())
+    // Step 6: the rename is a directory-entry change, and on a local
+    // filesystem only a directory fsync makes it durable. A failure here
+    // leaves the new file in place but not known to survive a crash, so
+    // it is reported, not swallowed.
+    fs.fsync_dir(dir)
 }
 
 #[cfg(test)]
@@ -115,6 +120,23 @@ mod tests {
     struct Sample {
         a: i64,
         b: String,
+    }
+
+    /// gh #231: the directory is fsynced, and only after the rename —
+    /// before it there is nothing new to make durable.
+    #[test]
+    fn the_directory_is_synced_after_the_rename() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = crate::fs::JournalFs::default();
+        let s = Sample {
+            a: 1,
+            b: "x".into(),
+        };
+        atomic_write_json(&fs, tmp.path(), "m.json", &s).unwrap();
+        assert_eq!(
+            *fs.ops.lock(),
+            ["create m.json.tmp", "rename m.json", "fsync_dir"]
+        );
     }
 
     #[test]

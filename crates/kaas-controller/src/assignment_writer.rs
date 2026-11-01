@@ -478,7 +478,7 @@ fn build_broker_entries(
     out
 }
 
-/// `tmp + rename` write of `<cluster_dir>/assignment.json`.
+/// `tmp + fsync + rename + fsync(dir)` write of `<cluster_dir>/assignment.json`.
 /// Shared by the loop and by the controller-failover test harness.
 /// Takes the cluster-state dir itself — callers resolve the legacy
 /// `<data_dir>/__cluster` join (gh #221 phase 1).
@@ -510,7 +510,9 @@ fn atomic_write<T: Serialize>(cluster_dir: &std::path::Path, payload: &T) -> io:
         let _ = std::fs::remove_file(&tmp_path);
         return Err(e);
     }
-    Ok(())
+    // gh #231: on a local filesystem the rename isn't durable until the
+    // directory is synced.
+    kaas_storage::fs::fsync_dir(&dir)
 }
 
 #[cfg(test)]

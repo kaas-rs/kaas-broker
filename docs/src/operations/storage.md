@@ -13,8 +13,8 @@ semantics. Each property is load-bearing in a specific place:
 
 1. **Same-directory rename atomicity** — every metadata file
    (`manifest.json`, `assignment.json`, txn slot files, credentials) is
-   written tmp + fsync + rename; a crash mid-write must leave either the
-   old or the new file, never a torn one.
+   written tmp + fsync + rename, then the directory is fsynced; a crash
+   mid-write must leave either the old or the new file, never a torn one.
 2. **Fsync durability** — the group-commit `sync_all()` is the `acks=all`
    promise ([storage hot path](../architecture/storage-hot-path.md)).
 3. **Close-to-open consistency** — a file written and closed on one broker

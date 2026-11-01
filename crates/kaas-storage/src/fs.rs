@@ -82,6 +82,24 @@ pub trait Fs: Send + Sync + 'static {
         ))
     }
 
+    /// Make the entries of directory `p` durable: a rename into it, or
+    /// a file created in it (gh #231). Without this a local filesystem
+    /// (ext4/xfs — the chart's single-broker local-path mode) can lose
+    /// the entry on crash even though the file's data was fsynced: the
+    /// partition comes back with the previous manifest, or without a
+    /// freshly created segment. On NFS directory operations are already
+    /// synchronous RPCs, so this costs next to nothing there.
+    ///
+    /// Same default as [`Self::truncate`]: `Unsupported`, so a
+    /// wrapper/fake `Fs` can't silently claim durability.
+    fn fsync_dir(&self, p: &Path) -> io::Result<()> {
+        let _ = p;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "fsync_dir not implemented for this Fs",
+        ))
+    }
+
     fn mkdir_all(&self, p: &Path) -> io::Result<()>;
 
     fn readdir(&self, p: &Path) -> io::Result<Vec<PathBuf>>;
@@ -197,6 +215,10 @@ impl Fs for RealFs {
             .set_len(len)
     }
 
+    fn fsync_dir(&self, p: &Path) -> io::Result<()> {
+        fsync_dir(p)
+    }
+
     fn mkdir_all(&self, p: &Path) -> io::Result<()> {
         std::fs::create_dir_all(p)
     }
@@ -229,6 +251,77 @@ impl Fs for RealFs {
 pub fn fsync_path(p: &Path) -> io::Result<()> {
     let f = std::fs::OpenOptions::new().read(true).write(true).open(p)?;
     f.sync_all()
+}
+
+/// Open directory `p` and sync it, so the entries renamed or created in
+/// it survive a crash (gh #231). For writers that use `std::fs` directly
+/// rather than an [`Fs`]; [`RealFs::fsync_dir`] calls this.
+///
+/// `EINVAL` counts as success: a filesystem that can't fsync a directory
+/// says so that way, and there is nothing further to do. PostgreSQL's
+/// `fsync_fname` makes the same call.
+pub fn fsync_dir(p: &Path) -> io::Result<()> {
+    match std::fs::File::open(p)?.sync_all() {
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        r => r,
+    }
+}
+
+/// Test-only [`Fs`] over [`RealFs`] that journals the calls whose order
+/// durability depends on: `create`, `rename` and `fsync_dir` (gh #231).
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub(crate) struct JournalFs {
+    inner: RealFs,
+    pub(crate) ops: parking_lot::Mutex<Vec<String>>,
+}
+
+#[cfg(test)]
+impl JournalFs {
+    fn log(&self, op: &str, p: &Path) {
+        let name = p.file_name().map_or_else(
+            || p.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        );
+        self.ops.lock().push(format!("{op} {name}"));
+    }
+}
+
+#[cfg(test)]
+impl Fs for JournalFs {
+    fn open_read(&self, p: &Path) -> io::Result<Box<dyn FileRead>> {
+        self.inner.open_read(p)
+    }
+    fn open_write(&self, p: &Path, append: bool) -> io::Result<Box<dyn FileWrite>> {
+        self.inner.open_write(p, append)
+    }
+    fn create(&self, p: &Path) -> io::Result<Box<dyn FileWrite>> {
+        self.log("create", p);
+        self.inner.create(p)
+    }
+    fn fsync(&self, f: &mut dyn FileWrite) -> io::Result<()> {
+        self.inner.fsync(f)
+    }
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        self.log("rename", to);
+        self.inner.rename(from, to)
+    }
+    fn remove(&self, p: &Path) -> io::Result<()> {
+        self.inner.remove(p)
+    }
+    fn fsync_dir(&self, p: &Path) -> io::Result<()> {
+        self.ops.lock().push("fsync_dir".to_owned());
+        self.inner.fsync_dir(p)
+    }
+    fn mkdir_all(&self, p: &Path) -> io::Result<()> {
+        self.inner.mkdir_all(p)
+    }
+    fn readdir(&self, p: &Path) -> io::Result<Vec<PathBuf>> {
+        self.inner.readdir(p)
+    }
+    fn stat(&self, p: &Path) -> io::Result<Metadata> {
+        self.inner.stat(p)
+    }
 }
 
 #[cfg(test)]
@@ -345,6 +438,19 @@ mod tests {
         }
         let err = Bare.truncate(Path::new("/x"), 0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        let err = Bare.fsync_dir(Path::new("/x")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    #[test]
+    fn fsync_dir_syncs_a_real_directory_and_fails_on_a_missing_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        RealFs::new().fsync_dir(tmp.path()).unwrap();
+        let missing = tmp.path().join("nope");
+        assert_eq!(
+            RealFs::new().fsync_dir(&missing).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
     }
 
     #[test]

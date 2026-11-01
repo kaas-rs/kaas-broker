@@ -495,6 +495,15 @@ impl ActiveSegment {
                 return Err(e);
             }
         };
+        // gh #231: persist the two new directory entries before anything
+        // is appended. The log's own fsync covers its data, not its name,
+        // so on a local filesystem a crash could otherwise lose a segment
+        // that held acked records.
+        if let Err(e) = fs.fsync_dir(dir) {
+            let _ = fs.remove(&log_path);
+            let _ = fs.remove(&index_path);
+            return Err(e);
+        }
         Ok(Self {
             meta: SegmentMeta {
                 base_offset,
@@ -1517,6 +1526,9 @@ mod tests {
         fn remove(&self, p: &Path) -> io::Result<()> {
             self.inner.remove(p)
         }
+        fn fsync_dir(&self, p: &Path) -> io::Result<()> {
+            self.inner.fsync_dir(p)
+        }
         fn mkdir_all(&self, p: &Path) -> io::Result<()> {
             self.inner.mkdir_all(p)
         }
@@ -1526,6 +1538,20 @@ mod tests {
         fn stat(&self, p: &Path) -> io::Result<std::fs::Metadata> {
             self.inner.stat(p)
         }
+    }
+
+    /// gh #231: a new segment's directory entries are made durable
+    /// before the segment is handed out for appends.
+    #[test]
+    fn create_syncs_the_directory_after_both_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = crate::fs::JournalFs::default();
+        let _seg = ActiveSegment::create(&fs, tmp.path(), 0, 1).unwrap();
+        let ops = fs.ops.lock();
+        assert_eq!(ops.len(), 3, "{ops:?}");
+        assert!(ops[0].starts_with("create ") && ops[0].ends_with(".log"), "{ops:?}");
+        assert!(ops[1].starts_with("create ") && ops[1].ends_with(".index"), "{ops:?}");
+        assert_eq!(ops[2], "fsync_dir");
     }
 
     /// gh #209: a fetch positioned near the end of a segment must not

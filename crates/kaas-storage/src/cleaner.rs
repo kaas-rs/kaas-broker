@@ -842,6 +842,9 @@ mod tests {
             fn remove(&self, p: &std::path::Path) -> std::io::Result<()> {
                 self.inner.remove(p)
             }
+            fn fsync_dir(&self, p: &std::path::Path) -> std::io::Result<()> {
+                self.inner.fsync_dir(p)
+            }
             fn mkdir_all(&self, p: &std::path::Path) -> std::io::Result<()> {
                 self.inner.mkdir_all(p)
             }

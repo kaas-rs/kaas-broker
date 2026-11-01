@@ -140,6 +140,17 @@ are append-only, and a segment roll creates a new (epoch-stamped) file
 and swaps a pointer. A new persisted file goes through the same
 temp-then-rename path, no exceptions.
 
+The rename is followed by an fsync of the directory, and so is the
+creation of a new segment's files (gh #231). On NFS that step is nearly
+free, because a returning `rename()` has already reached the server. It
+is there for the chart's single-broker local-path mode: on ext4 or xfs a
+directory entry is not durable until its directory is synced, so without
+it a crash could bring a partition back with the previous manifest, or
+lose a just-rolled segment that already held acked records. The three
+writers are `kaas-storage`'s `atomic_write` (through `Fs::fsync_dir`),
+`kaas-coordinator`'s twin, and the controller's `assignment.json`
+writer.
+
 ### Rule 2 is the one that gets forgotten
 
 A multi-step operation that isn't retried turns a momentary hiccup into

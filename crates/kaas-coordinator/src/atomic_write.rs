@@ -18,6 +18,7 @@ use std::path::Path;
 /// 3. Write into `dir/<name>.tmp`
 /// 4. `fsync` the tmp file
 /// 5. `rename(<name>.tmp, <name>)`
+/// 6. `fsync` the directory, so the rename is durable (gh #231)
 pub fn atomic_write_json<T: serde::Serialize>(
     dir: &Path,
     name: &str,
@@ -52,7 +53,18 @@ pub fn atomic_write_json<T: serde::Serialize>(
         return Err(e);
     }
 
-    Ok(())
+    fsync_dir(dir)
+}
+
+/// Sync directory `dir` so a rename into it survives a crash on a local
+/// filesystem (gh #231); a twin of `kaas_storage::fs::fsync_dir`, kept
+/// here because this writer stays independent of the storage crate.
+/// `EINVAL` (a filesystem that can't fsync a directory) counts as done.
+fn fsync_dir(dir: &Path) -> io::Result<()> {
+    match File::open(dir)?.sync_all() {
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        r => r,
+    }
 }
 
 #[cfg(test)]
