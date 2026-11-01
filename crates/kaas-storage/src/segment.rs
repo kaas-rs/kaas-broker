@@ -293,12 +293,37 @@ pub struct ScanResult {
     /// appended to again (gh #226), or writes land past it and the next
     /// recovery silently drops them.
     pub valid_end: u64,
-    /// Byte position where the last *valid* batch starts; `None` when the
-    /// scan found none. A recovery checkpoint records this so the next
-    /// recovery can resume on a batch it can verify (gh #230).
-    pub last_batch_start: Option<u64>,
+    /// The last *valid* batch; `None` when the scan found none. A
+    /// recovery checkpoint records it so the next recovery can resume on
+    /// a batch it can verify (gh #230).
+    pub last_batch: Option<BatchRef>,
     /// Why the scan stopped.
     pub stop: ScanStop,
+}
+
+/// Where a batch starts in its log, and the CRC32C its header carries
+/// (batch bytes 17..21 — untouched by the broker's baseOffset rewrite).
+/// The recovery checkpoint names its resume point this way: a position
+/// alone could land on a batch-shaped record payload, but that payload
+/// would also have to carry this exact CRC (gh #230).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchRef {
+    pub start: u64,
+    pub crc: u32,
+}
+
+/// The CRC field of the batch starting at `pos`, or `None` if the log is
+/// too short to hold a batch header there.
+pub fn batch_crc_at<R: Read + Seek>(f: &mut R, pos: u64) -> io::Result<Option<u32>> {
+    f.seek(SeekFrom::Start(pos))?;
+    let mut head = [0u8; 21];
+    match f.read_exact(&mut head) {
+        Ok(()) => Ok(Some(u32::from_be_bytes([
+            head[17], head[18], head[19], head[20],
+        ]))),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 /// Scan a log file to find the high watermark (next offset to write).
@@ -318,13 +343,13 @@ pub fn scan_high_watermark<R: Read + Seek>(f: &mut R, segment_base_offset: i64) 
     Ok(scan_high_watermark_from(f, 0, segment_base_offset)?.high_watermark)
 }
 
-/// Like [`scan_high_watermark`] but resumes a partial scan: start at
-/// byte `start_byte` (a batch boundary the recovery checkpoint recorded
-/// as fsynced) with the running HWM seeded to `start_hwm` (the
-/// log-end-offset at that boundary). Everything before `start_byte` is
-/// trusted; only the tail is read. gh #recovery-checkpoint turns
-/// takeover recovery from O(active segment) into O(bytes since the last
-/// checkpoint).
+/// Like [`scan_high_watermark`] but starts at byte `start_byte`, which
+/// must be a batch boundary — recovery passes the checkpointed batch's
+/// start (gh #230). `start_hwm` is only the answer if no valid batch
+/// follows; recovery passes the segment base, so the HWM always comes
+/// from the batch headers read. Bytes before `start_byte` are not read,
+/// which is what turns takeover recovery from O(active segment) into
+/// O(bytes since the last checkpoint).
 pub fn scan_high_watermark_from<R: Read + Seek>(
     f: &mut R,
     start_byte: u64,
@@ -335,7 +360,7 @@ pub fn scan_high_watermark_from<R: Read + Seek>(
 
     let mut hwm = start_hwm;
     let mut valid_end = start_byte;
-    let mut last_batch_start = None;
+    let mut last_batch = None;
     let mut header = [0u8; 12];
     let mut body_head = [0u8; 16];
 
@@ -387,13 +412,16 @@ pub fn scan_high_watermark_from<R: Read + Seek>(
         // Only now is the batch known-good, so only now does the valid
         // region grow. 12 = baseOffset + batchLength fields, which
         // batch_length itself does not cover.
-        last_batch_start = Some(valid_end);
+        last_batch = Some(BatchRef {
+            start: valid_end,
+            crc: expected,
+        });
         valid_end += u64::from(u32::try_from(batch_length).unwrap_or(0)) + 12;
     };
     Ok(ScanResult {
         high_watermark: hwm,
         valid_end,
-        last_batch_start,
+        last_batch,
         stop,
     })
 }
@@ -487,10 +515,10 @@ pub struct ActiveSegment {
     /// entry is emitted when `log_size - last_indexed_log_pos >=
     /// index_interval_bytes`.
     last_indexed_log_pos: u64,
-    /// Byte position where the last batch in the log starts, for the
-    /// recovery checkpoint (gh #230). `None` until a batch is appended or
-    /// recovery reports one ([`Self::set_last_batch_start`]).
-    last_batch_start: Option<u64>,
+    /// The last batch in the log, for the recovery checkpoint (gh #230).
+    /// `None` until a batch is appended or recovery reports one
+    /// ([`Self::set_last_batch`]).
+    last_batch: Option<BatchRef>,
     /// Highest `max_timestamp` seen across appended batches. Used by
     /// the cleaner's retention.ms check and reported in
     /// [`SegmentMeta`] when this segment is closed.
@@ -555,7 +583,7 @@ impl ActiveSegment {
             log_size: 0,
             last_offset: base_offset - 1,
             last_indexed_log_pos: 0,
-            last_batch_start: None,
+            last_batch: None,
             // gh #267: UNKNOWN, not 0 — this value gets stamped into
             // the closed SegmentMeta on roll, and the cleaner treats
             // any value >= 0 as a real timestamp. A 0 dates the
@@ -580,7 +608,7 @@ impl ActiveSegment {
             log_size,
             last_offset: 0,
             last_indexed_log_pos: 0,
-            last_batch_start: None,
+            last_batch: None,
             // gh #267: UNKNOWN, not 0. This is the arm that ate data:
             // the takeover roll on every restart closed the adopted
             // active segment with this value stamped as its largest
@@ -704,8 +732,8 @@ impl ActiveSegment {
             Err(e) => return Err(e),
         }
         self.log_size = valid_end;
-        if self.last_batch_start.is_some_and(|p| p >= valid_end) {
-            self.last_batch_start = None;
+        if self.last_batch.is_some_and(|b| b.start >= valid_end) {
+            self.last_batch = None;
         }
         self.meta.size = valid_end;
         Ok(())
@@ -731,15 +759,15 @@ impl ActiveSegment {
         self.log_size
     }
 
-    /// Where the last batch in the log starts (gh #230).
-    pub fn last_batch_start(&self) -> Option<u64> {
-        self.last_batch_start
+    /// The last batch in the log (gh #230).
+    pub fn last_batch(&self) -> Option<BatchRef> {
+        self.last_batch
     }
 
-    /// Adopt the last valid batch position a recovery scan found, so the
-    /// first checkpoint after open can name it.
-    pub fn set_last_batch_start(&mut self, pos: Option<u64>) {
-        self.last_batch_start = pos;
+    /// Adopt the last valid batch a recovery scan found, so the first
+    /// checkpoint after open can name it.
+    pub fn set_last_batch(&mut self, b: Option<BatchRef>) {
+        self.last_batch = b;
     }
 
     /// Highest `max_timestamp` seen so far.
@@ -787,7 +815,10 @@ impl ActiveSegment {
         }
 
         let raw_len = u64::try_from(raw.len()).unwrap_or(u64::MAX);
-        self.last_batch_start = Some(self.log_size);
+        self.last_batch = Some(BatchRef {
+            start: self.log_size,
+            crc: u32::from_be_bytes([raw[17], raw[18], raw[19], raw[20]]),
+        });
         self.log_size = self.log_size.saturating_add(raw_len);
         self.meta.size = self.log_size;
         self.last_offset = base_offset + i64::from(last_offset_delta);

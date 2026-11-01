@@ -226,14 +226,16 @@ Re-scanning the whole active segment on every takeover is the dominant
 cost of broker startup on NFS (O(active segment) at the substrate's
 read bandwidth). A per-partition **recovery checkpoint** — Kafka's
 recovery-point idea — bounds it. `recovery-checkpoint.json` records
-`{segment_base, byte_pos, last_batch_pos}`: everything up to `byte_pos`
-of the named active segment is fsynced, and the last batch before it
-starts at `last_batch_pos`. The committer refreshes it once the fsynced
+`{segment_base, byte_pos, last_batch_pos, last_batch_crc}`: everything
+up to `byte_pos` of the named active segment is fsynced, and the last
+batch before it starts at `last_batch_pos` and carries `last_batch_crc`. The committer refreshes it once the fsynced
 log grows a threshold (64 MiB) past the last one, and a clean close
 writes it at EOF. On open, recovery resumes the scan on the batch at
 `last_batch_pos` instead of byte 0 whenever the checkpoint still names
-the current active segment, and keeps the result only if the scan
-parses cleanly at least as far as `byte_pos`. Otherwise (a roll
+the current active segment and the batch there carries
+`last_batch_crc` (position alone could land on a batch-shaped record
+payload), and keeps the result only if the scan parses cleanly at least
+as far as `byte_pos`. Otherwise (a roll
 happened since, the file is missing/stale/truncated, or its positions
 don't fall on this log's batches) it falls back to a full scan — always
 correct, and cheap with a bounded segment size.

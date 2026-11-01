@@ -10,12 +10,14 @@
 //!
 //! It is only a hint, and recovery verifies it before using it (gh #230).
 //! The checkpoint carries no offsets: it names the byte where the last
-//! batch before `byte_pos` starts, recovery resumes the scan *on* that
-//! batch, and the high watermark comes from the batch headers the scan
-//! reads. The resumed scan is accepted only if it parses cleanly at
-//! least as far as `byte_pos`, which a stale checkpoint (another
-//! incarnation of the segment, a copied directory) can't fake short of
-//! a CRC32C collision. Otherwise, or if the file is missing or names a
+//! batch before `byte_pos` starts and the CRC32C that batch carries;
+//! recovery resumes the scan *on* that batch only if the batch there
+//! carries that CRC, and the high watermark comes from the batch headers
+//! the scan reads. The resumed scan is accepted only if it parses cleanly
+//! at least as far as `byte_pos`. A stale checkpoint (another incarnation
+//! of the segment, a copied directory) can't fake both short of a CRC32C
+//! collision — position alone could: a record payload can hold a
+//! complete, valid batch. Otherwise, or if the file is missing or names a
 //! different active segment, recovery scans the whole active segment
 //! from byte 0. So a wrong checkpoint costs time, never offsets, and
 //! never drives the torn-tail truncation (gh #226) from an unverified
@@ -49,6 +51,12 @@ pub struct RecoveryCheckpoint {
     /// scan.
     #[serde(default)]
     pub last_batch_pos: Option<i64>,
+    /// The CRC32C field of that batch. Recovery resumes only on a batch
+    /// carrying it, so a position that happens to land on a batch-shaped
+    /// record payload is not mistaken for a boundary. Absent in
+    /// checkpoints from v0.3.25–v0.3.33, which then mean a full scan.
+    #[serde(default)]
+    pub last_batch_crc: Option<u32>,
 }
 
 /// Read the checkpoint. `None` when the file is absent or unreadable —
@@ -87,6 +95,7 @@ mod tests {
             segment_base: 100,
             byte_pos: 4096,
             last_batch_pos: Some(3000),
+            last_batch_crc: Some(0xdead_beef),
         };
         write(&fs, tmp.path(), &cp).unwrap();
         assert_eq!(read(&fs, tmp.path()), Some(cp));

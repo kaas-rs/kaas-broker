@@ -352,11 +352,19 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
             match (
                 cp.last_batch_pos.and_then(|p| u64::try_from(p).ok()),
                 u64::try_from(cp.byte_pos).ok(),
+                cp.last_batch_crc,
             ) {
-                (Some(from), Some(upto)) if from < upto && upto <= active.log_size() => {
+                (Some(from), Some(upto), Some(crc)) if from < upto && upto <= active.log_size() => {
                     let mut f = fs.open_read(&active.meta.log_path)?;
-                    let scan = segment::scan_high_watermark_from(&mut f, from, base)?;
-                    (scan.valid_end >= upto).then_some(scan)
+                    // The batch at `from` must be the one the checkpoint
+                    // named (same CRC field), and the scan then proves
+                    // the bytes match that CRC.
+                    if segment::batch_crc_at(&mut f, from)? == Some(crc) {
+                        let scan = segment::scan_high_watermark_from(&mut f, from, base)?;
+                        (scan.valid_end >= upto).then_some(scan)
+                    } else {
+                        None
+                    }
                 }
                 _ => None,
             }
@@ -387,7 +395,7 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
         active.truncate_to(fs, scan.valid_end)?;
     }
     // The next checkpoint names this batch as its resume point (gh #230).
-    active.set_last_batch_start(scan.last_batch_start);
+    active.set_last_batch(scan.last_batch);
 
     // Restore the idempotence window.
     let producer_states = read_producer_snapshot(fs, dir)
@@ -744,13 +752,12 @@ impl Partition {
             let checkpoint = if persisted && guard.active.sync_log().is_ok() {
                 let durable = i64::try_from(guard.active.log_size()).unwrap_or(i64::MAX);
                 guard.last_checkpoint_byte = durable;
+                let last = guard.active.last_batch();
                 Some(RecoveryCheckpoint {
                     segment_base: guard.active.meta.base_offset,
                     byte_pos: durable,
-                    last_batch_pos: guard
-                        .active
-                        .last_batch_start()
-                        .and_then(|p| i64::try_from(p).ok()),
+                    last_batch_pos: last.and_then(|b| i64::try_from(b.start).ok()),
+                    last_batch_crc: last.map(|b| b.crc),
                 })
             } else {
                 None
@@ -894,6 +901,14 @@ impl Partition {
                     old_active.roll_fast(self.fs.as_ref(), &dir, new_base, new_epoch)?;
                 guard.closed.push(tail.closed_meta);
                 guard.active = new_active;
+                // The checkpoint position counts bytes in the active
+                // segment. Without this reset the old segment's bytes
+                // stayed in it, so after the first roll the committer
+                // never saw another 64 MiB of growth and wrote no
+                // mid-segment checkpoint until the next open — a crash
+                // then rescanned the whole segment. The takeover roll
+                // already reset it (gh #230 verification).
+                guard.last_checkpoint_byte = 0;
                 // Deferred index-fsync + close runs off-lock on the
                 // blocking pool.
                 tokio::task::spawn_blocking(move || {
@@ -1605,8 +1620,9 @@ fn spawn_committer(
                                 byte_pos: durable,
                                 last_batch_pos: guard
                                     .active
-                                    .last_batch_start()
-                                    .and_then(|p| i64::try_from(p).ok()),
+                                    .last_batch()
+                                    .and_then(|b| i64::try_from(b.start).ok()),
+                                last_batch_crc: guard.active.last_batch().map(|b| b.crc),
                             },
                             guard.dir.clone(),
                         ))
@@ -3491,6 +3507,7 @@ mod tests {
             assert_eq!(cp.segment_base, 0);
             let one = i64::try_from(build_batch(1, 1_000).len()).unwrap();
             assert_eq!(cp.last_batch_pos, Some(cp.byte_pos - one));
+            assert!(cp.last_batch_crc.is_some(), "the resume batch is CRC-bound");
             let log_len = std::fs::metadata(dir.join("00000000-00000000000000000000.log"))
                 .unwrap()
                 .len();
@@ -3540,6 +3557,7 @@ mod tests {
                     segment_base: 999,
                     byte_pos: 1,
                     last_batch_pos: Some(0),
+                    last_batch_crc: Some(0),
                 },
             )
             .unwrap();
@@ -3593,6 +3611,7 @@ mod tests {
                     segment_base: 0,
                     byte_pos: one + 7,
                     last_batch_pos: Some(7),
+                    last_batch_crc: Some(0),
                 },
             )
             .unwrap();
@@ -3611,6 +3630,101 @@ mod tests {
                 "an unverified checkpoint must not drive the torn-tail truncation"
             );
             p2.close().await.unwrap();
+        });
+    }
+
+    /// gh #230 verification: a record payload can contain a complete,
+    /// CRC-valid batch. A stale checkpoint whose position lands exactly on
+    /// it passed the "parses cleanly to byte_pos" check and supplied that
+    /// payload's offsets as the HWM. Binding the checkpoint to its batch's
+    /// CRC rejects it: the payload batch carries a different one.
+    #[test]
+    fn a_checkpoint_landing_on_a_batch_shaped_payload_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Partition::open(
+                fs.clone(),
+                "t".into(),
+                0,
+                dir.clone(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            // A forged inner batch claiming offset 1_000_000, carried as
+            // the tail of an outer batch's record payload.
+            let mut inner = build_batch(1, 1_000).to_vec();
+            inner[0..8].copy_from_slice(&1_000_000i64.to_be_bytes());
+            let mut outer = build_batch(1, 2_000).to_vec();
+            outer.extend_from_slice(&inner);
+            let body_len = i32::try_from(outer.len() - 12).unwrap();
+            outer[8..12].copy_from_slice(&body_len.to_be_bytes());
+            crate::segment::stamp_crc(&mut outer);
+            let outer_crc = u32::from_be_bytes([outer[17], outer[18], outer[19], outer[20]]);
+
+            p.append(0, -1, build_batch(1, 1_000)).await.unwrap();
+            p.append(0, -1, Bytes::from(outer.clone())).await.unwrap();
+            p.close().await.unwrap();
+            let log = dir.join("00000000-00000000000000000000.log");
+            let len = std::fs::metadata(&log).unwrap().len();
+            let inner_start = len - u64::try_from(inner.len()).unwrap();
+
+            // A stale checkpoint pointing at the inner batch, carrying a
+            // real batch's CRC (here the outer one's).
+            recovery_checkpoint::write(
+                fs.as_ref(),
+                &dir,
+                &RecoveryCheckpoint {
+                    segment_base: 0,
+                    byte_pos: i64::try_from(len).unwrap(),
+                    last_batch_pos: Some(i64::try_from(inner_start).unwrap()),
+                    last_batch_crc: Some(outer_crc),
+                },
+            )
+            .unwrap();
+
+            let p2 = Partition::open(fs, "t".into(), 0, dir.clone(), PartitionConfig::default())
+                .await
+                .unwrap();
+            assert_eq!(p2.high_watermark(), 2, "not the payload's 1_000_001");
+            assert_eq!(
+                std::fs::metadata(&log).unwrap().len(),
+                len,
+                "nothing truncated"
+            );
+            p2.close().await.unwrap();
+        });
+    }
+
+    /// gh #230 verification: the checkpoint position counts bytes in the
+    /// *active* segment, so a size roll must reset it — otherwise the
+    /// committer never sees 64 MiB of new growth after the first roll.
+    #[test]
+    fn a_size_roll_resets_the_checkpoint_position() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let one_len = u64::try_from(build_batch(1, 1_000).len()).unwrap();
+            let p = Partition::open(
+                fs,
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig {
+                    segment_bytes: one_len,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            p.inner.lock().last_checkpoint_byte = 12_345;
+            p.append(0, -1, build_batch(1, 1_000)).await.unwrap();
+            p.append(0, -1, build_batch(1, 1_000)).await.unwrap(); // rolls
+            assert!(!p.inner.lock().closed.is_empty(), "expected a roll");
+            assert_eq!(p.inner.lock().last_checkpoint_byte, 0);
+            p.close().await.unwrap();
         });
     }
 
