@@ -36,7 +36,7 @@ spec:
               kaas_self_fence_events_total exceeded {{ .Values.observability.alerts.thresholds.selfFencePerMinute }}/min for 2 minutes.
               The broker has lost connectivity to the controller; produces are
               being rejected with NOT_LEADER_FOR_PARTITION. Check
-              kaas_heartbeat_rtt_seconds and the controller's
+              kaas_heartbeat_misses_total and the controller's
               kaas_assignment_pushes_total — likely a network partition or
               controller pod issue.
 

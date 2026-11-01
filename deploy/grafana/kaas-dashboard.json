@@ -147,7 +147,7 @@
       "id": 12,
       "type": "stat",
       "title": "assignment.json size",
-      "description": "Approaches the Kubernetes 1MB CR-status cap around 8000 partitions; CR mirror truncates above that.",
+      "description": "assignment.json on the shared volume. Around 8000 partitions it nears 1 MB, where write and parse latency start to matter (KaasAssignmentFileSizeApproachingCap).",
       "gridPos": {"h": 6, "w": 8, "x": 16, "y": 30},
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "targets": [
@@ -204,7 +204,7 @@
       "type": "timeseries",
       "title": "Stale assignments rejected (1m)",
       "description": "Non-zero means a partitioned ex-controller is still writing files. The epoch fence is doing its job — but operators should investigate.",
-      "gridPos": {"h": 6, "w": 8, "x": 0, "y": 52},
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 52},
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "targets": [
         {"expr": "sum by (broker_id) (increase(kaas_stale_assignments_rejected_total[1m]))", "legendFormat": "{{broker_id}}"}
@@ -215,21 +215,10 @@
       "type": "timeseries",
       "title": "Assignment polls (change vs no-change, 1m)",
       "description": "Most polls find no change (false). A burst of true labels = active assignment churn.",
-      "gridPos": {"h": 6, "w": 8, "x": 8, "y": 52},
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 52},
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "targets": [
         {"expr": "sum by (change_detected) (increase(kaas_assignment_polls_total[1m]))", "legendFormat": "change_detected={{change_detected}}"}
-      ]
-    },
-    {
-      "id": 19,
-      "type": "timeseries",
-      "title": "CR mirror writes by result (1m)",
-      "description": "Status updates to KafkaClusterAssignments. not_found is fine briefly during fresh install; persistent error is a problem.",
-      "gridPos": {"h": 6, "w": 8, "x": 16, "y": 52},
-      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
-      "targets": [
-        {"expr": "sum by (result) (increase(kaas_assignment_cr_mirror_writes_total[1m]))", "legendFormat": "{{result}}"}
       ]
     },
     {
