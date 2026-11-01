@@ -153,8 +153,13 @@ what `kafka-get-offsets.sh` and every consumer's `auto.offset.reset` ride on
 
 **Versions**: v1–v7 (flexible from v6)
 
-The handler checks the topic exists (else `UNKNOWN_TOPIC_OR_PARTITION`, 3),
-then translates the request timestamp: `-2` (EARLIEST) returns the partition's
+Gates run per partition in Apache's order (gh #295): `Describe` on the topic
+(else `TOPIC_AUTHORIZATION_FAILED`, 29, whether or not the topic exists,
+gh #268); the topic exists and the partition is inside its count (else
+`UNKNOWN_TOPIC_OR_PARTITION`, 3); and this broker leads the partition per
+`assignment.json` (else `NOT_LEADER_OR_FOLLOWER`, 6). The leadership gate is
+skipped for `replica_id = -2`, Apache's debugging replica, which any broker
+may answer. The handler then translates the request timestamp: `-2` (EARLIEST) returns the partition's
 `log_start_offset`, `-1` (LATEST) returns the high watermark — both echoed
 with `timestamp = -1`, matching Apache's sentinel-response shape. Any other
 timestamp is passed to the engine's `offset_for_timestamp`.
@@ -178,13 +183,6 @@ timestamp is passed to the engine's `offset_for_timestamp`.
   ([non-goals](../non-goals.md)); on the wire they fall into the same
   `(-1, -1)` path as any other timestamp.
 - `leader_epoch` is always `0` in success responses.
-- No leadership gate: there is no `Coordinator::owns` check — a non-leader
-  broker answers from its local engine view (typically offset `0`) instead of
-  `NOT_LEADER_OR_FOLLOWER`. Clients that route by Metadata leadership never
-  hit this in steady state. Authorization does match Apache (gh #268):
-  `Describe` on the topic, checked before existence, so every partition of a
-  denied topic answers `TOPIC_AUTHORIZATION_FAILED` (29) whether or not the
-  topic exists.
 
 **Source**: `crates/kaas-broker/src/handlers/list_offsets.rs`,
 `crates/kaas-codec/src/api/list_offsets.rs`; the sentinel-returning engine
@@ -192,7 +190,8 @@ lookup in `crates/kaas-storage/src/disk.rs`.
 
 **Verified by**: handler unit tests `latest_returns_high_watermark`,
 `earliest_returns_log_start_offset`, `unknown_topic_returns_3`,
-`topic_without_describe_returns_29_existing_or_not`. Shell suite:
+`topic_without_describe_returns_29_existing_or_not`,
+`existence_and_range_before_leadership`. Shell suite:
 `scripts/kafka-get-offsets.sh` (exercises the `-2`/`-1` sentinels before and
 after producing — the paths clients actually use).
 

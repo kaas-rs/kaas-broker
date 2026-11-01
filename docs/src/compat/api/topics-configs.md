@@ -117,9 +117,12 @@ Advances a partition's log start offset ([KIP-107](../kip/kip-107.md)) —
 **Versions**: v0–v2 (flexible from v2).
 
 **Handling**: this is a storage-path API, not a CR write. Per partition the
-handler applies the same ownership gate Produce uses — with a cluster
-coordinator wired, partitions this broker doesn't lead answer
-`NOT_LEADER_OR_FOLLOWER` (6). The storage engine then advances `logStart` to
+handler runs the same gates as Produce, in Apache's order: `Delete` on the
+topic (else `TOPIC_AUTHORIZATION_FAILED`, 29, and nothing is purged); the topic
+exists and the partition is inside its count (else
+`UNKNOWN_TOPIC_OR_PARTITION`, 3, gh #295); and, with a cluster coordinator
+wired, this broker leads the partition (else `NOT_LEADER_OR_FOLLOWER`, 6). The
+storage engine then advances `logStart` to
 the target offset (`-1` = purge to the high watermark; a target past the HWM
 is `OFFSET_OUT_OF_RANGE` (1)) and returns the new low watermark. Records below
 `logStart` become invisible to Fetch immediately, and closed segments that
@@ -133,15 +136,15 @@ because only the leader holds open handles.
   moves immediately; the covering bytes are reclaimed later by segment roll
   and retention. Apache behaves similarly for partial segments but kaas holds
   the active segment even when the purge covers the entire log.
-- Authorization: `Delete` on the topic, as in Apache — denial answers
-  `TOPIC_AUTHORIZATION_FAILED` (29) per partition and nothing is purged.
 
 **Source**: `crates/kaas-broker/src/handlers/delete_records.rs`,
 `crates/kaas-storage/src/partition.rs` (`delete_records`),
 `crates/kaas-storage/src/disk.rs`.
 
 **Verified by**: `scripts/kafka-delete-records.sh` (produce 10, purge to 7,
-assert earliest = 7); `delete_records_*` unit tests in
+assert earliest = 7); the handler's
+`denied_delete_returns_authz_failed_and_purges_nothing` and
+`existence_and_range_before_leadership`; `delete_records_*` unit tests in
 `crates/kaas-storage/src/partition.rs` and `crates/kaas-storage/src/memory.rs`.
 
 ## DescribeConfigs

@@ -192,3 +192,65 @@ pub(crate) mod test_authz {
         }
     }
 }
+
+/// A real [`Coordinator`](crate::coordinator::Coordinator) for handler
+/// tests, so a leadership gate is exercised rather than skipped (no
+/// coordinator = dev mode = "lead everything").
+#[cfg(test)]
+pub(crate) mod test_cluster {
+    use std::path::Path;
+    use std::sync::Arc;
+
+    use crate::assignment::{
+        Assignment, BrokerAssignment, BrokerHealth, PartitionAssignment, PartitionRole,
+    };
+    use crate::broker::Broker;
+    use crate::coordinator::{Coordinator, LocalHeartbeat, LocalLeaseEpoch};
+
+    /// This broker's id in the installed assignment.
+    pub const SELF: &str = "test";
+    /// The peer that leads whatever this broker doesn't.
+    pub const PEER: &str = "kaas-1";
+
+    /// Write an `assignment.json` under `cluster_dir` naming `leaders`
+    /// (`(topic, partition, broker)`), load it, and install the
+    /// coordinator on `b`. Partitions not listed are led by nobody.
+    pub fn install(b: &Arc<Broker>, cluster_dir: &Path, leaders: &[(&str, i32, &str)]) {
+        let broker = |id: &str| BrokerAssignment {
+            id: id.to_owned(),
+            health: BrokerHealth::Alive,
+            last_seen: "x".to_owned(),
+        };
+        let a = Assignment {
+            controller_epoch: 1,
+            assignment_version: 1,
+            generated_at: "2026-01-01T00:00:00Z".to_owned(),
+            controller: SELF.to_owned(),
+            brokers: vec![broker(SELF), broker(PEER)],
+            partitions: leaders
+                .iter()
+                .map(|(topic, partition, leader)| PartitionAssignment {
+                    topic: (*topic).to_owned(),
+                    partition: *partition,
+                    broker: (*leader).to_owned(),
+                    epoch: 1,
+                    role: PartitionRole::Leader,
+                })
+                .collect(),
+            consumer_groups: Vec::new(),
+        };
+        std::fs::write(
+            cluster_dir.join("assignment.json"),
+            serde_json::to_vec(&a).unwrap(),
+        )
+        .unwrap();
+        let c = Coordinator::new(
+            SELF,
+            cluster_dir,
+            Arc::new(LocalLeaseEpoch),
+            Arc::new(LocalHeartbeat),
+        );
+        assert!(c.apply_if_new(), "coordinator must load the assignment");
+        b.install_coordinator(c);
+    }
+}

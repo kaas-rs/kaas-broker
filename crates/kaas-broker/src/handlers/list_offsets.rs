@@ -4,6 +4,16 @@
 //! - `-2` (EARLIEST) → `log_start_offset`
 //! - `-1` (LATEST)   → `high_watermark`
 //! - otherwise       → `engine.offset_for_timestamp(ts)`
+//!
+//! Gates run per partition, as in Apache's `handleListOffsetRequest` and
+//! `fetchOffsetForTimestamp` (gh #295):
+//! 1. `Describe` on the topic (29).
+//! 2. The topic exists and the partition is inside its count (3).
+//! 3. With a cluster `Coordinator` wired, this broker leads the
+//!    partition (6). The exception is `replica_id = -2`, Apache's
+//!    debugging replica, which any broker may answer. A non-leader's
+//!    engine has no open partition, so before this it answered 0 for
+//!    both offsets instead of redirecting the client.
 
 use std::sync::Arc;
 
@@ -19,10 +29,13 @@ use super::principal_from;
 use crate::broker::Broker;
 
 const ERR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+const ERR_NOT_LEADER_OR_FOLLOWER: i16 = 6;
 const ERR_TOPIC_AUTHZ_FAILED: i16 = 29;
 
 const TS_EARLIEST: i64 = -2;
 const TS_LATEST: i64 = -1;
+/// `ListOffsetsRequest.DEBUGGING_REPLICA_ID`: answered from any broker.
+const DEBUGGING_REPLICA_ID: i32 = -2;
 
 #[derive(Debug)]
 pub struct ListOffsetsHandler {
@@ -59,7 +72,7 @@ impl Handler for ListOffsetsHandler {
             let mut parts = Vec::with_capacity(t.partitions.len());
             for p in &t.partitions {
                 parts.push(if authorized {
-                    self.resolve_one(&t.name, p)
+                    self.resolve_one(&t.name, p, req.replica_id)
                 } else {
                     error_partition(p.partition_index, ERR_TOPIC_AUTHZ_FAILED)
                 });
@@ -85,9 +98,22 @@ impl ListOffsetsHandler {
         &self,
         topic: &str,
         p: &list_offsets::Partition,
+        replica_id: i32,
     ) -> list_offsets::PartitionResponse {
-        if self.broker.topics.get(topic).is_none() {
+        if !self
+            .broker
+            .topics
+            .get(topic)
+            .is_some_and(|m| (0..m.partition_count).contains(&p.partition_index))
+        {
             return error_partition(p.partition_index, ERR_UNKNOWN_TOPIC_OR_PARTITION);
+        }
+        if replica_id != DEBUGGING_REPLICA_ID {
+            if let Some(c) = self.broker.coordinator() {
+                if !c.owns(topic, p.partition_index) {
+                    return error_partition(p.partition_index, ERR_NOT_LEADER_OR_FOLLOWER);
+                }
+            }
         }
         let (timestamp, offset) = match p.timestamp {
             TS_EARLIEST => {
@@ -184,6 +210,27 @@ mod tests {
         w.freeze()
     }
 
+    /// A whole v6 request (flexible), for multi-partition shapes.
+    fn encode_v6(req: &list_offsets::Request) -> Bytes {
+        let mut w = BytesMut::new();
+        write_i32(&mut w, req.replica_id);
+        write_i8(&mut w, req.isolation_level);
+        write_array_len(&mut w, req.topics.len(), true).unwrap();
+        for t in &req.topics {
+            write_str(&mut w, &t.name, true).unwrap();
+            write_array_len(&mut w, t.partitions.len(), true).unwrap();
+            for p in &t.partitions {
+                write_i32(&mut w, p.partition_index);
+                write_i32(&mut w, p.current_leader_epoch);
+                write_i64(&mut w, p.timestamp);
+                tagged::write_empty(&mut w);
+            }
+            tagged::write_empty(&mut w);
+        }
+        tagged::write_empty(&mut w);
+        w.freeze()
+    }
+
     #[tokio::test]
     async fn latest_returns_high_watermark() {
         let h = ListOffsetsHandler::new(broker_with_topic("t"));
@@ -245,5 +292,62 @@ mod tests {
         let mut r = out.freeze();
         let resp = list_offsets::decode_response(&mut r, 6).unwrap();
         assert_eq!(resp.topics[0].partitions[0].error_code, 3);
+    }
+
+    /// gh #295: after the Describe ACL, Apache's order is existence and
+    /// partition range (3), then leadership (6) unless `replica_id` is
+    /// the debugging replica (-2). A coordinator is installed so the
+    /// leadership gate runs: `t-0` is a peer's, `t-1` is ours.
+    #[tokio::test]
+    async fn existence_and_range_before_leadership() {
+        use crate::handlers::test_cluster::{self, PEER, SELF};
+        let tmp = tempfile::tempdir().unwrap();
+        let topics = Arc::new(TopicRegistry::new());
+        topics.insert(TopicMeta {
+            name: "t".to_owned(),
+            partition_count: 2,
+            topic_id: [0; 16],
+        });
+        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let b = Arc::new(Broker::new(engine, topics, "test", 0));
+        test_cluster::install(&b, tmp.path(), &[("t", 0, PEER), ("t", 1, SELF)]);
+        let h = ListOffsetsHandler::new(b);
+
+        let codes = |replica_id: i32| {
+            let req = list_offsets::Request {
+                replica_id,
+                isolation_level: 0,
+                topics: [("t", vec![0, 1, 2, 999]), ("missing", vec![0])]
+                    .into_iter()
+                    .map(|(name, parts)| list_offsets::Topic {
+                        name: name.to_owned(),
+                        partitions: parts
+                            .into_iter()
+                            .map(|partition_index| list_offsets::Partition {
+                                partition_index,
+                                current_leader_epoch: -1,
+                                timestamp: TS_LATEST,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            };
+            let body = encode_v6(&req);
+            let h = &h;
+            async move {
+                let out = h.handle(&conn(), 6, body).await.unwrap();
+                let resp = list_offsets::decode_response(&mut out.freeze(), 6).unwrap();
+                resp.topics
+                    .iter()
+                    .flat_map(|t| t.partitions.iter().map(|p| p.error_code))
+                    .collect::<Vec<_>>()
+            }
+        };
+        // A consumer (replica_id -1): t-0 [peer], t-1 [ours], t-2 and
+        // t-999 out of range, a missing topic.
+        assert_eq!(codes(-1).await, [6, 0, 3, 3, 3]);
+        // The debugging replica may ask any broker, but never for a
+        // partition that doesn't exist.
+        assert_eq!(codes(DEBUGGING_REPLICA_ID).await, [0, 0, 3, 3, 3]);
     }
 }
