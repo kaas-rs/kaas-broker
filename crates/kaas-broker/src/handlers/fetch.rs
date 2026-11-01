@@ -95,12 +95,33 @@ impl FetchHandler {
         p: &fetch::Partition,
         read_committed: bool,
     ) -> fetch::PartitionResponse {
-        if self.broker.topics.get(topic).is_none() {
+        // Read ACL first, so a principal without rights learns nothing
+        // about the topic — not whether it exists, not who leads it
+        // (gh #282, as gh #268 did for the discovery APIs).
+        let resource = Resource::topic(topic);
+        if !self
+            .broker
+            .authorizer
+            .authorize(principal, &resource, Operation::Read)
+        {
             return error_partition_bumped(
                 topic,
                 p.partition_index,
-                ERR_UNKNOWN_TOPIC_OR_PARTITION,
+                ERR_TOPIC_AUTHORIZATION_FAILED,
             );
+        }
+
+        // Unknown topic, or a partition past the topic's count: Apache's
+        // UNKNOWN_TOPIC_OR_PARTITION, not a leadership error.
+        match self.broker.topics.get(topic) {
+            Some(meta) if (0..meta.partition_count).contains(&p.partition_index) => {}
+            _ => {
+                return error_partition_bumped(
+                    topic,
+                    p.partition_index,
+                    ERR_UNKNOWN_TOPIC_OR_PARTITION,
+                );
+            }
         }
 
         // Phase 5 cluster check (mirrors Produce). Dev mode (no
@@ -113,19 +134,6 @@ impl FetchHandler {
                     ERR_NOT_LEADER_FOR_PARTITION,
                 );
             }
-        }
-
-        let resource = Resource::topic(topic);
-        if !self
-            .broker
-            .authorizer
-            .authorize(principal, &resource, Operation::Read)
-        {
-            return error_partition_bumped(
-                topic,
-                p.partition_index,
-                ERR_TOPIC_AUTHORIZATION_FAILED,
-            );
         }
 
         // Best-effort metadata; HWM = 0 if the partition has never
@@ -429,5 +437,44 @@ mod tests {
         let resp = fetch::decode_response(&mut r, 12).unwrap();
         assert_eq!(resp.session_id, 0, "session_id must be 0 (gh #4)");
         assert_eq!(resp.responses[0].partitions[0].error_code, 3);
+    }
+
+    /// gh #282: the Read ACL comes first, so a principal without rights
+    /// gets 29 whether or not the topic exists; with rights, a partition
+    /// past the topic's count is Apache's 3, not a leadership error.
+    #[tokio::test]
+    async fn acl_before_existence_and_range_is_unknown_partition() {
+        use crate::handlers::test_authz::DenyAllAuthorizer;
+        let part = |i| fetch::Partition {
+            partition_index: i,
+            current_leader_epoch: -1,
+            fetch_offset: 0,
+            last_fetched_epoch: -1,
+            log_start_offset: -1,
+            partition_max_bytes: 1024,
+        };
+        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let topics = Arc::new(TopicRegistry::new());
+        topics.insert(TopicMeta {
+            name: "t".to_owned(),
+            partition_count: 1,
+            topic_id: [0; 16],
+        });
+        let denied = FetchHandler::new(Arc::new(Broker::with_auth(
+            engine,
+            topics,
+            "test",
+            0,
+            Arc::new(DenyAllAuthorizer),
+            Arc::new(kaas_auth::NoQuotaChecker),
+        )));
+        let anon = Principal::anonymous();
+        for topic in ["t", "missing"] {
+            let r = denied.read_one(&anon, topic, &part(0), false).await;
+            assert_eq!(r.error_code, ERR_TOPIC_AUTHORIZATION_FAILED, "{topic}");
+        }
+        let allowed = FetchHandler::new(broker());
+        let r = allowed.read_one(&anon, "t", &part(999), false).await;
+        assert_eq!(r.error_code, ERR_UNKNOWN_TOPIC_OR_PARTITION);
     }
 }

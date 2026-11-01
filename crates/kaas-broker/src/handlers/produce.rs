@@ -137,10 +137,27 @@ impl ProduceHandler {
         p: &produce::PartitionData,
         acks: i16,
     ) -> produce::PartitionResponse {
-        // Quick "topic exists" check before going to the engine —
-        // matches Apache's UNKNOWN_TOPIC_OR_PARTITION granularity.
-        if self.broker.topics.get(topic).is_none() {
-            return error_partition_bumped(topic, p.index, ERR_UNKNOWN_TOPIC_OR_PARTITION);
+        // Cluster-wide ACL check (gh #126). Topic-level Write is the
+        // canonical Apache mapping for Produce. First, so a principal
+        // without rights learns nothing about the topic — not whether it
+        // exists, not who leads it (gh #282, as gh #268 did for the
+        // discovery APIs).
+        let resource = Resource::topic(topic);
+        if !self
+            .broker
+            .authorizer
+            .authorize(principal, &resource, Operation::Write)
+        {
+            return error_partition_bumped(topic, p.index, ERR_TOPIC_AUTHORIZATION_FAILED);
+        }
+
+        // Unknown topic, or a partition past the topic's count: Apache's
+        // UNKNOWN_TOPIC_OR_PARTITION, not a leadership error.
+        match self.broker.topics.get(topic) {
+            Some(meta) if (0..meta.partition_count).contains(&p.index) => {}
+            _ => {
+                return error_partition_bumped(topic, p.index, ERR_UNKNOWN_TOPIC_OR_PARTITION);
+            }
         }
 
         // Phase 5 cluster check: a real `Coordinator` answers "do I
@@ -162,17 +179,6 @@ impl ProduceHandler {
                 m.self_fence_events.add(1, &[]);
                 return error_partition_bumped(topic, p.index, ERR_NOT_LEADER_FOR_PARTITION);
             }
-        }
-
-        // Cluster-wide ACL check (gh #126). Topic-level Write is the
-        // canonical Apache mapping for Produce.
-        let resource = Resource::topic(topic);
-        if !self
-            .broker
-            .authorizer
-            .authorize(principal, &resource, Operation::Write)
-        {
-            return error_partition_bumped(topic, p.index, ERR_TOPIC_AUTHORIZATION_FAILED);
         }
 
         let Some(records) = p.records.clone() else {
@@ -402,5 +408,40 @@ mod tests {
                 .unwrap();
             assert_eq!(c.lock().reply, want, "acks={acks}");
         }
+    }
+
+    /// gh #282: the Write ACL comes first, so a principal without rights
+    /// gets 29 whether or not the topic exists; with rights, a partition
+    /// past the topic's count is Apache's 3, not a leadership error.
+    #[tokio::test]
+    async fn acl_before_existence_and_range_is_unknown_partition() {
+        use crate::handlers::test_authz::DenyAllAuthorizer;
+        let part = |index| produce::PartitionData {
+            index,
+            records: Some(Bytes::from_static(&[0; 64])),
+        };
+        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let topics = Arc::new(TopicRegistry::new());
+        topics.insert(TopicMeta {
+            name: "known".to_owned(),
+            partition_count: 1,
+            topic_id: [0; 16],
+        });
+        let denied = ProduceHandler::new(Arc::new(Broker::with_auth(
+            engine,
+            topics,
+            "test",
+            0,
+            Arc::new(DenyAllAuthorizer),
+            Arc::new(kaas_auth::NoQuotaChecker),
+        )));
+        let anon = Principal::anonymous();
+        for topic in ["known", "missing"] {
+            let r = denied.append_one(&anon, topic, &part(0), -1).await;
+            assert_eq!(r.error_code, ERR_TOPIC_AUTHORIZATION_FAILED, "{topic}");
+        }
+        let allowed = ProduceHandler::new(broker_with_topic("known", 1));
+        let r = allowed.append_one(&anon, "known", &part(999), -1).await;
+        assert_eq!(r.error_code, ERR_UNKNOWN_TOPIC_OR_PARTITION);
     }
 }

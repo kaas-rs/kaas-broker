@@ -10,13 +10,16 @@ mechanics end to end; this section covers the wire contract.
 
 **Versions**: v3–v9 (flexible from v9)
 
-Four gates run before any byte reaches the engine, per partition: the topic
-must exist in the registry (else `UNKNOWN_TOPIC_OR_PARTITION`, 3), the broker
-`Coordinator` must own the partition per the applied `assignment.json` (else
-`NOT_LEADER_FOR_PARTITION`, 6), the controller-connectivity self-fence must
-see a fresh controller heartbeat — a broker cut off from the controller
-stops acking within 3 s (also 6) — and the cluster-wide authorizer must
-grant topic Write (else `TOPIC_AUTHORIZATION_FAILED`, 29). A batch larger
+Four gates run before any byte reaches the engine, per partition, in this
+order: the cluster-wide authorizer must grant topic Write (else
+`TOPIC_AUTHORIZATION_FAILED`, 29 — first, so a denied principal learns
+nothing about the topic, as in Apache, gh #282); the topic must exist in the
+registry with the partition inside its count (else
+`UNKNOWN_TOPIC_OR_PARTITION`, 3); the broker `Coordinator` must own the
+partition per the applied `assignment.json` (else
+`NOT_LEADER_FOR_PARTITION`, 6); and the controller-connectivity self-fence
+must see a fresh controller heartbeat — a broker cut off from the
+controller stops acking within 3 s (also 6). A batch larger
 than Apache's `message.max.bytes` default (1 MiB + 12 bytes batch overhead)
 is rejected with `MESSAGE_TOO_LARGE` (18) before it hits storage.
 
@@ -70,9 +73,9 @@ contract: batch bytes come back off disk undecoded (see the
 
 **Versions**: v4–v12 (flexible from v12)
 
-The front door mirrors Produce: topic-exists, `Coordinator::owns`, and a
-cluster-wide topic Read ACL check, per partition (there is no self-fence gate
-on reads). The handler then picks the read cap: the high watermark for
+The front door mirrors Produce, in the same order: the cluster-wide topic
+Read ACL check, topic-exists with the partition inside its count, then
+`Coordinator::owns`, per partition (there is no self-fence gate on reads). The handler then picks the read cap: the high watermark for
 `read_uncommitted`, the last stable offset for `read_committed` (the LSO is
 the highest offset with no in-flight transaction extending past it). The
 engine copies batch bytes from the segment files into memory; for

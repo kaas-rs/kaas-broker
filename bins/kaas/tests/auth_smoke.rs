@@ -406,14 +406,15 @@ async fn scram_handshake_then_authenticate_unblocks_produce() {
         "Write on allowed topic must succeed"
     );
 
-    // 6. Produce to "denied" topic the broker doesn't know about —
-    // UNKNOWN_TOPIC_OR_PARTITION (3) is the broker's fast-path miss,
-    // before the ACL evaluator runs.
+    // 6. Produce to "denied", a topic the broker doesn't know and alice
+    // may not write: TOPIC_AUTHORIZATION_FAILED (29). The ACL is checked
+    // before existence, as in Apache, so the error never confirms whether
+    // a topic exists (gh #282; it used to answer 3 here).
     let resp = send(&mut sock, &produce_frame_v9("denied", records.clone(), 6)).await;
     let body = strip_response_header(&resp, HeaderVersion::V2);
     let mut b = body;
     let r = produce::decode_response(&mut b, 9).unwrap();
-    assert_eq!(r.responses[0].partition_responses[0].error_code, 3);
+    assert_eq!(r.responses[0].partition_responses[0].error_code, 29);
 
     cancel.cancel();
 }
