@@ -59,6 +59,11 @@ pub const ERR_INVALID_TXN_STATE: i16 = 48;
 /// `CONCURRENT_TRANSACTIONS` — markers in flight, or an `Ongoing`
 /// transaction this request just aborted. Retriable.
 pub const ERR_CONCURRENT_TRANSACTIONS: i16 = 51;
+/// `INVALID_TRANSACTION_TIMEOUT` — a transactional producer's timeout is
+/// not in `1..=TRANSACTION_MAX_TIMEOUT_MS`.
+pub const ERR_INVALID_TRANSACTION_TIMEOUT: i16 = 50;
+/// Apache's `transaction.max.timeout.ms` default (15 minutes).
+pub const TRANSACTION_MAX_TIMEOUT_MS: i32 = 900_000;
 /// `INVALID_REQUEST` — exactly one of the v3+ claimed
 /// `producer_id` / `producer_epoch` is the `-1` sentinel.
 pub const ERR_INVALID_REQUEST: i16 = 42;
@@ -140,6 +145,14 @@ impl InitProducerIdHandler {
         timeout_ms: i32,
         expected: Option<(i64, i16)>,
     ) -> init_producer_id::Response {
+        // Apache's `validateTransactionTimeoutMs`, checked before
+        // coordinator routing as in `TransactionCoordinator`. A timeout of
+        // 0 or below used to be stored as "no timeout", which the reaper
+        // skips: a dead producer's transaction then pinned the LSO
+        // forever (gh #198 verification).
+        if !(1..=TRANSACTION_MAX_TIMEOUT_MS).contains(&timeout_ms) {
+            return error_response(ERR_INVALID_TRANSACTION_TIMEOUT);
+        }
         // gh #91 routing — reject on the wrong broker before
         // touching the PID counter or the store.
         if !self.broker.owns_txn(txn_id) {
@@ -642,5 +655,35 @@ mod tests {
             let resp = init_producer_id::decode_response(&mut out.freeze(), version).unwrap();
             assert_eq!(resp.error_code, want, "v{version}");
         }
+    }
+
+    /// A transactional producer's timeout must be in
+    /// `1..=transaction.max.timeout.ms` (900000), else Apache's
+    /// INVALID_TRANSACTION_TIMEOUT (50), with no PID handed out and no
+    /// store entry. 0 or below used to disable the timeout reaper for the
+    /// transaction. The idempotent path doesn't use the timeout and isn't
+    /// checked.
+    #[tokio::test]
+    async fn a_transaction_timeout_outside_apaches_range_is_50() {
+        let (_t, b) = broker_with_txn();
+        let store = b.txn_state().unwrap();
+        let h = InitProducerIdHandler::new(b);
+        for timeout in [0, -1, i32::MIN, 900_001, i32::MAX] {
+            let resp = call(&h, Some("tx-1"), timeout).await;
+            assert_eq!(resp.error_code, 50, "timeout {timeout}");
+            assert_eq!(resp.producer_id, -1, "timeout {timeout}");
+        }
+        assert!(
+            !store.snapshot().contains_key("tx-1"),
+            "no entry may be created"
+        );
+        for timeout in [1, 900_000] {
+            assert_eq!(
+                call(&h, Some("tx-1"), timeout).await.error_code,
+                0,
+                "{timeout}"
+            );
+        }
+        assert_eq!(call(&h, None, 0).await.error_code, 0, "idempotent path");
     }
 }

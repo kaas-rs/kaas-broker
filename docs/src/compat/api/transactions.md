@@ -116,9 +116,12 @@ epoch 0, and a one-shot warning that the rejoin fence is disabled.
 
 **Deviations from Apache 3.7**:
 
-- `transaction_timeout_ms` is not validated against a
-  `transaction.max.timeout.ms` ceiling (Apache rejects oversized values
-  with `INVALID_TRANSACTION_TIMEOUT`); kaas records whatever is sent.
+- The `transaction.max.timeout.ms` ceiling is fixed at Apache's default,
+  900000 ms, and not configurable. A transactional InitProducerId whose
+  timeout is outside `1..=900000` is refused with
+  `INVALID_TRANSACTION_TIMEOUT` (50), as in Apache. Until the gh #198
+  verification it was recorded as sent, and a timeout of 0 or below
+  exempted the transaction from the timeout reaper.
 - PID allocation is cluster-unique but by a different mechanism than
   Apache's. Apache allocates PID blocks through the quorum; kaas has no
   quorum, so it **partitions the PID space per broker**
