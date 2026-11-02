@@ -35,6 +35,11 @@ pub enum StorageError {
     /// Topic / partition does not exist in the engine.
     #[error("unknown topic or partition")]
     UnknownTopicOrPartition,
+    /// The batch is larger than the topic's `segment.bytes`, so no segment
+    /// can hold it. Apache's `RecordBatchTooLargeException`; wire error
+    /// 18, `RECORD_LIST_TOO_LARGE`.
+    #[error("record batch larger than segment.bytes")]
+    RecordBatchTooLarge,
 
     /// Read offset is outside `[log_start_offset, high_watermark)`.
     #[error("offset out of range")]

@@ -441,4 +441,37 @@ mod tests {
             }
         }
     }
+
+    /// gh #285 (KIP-588): AddPartitionsToTxn learned PRODUCER_FENCED (90)
+    /// at v2. A v1 client gets INVALID_PRODUCER_EPOCH (47), on every
+    /// partition.
+    #[tokio::test]
+    async fn a_pre_v2_client_is_fenced_with_invalid_producer_epoch() {
+        let (_t, b) = broker_with_txn();
+        let store = b.txn_state().unwrap();
+        let (pid, _epoch) = store.get_or_allocate("tx-1", || 42).unwrap();
+        let h = AddPartitionsToTxnHandler::new(b);
+        let req = add_partitions_to_txn::Request {
+            transactional_id: "tx-1".into(),
+            producer_id: pid,
+            producer_epoch: 99,
+            topics: vec![add_partitions_to_txn::Topic {
+                name: "t".into(),
+                partitions: vec![0],
+            }],
+        };
+        for (version, want) in [(1, 47), (2, 90)] {
+            let out = h
+                .handle(&conn(), version, encode_request(&req, version))
+                .await
+                .unwrap();
+            let resp = add_partitions_to_txn::decode_response(&mut out.freeze(), version).unwrap();
+            let codes: Vec<i16> = resp
+                .results
+                .iter()
+                .flat_map(|t| t.partition_results.iter().map(|p| p.error_code))
+                .collect();
+            assert_eq!(codes, [want], "v{version}");
+        }
+    }
 }

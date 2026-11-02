@@ -37,7 +37,10 @@ Four facts are shared by everything below:
   coordinator-side handler: unknown id or PID mismatch →
   `INVALID_PRODUCER_ID_MAPPING` (49); epoch mismatch → `PRODUCER_FENCED`
   (90, the txn-coordinator convention — the Produce path keeps
-  `INVALID_PRODUCER_EPOCH` 47); transition already in flight →
+  `INVALID_PRODUCER_EPOCH` 47). A client that predates code 90 gets 47
+  instead, as Apache's KIP-588 down-conversion does: InitProducerId below
+  v4, and AddPartitionsToTxn, AddOffsetsToTxn and EndTxn below v2
+  (gh #285). Transition already in flight →
   `CONCURRENT_TRANSACTIONS` (51); store not yet wired at boot →
   `COORDINATOR_NOT_AVAILABLE` (15, retryable); empty `transactional.id`
   → `INVALID_REQUEST` (42); invalid transition → `INVALID_TXN_STATE`

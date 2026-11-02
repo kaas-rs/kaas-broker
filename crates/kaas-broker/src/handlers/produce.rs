@@ -48,6 +48,9 @@ const ERR_NOT_LEADER_FOR_PARTITION: i16 = 6;
 /// `max.message.bytes`. Until gh #285 this was 18, `RECORD_LIST_TOO_LARGE`,
 /// which the Java producer doesn't answer by splitting the batch.
 const ERR_MESSAGE_TOO_LARGE: i16 = 10;
+/// Apache's `RECORD_LIST_TOO_LARGE` (`RecordBatchTooLargeException`): a
+/// batch larger than the topic's `segment.bytes`.
+const ERR_RECORD_LIST_TOO_LARGE: i16 = 18;
 /// Mirrors Apache Kafka's `message.max.bytes` default: 1 MiB of
 /// records plus 12 bytes of batch overhead (gh #14).
 /// Apache's `message.max.bytes` default (1 MiB + batch overhead).
@@ -426,6 +429,7 @@ fn map_error(topic: &str, index: i32, err: &StorageError) -> produce::PartitionR
         StorageError::DuplicateSequence => ERR_DUPLICATE_SEQUENCE_NUMBER,
         StorageError::InvalidProducerEpoch => ERR_INVALID_PRODUCER_EPOCH,
         StorageError::UnknownTopicOrPartition => ERR_UNKNOWN_TOPIC_OR_PARTITION,
+        StorageError::RecordBatchTooLarge => ERR_RECORD_LIST_TOO_LARGE,
         StorageError::Stalled => ERR_LEADER_NOT_AVAILABLE,
         // Mid-migration (gh #221 phase 3): retriable; the client
         // refreshes metadata and retries after the cutover.
@@ -810,5 +814,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A batch larger than the topic's `segment.bytes` is Apache's
+    /// RECORD_LIST_TOO_LARGE, 18 (`RecordBatchTooLargeException`), as
+    /// opposed to MESSAGE_TOO_LARGE (10) for one over `max.message.bytes`.
+    #[test]
+    fn a_batch_over_segment_bytes_is_record_list_too_large_18() {
+        let r = map_error("t", 0, &StorageError::RecordBatchTooLarge);
+        assert_eq!(r.error_code, 18);
     }
 }

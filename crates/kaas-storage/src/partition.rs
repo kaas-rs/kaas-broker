@@ -886,6 +886,12 @@ impl Partition {
             // age out at all: retention only deletes closed segments.
             let cfg = self.cfg.load();
             let batch_len_u64 = u64::try_from(batch.len()).unwrap_or(u64::MAX);
+            // Apache's UnifiedLog.append refuses a batch no segment can
+            // hold (`RecordBatchTooLargeException`). Without this a batch
+            // over `segment.bytes` was accepted into an oversized segment.
+            if batch_len_u64 > cfg.segment_bytes {
+                return Err(StorageError::RecordBatchTooLarge);
+            }
             let projected_size = guard.active.log_size().saturating_add(batch_len_u64);
             let too_big = projected_size > cfg.segment_bytes;
             // Short-circuit: the age check is the cheap-but-not-free
@@ -3863,6 +3869,33 @@ mod tests {
                 !p.inner.lock().closed.is_empty(),
                 "expected at least one roll"
             );
+            p.close().await.unwrap();
+        });
+    }
+
+    /// A batch larger than `segment.bytes` can't fit any segment: Apache
+    /// refuses it (`RecordBatchTooLargeException`), and nothing is written.
+    #[test]
+    fn a_batch_over_segment_bytes_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let big = build_batch(1, 1_000);
+            let p = Partition::open(
+                fs,
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig {
+                    segment_bytes: u64::try_from(big.len()).unwrap() - 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let err = p.append(0, -1, big).await.unwrap_err();
+            assert!(matches!(err, StorageError::RecordBatchTooLarge), "{err:?}");
+            assert_eq!(p.high_watermark(), 0);
             p.close().await.unwrap();
         });
     }

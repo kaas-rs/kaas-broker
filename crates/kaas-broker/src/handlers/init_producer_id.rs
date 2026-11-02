@@ -618,4 +618,29 @@ mod tests {
         assert_eq!(retry.producer_id, old.producer_id);
         assert_eq!(retry.producer_epoch, fence_epoch + 1);
     }
+
+    /// gh #285 (KIP-588): InitProducerId learned PRODUCER_FENCED (90) at
+    /// v4. A v3 client, which can already send a KIP-360 claim, gets
+    /// INVALID_PRODUCER_EPOCH (47) for the same stale claim.
+    #[tokio::test]
+    async fn a_pre_v4_client_is_fenced_with_invalid_producer_epoch() {
+        let (_t, b) = broker_with_txn();
+        let h = InitProducerIdHandler::new(b);
+        let zombie = call(&h, Some("tx-1"), 60_000).await;
+        let _live = call(&h, Some("tx-1"), 60_000).await;
+        for (version, want) in [(3, 47), (4, 90)] {
+            let req = init_producer_id::Request {
+                transactional_id: Some("tx-1".to_owned()),
+                transaction_timeout_ms: 60_000,
+                producer_id: zombie.producer_id,
+                producer_epoch: zombie.producer_epoch,
+            };
+            let out = h
+                .handle(&conn(), version, encode_request(&req, version))
+                .await
+                .unwrap();
+            let resp = init_producer_id::decode_response(&mut out.freeze(), version).unwrap();
+            assert_eq!(resp.error_code, want, "v{version}");
+        }
+    }
 }

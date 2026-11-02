@@ -35,6 +35,8 @@ than Apache's `message.max.bytes` default (1 MiB + 12 bytes batch overhead)
 is rejected with `MESSAGE_TOO_LARGE` (10) before it hits storage — Apache's
 code for a batch over `max.message.bytes`, which the Java producer answers by
 splitting the batch (until gh #285 kaas sent 18, `RECORD_LIST_TOO_LARGE`).
+A batch larger than the topic's `segment.bytes`, which no segment can hold,
+is `RECORD_LIST_TOO_LARGE` (18), as in Apache's `UnifiedLog.append`.
 A batch whose CRC doesn't match is `CORRUPT_MESSAGE` (2) and is never acked.
 The recovery scan would stop at it and truncate every acked record behind it.
 A control batch from a client is refused with `INVALID_RECORD` (87), as in
