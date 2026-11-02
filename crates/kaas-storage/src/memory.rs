@@ -208,9 +208,13 @@ impl StorageEngine for MemoryStorage {
             .ok_or(StorageError::UnknownTopicOrPartition)?;
         let mut guard = entry.lock();
         // KIP-107: target == -1 means "purge to HWM".
-        let new_start = if target_offset < 0 {
+        // gh #300: only -1 (`DeleteRecordsRequest.HIGH_WATERMARK`) means
+        // the high watermark. Any other negative offset is out of range,
+        // as in Apache's `deleteRecordsOnLeader`; it used to purge the
+        // whole partition.
+        let new_start = if target_offset == -1 {
             guard.high_water
-        } else if target_offset > guard.high_water {
+        } else if !(0..=guard.high_water).contains(&target_offset) {
             return Err(StorageError::OffsetOutOfRange);
         } else {
             target_offset
@@ -462,6 +466,12 @@ mod tests {
             s.append("t", 0, 0, -1, build_batch(0, 1)).await.unwrap();
             let err = s.delete_records("t", 0, 999).await.unwrap_err();
             assert!(matches!(err, StorageError::OffsetOutOfRange));
+            // gh #300: only -1 means the high watermark.
+            for offset in [-2, -5, i64::MIN] {
+                let err = s.delete_records("t", 0, offset).await.unwrap_err();
+                assert!(matches!(err, StorageError::OffsetOutOfRange), "{offset}");
+            }
+            assert_eq!(s.log_start_offset("t", 0).unwrap(), 0);
         });
     }
 

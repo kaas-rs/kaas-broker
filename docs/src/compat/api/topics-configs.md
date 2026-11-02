@@ -142,8 +142,10 @@ exists and the partition is inside its count (else
 `UNKNOWN_TOPIC_OR_PARTITION`, 3, gh #295); and, with a cluster coordinator
 wired, this broker leads the partition (else `NOT_LEADER_OR_FOLLOWER`, 6). The
 storage engine then advances `logStart` to
-the target offset (`-1` = purge to the high watermark; a target past the HWM
-is `OFFSET_OUT_OF_RANGE` (1)) and returns the new low watermark. Records below
+the target offset (`-1` = purge to the high watermark; a target past the HWM,
+or any other negative offset, is `OFFSET_OUT_OF_RANGE` (1) and deletes nothing —
+until gh #300 every negative offset purged the whole partition) and returns the
+new low watermark. Records below
 `logStart` become invisible to Fetch immediately, and closed segments that
 fall entirely below it are unlinked from disk on the spot — safe on NFS
 because only the leader holds open handles.

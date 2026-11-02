@@ -1074,9 +1074,13 @@ impl Partition {
     pub async fn delete_records(&self, target_offset: i64) -> Result<i64, StorageError> {
         let new_log_start = {
             let mut guard = self.inner.lock();
-            let new_start = if target_offset < 0 {
+            // gh #300: only -1 (`DeleteRecordsRequest.HIGH_WATERMARK`) means
+            // the high watermark. Any other negative offset is out of range,
+            // as in Apache's `deleteRecordsOnLeader`; it used to purge the
+            // whole partition.
+            let new_start = if target_offset == -1 {
                 guard.high_water
-            } else if target_offset > guard.high_water {
+            } else if !(0..=guard.high_water).contains(&target_offset) {
                 return Err(StorageError::OffsetOutOfRange);
             } else {
                 target_offset
@@ -3237,6 +3241,13 @@ mod tests {
             p.append(0, -1, build_batch(1, 1_000)).await.unwrap();
             let err = p.delete_records(999).await.unwrap_err();
             assert!(matches!(err, StorageError::OffsetOutOfRange));
+            // gh #300: only -1 means the high watermark. Any other
+            // negative offset is out of range and deletes nothing.
+            for offset in [-2, -5, i64::MIN] {
+                let err = p.delete_records(offset).await.unwrap_err();
+                assert!(matches!(err, StorageError::OffsetOutOfRange), "{offset}");
+            }
+            assert_eq!(p.log_start_offset(), 0, "a negative offset purged the log");
             p.close().await.unwrap();
         });
     }
