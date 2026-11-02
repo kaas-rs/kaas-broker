@@ -143,6 +143,11 @@ fn read_snapshot(
     max_bytes: usize,
 ) -> Result<Bytes, StorageError> {
     let effective_start = start_offset.max(snap.log_start);
+    // KIP-74 at the edge (gh #287 verification): a limit of 0 still gets
+    // the first batch whole, as in Apache's `LogSegment.read`
+    // (`max(maxSize, firstBatchSize)`) and kaas's memory engine. The loops
+    // below read nothing at 0, which stalled such a consumer silently.
+    let max_bytes = max_bytes.max(1);
     let mut out = bytes::BytesMut::new();
 
     for (i, seg) in snap.closed.iter().enumerate() {
@@ -3697,6 +3702,13 @@ mod tests {
             p.append(0, -1, build_batch(1, 2_000)).await.unwrap();
             let got = p.read(0, 50).await.unwrap();
             assert_eq!(got.len(), big.len(), "the first batch, whole, and only it");
+            // Even at a limit of 0 (`max.partition.fetch.bytes` may be 0).
+            let got = p.read(0, 0).await.unwrap();
+            assert_eq!(
+                got.len(),
+                big.len(),
+                "a zero limit still returns the first batch"
+            );
             let got = p.read(0, 1 << 20).await.unwrap();
             assert_eq!(got.len(), 2 * big.len());
             p.close().await.unwrap();
