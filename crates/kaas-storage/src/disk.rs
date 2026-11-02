@@ -616,7 +616,7 @@ impl StorageEngine for DiskStorageEngine {
         topic: &str,
         partition: i32,
         log_dir: &str,
-    ) -> Result<PathBuf, StorageError> {
+    ) -> Result<Option<PathBuf>, StorageError> {
         let target_root = if log_dir == crate::engine::DEFAULT_LOG_DIR_NAME {
             self.data_dir.clone()
         } else {
@@ -629,8 +629,11 @@ impl StorageEngine for DiskStorageEngine {
         let key = (topic.to_owned(), partition);
         let src_dir = self.partition_dir(topic, partition);
         let dst_dir = target_root.join(topic).join(partition.to_string());
+        // Already there (gh #297): Apache skips the move and answers
+        // NONE. Returning `src_dir` here handed the live partition to the
+        // caller's reclaim.
         if src_dir == dst_dir {
-            return Ok(src_dir);
+            return Ok(None);
         }
         // Single mover per partition; a concurrent request sees the
         // same retriable error producers do.
@@ -654,7 +657,7 @@ impl StorageEngine for DiskStorageEngine {
         .await;
         self.migrating.remove(&key);
         moved?;
-        Ok(src_dir)
+        Ok(Some(src_dir))
     }
 
     async fn relinquish(&self, topic: &str, partition: i32) -> Result<(), StorageError> {
@@ -1331,7 +1334,7 @@ mod tests {
             std::fs::write(src.join("sentinel"), b"x").unwrap();
 
             let returned = e.move_partition_to_log_dir("t", 0, "fast").await.unwrap();
-            assert_eq!(returned, src);
+            assert_eq!(returned, Some(src.clone()));
             assert!(fast_root.join("t/0/sentinel").is_file(), "files copied");
             // Source is left for the caller to reclaim after the
             // placement record flips.
@@ -1344,12 +1347,14 @@ mod tests {
                 .unwrap_err();
             assert!(matches!(err, StorageError::Unsupported(_)));
 
-            // Same-dir move is a no-op Ok.
+            // Same-dir move is a no-op that names nothing to reclaim
+            // (gh #297).
             let same = e
                 .move_partition_to_log_dir("t", 0, "default")
                 .await
                 .unwrap();
-            assert_eq!(same, src);
+            assert_eq!(same, None);
+            assert!(src.join("sentinel").is_file());
         });
     }
 

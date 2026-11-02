@@ -255,16 +255,21 @@ pub trait StorageEngine: Send + Sync + 'static {
 
     /// gh #221 phase 3: move a partition's files to another log dir
     /// (`AlterReplicaLogDirs`, KIP-113). Closes the partition, copies
-    /// its directory to the target log dir, and returns the *source*
-    /// directory (the caller reclaims it after flipping the placement
-    /// record). Appends/reads during the copy fail with
+    /// its directory to the target log dir, and returns `Some(source
+    /// directory)`, which the caller reclaims after flipping the
+    /// placement record. Appends/reads during the copy fail with
     /// [`StorageError::Migrating`] — a brief, retriable window.
+    ///
+    /// `None` means the partition's data is already in the target log
+    /// dir: nothing was copied, and there is **nothing to reclaim**. The
+    /// directory it would name is the live partition (gh #297: returning
+    /// it as the "source" got it deleted).
     async fn move_partition_to_log_dir(
         &self,
         _topic: &str,
         _partition: i32,
         _log_dir: &str,
-    ) -> Result<PathBuf, StorageError> {
+    ) -> Result<Option<PathBuf>, StorageError> {
         Err(StorageError::Unsupported("log-dir moves"))
     }
 

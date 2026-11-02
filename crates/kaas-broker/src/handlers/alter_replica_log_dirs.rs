@@ -88,7 +88,13 @@ pub async fn migrate_partition(
         .move_partition_to_log_dir(topic, partition, log_dir_name)
         .await
     {
-        Ok(src) => src,
+        Ok(Some(src)) => src,
+        // gh #297: the data is already in the target dir. Apache answers
+        // NONE and does nothing. Nothing was copied, so there is nothing
+        // to roll back or reclaim: the directory is the live partition.
+        // The placement record is still brought in line, because a record
+        // that lags the data is how the gh #224 driver reaches this case.
+        Ok(None) => return confirm_placement(broker, topic, partition, log_dir_name).await,
         Err(kaas_storage::StorageError::UnknownTopicOrPartition) => {
             return ERR_UNKNOWN_TOPIC_OR_PARTITION;
         }
@@ -142,6 +148,33 @@ pub async fn migrate_partition(
     }
     info!(topic, partition, log_dir_name, src = %src_dir.display(),
         "AlterReplicaLogDirs: partition moved");
+    ERR_NONE
+}
+
+/// The partition already lives in `log_dir_name`: make the placement
+/// record say so, touching no files.
+async fn confirm_placement(
+    broker: &Broker,
+    topic: &str,
+    partition: i32,
+    log_dir_name: &str,
+) -> i16 {
+    if broker.topics.volume_assignment(topic, partition).as_deref() == Some(log_dir_name) {
+        return ERR_NONE;
+    }
+    if let Some(writer) = broker.cr_writer() {
+        if let Err(err) = writer
+            .set_partition_log_dir(topic, partition, log_dir_name)
+            .await
+        {
+            warn!(topic, partition, %err,
+                "AlterReplicaLogDirs: placement-record update failed; data is already in place");
+            return ERR_KAFKA_STORAGE_ERROR;
+        }
+    }
+    broker
+        .topics
+        .set_volume_assignment(topic, partition, log_dir_name);
     ERR_NONE
 }
 
@@ -325,5 +358,36 @@ mod tests {
         let fast = p.fast_root.clone();
         assert_eq!(alter(&p, &fast).await, 0);
         assert!(p.fast_root.join("t/0/sentinel").is_file(), "not moved");
+    }
+
+    /// gh #297: a move to the dir the partition is already in is Apache's
+    /// no-op, answered 0. It used to hand the live partition dir to the
+    /// reclaim, which deleted it and still answered 0. Covers the wire
+    /// path (the default root, before any move) and the gh #224 driver's
+    /// entry point (`migrate_partition`, after a real move to `fast`).
+    #[tokio::test]
+    async fn a_move_to_the_current_dir_is_a_no_op_that_keeps_the_data() {
+        let p = pool(Arc::new(DenyOpAuthorizer(Operation::Describe))).await;
+        let default_root = p.src.parent().unwrap().parent().unwrap().to_path_buf();
+
+        assert_eq!(alter(&p, &default_root).await, 0);
+        assert!(
+            p.src.join("sentinel").is_file(),
+            "the live partition was deleted"
+        );
+
+        let fast = p.fast_root.clone();
+        assert_eq!(alter(&p, &fast).await, 0);
+        let moved = p.fast_root.join("t/0/sentinel");
+        assert!(moved.is_file(), "not moved");
+        assert_eq!(migrate_partition(&p.broker, "t", 0, "fast").await, 0);
+        assert!(
+            moved.is_file(),
+            "the live partition was deleted by a repeat move"
+        );
+        assert_eq!(
+            p.broker.topics.volume_assignment("t", 0).as_deref(),
+            Some("fast")
+        );
     }
 }

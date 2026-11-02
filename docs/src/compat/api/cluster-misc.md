@@ -192,7 +192,10 @@ Error codes: unknown path → `LOG_DIR_NOT_FOUND` (57); cordoned member
 (KIP-1066: no new placements) → `INVALID_REQUEST` (42); not this
 broker's partition → `REPLICA_NOT_AVAILABLE` (9); failed copy or
 record flip → `KAFKA_STORAGE_ERROR` (56), with the copy rolled back so
-data location and placement record never diverge.
+data location and placement record never diverge. A move to the log dir the
+partition's data is already in is Apache's no-op and answers 0: no files are
+touched, and only a lagging placement record is brought in line (gh #297;
+until then it deleted the live partition).
 
 **Authorization** (gh #293): `Alter` on the cluster resource, as in
 Apache, checked before anything else — without it every requested
@@ -217,6 +220,7 @@ client principal.
 
 **Verified by**: `move_partition_between_log_dirs` in
 `crates/kaas-storage/src/disk.rs`; `denied_alter_is_31_and_moves_nothing`
-and `alter_on_the_cluster_moves_the_partition` in the handler;
+`alter_on_the_cluster_moves_the_partition` and
+`a_move_to_the_current_dir_is_a_no_op_that_keeps_the_data` in the handler;
 `all_versions_roundtrip` in the
 codec module; `scripts/kafka-log-dirs.sh`.
