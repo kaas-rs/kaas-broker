@@ -151,6 +151,22 @@ writers are `kaas-storage`'s `atomic_write` (through `Fs::fsync_dir`),
 `kaas-coordinator`'s twin, and the controller's `assignment.json`
 writer.
 
+The same goes one level up (gh #289). A *new directory* is an entry in its
+parent, so every directory kaas creates is synced into its parent as it is
+made: `Fs::mkdir_all_durable`, or `create_dir_all_durable` for the writers
+that use `std::fs` directly. That covers topic and partition dirs (operator
+and broker), the cluster-state dirs, `txn_state/`, the fence log and the
+marker-queue inboxes. A directory that already exists costs nothing.
+
+Three more cases:
+- An identical manifest that `write_unless_superseded` skips still has
+  its directory synced. It may be the one an earlier write renamed into
+  place before its sync failed.
+- The gh #229 reset syncs its snapshot removals before it creates the new
+  segment.
+- A filesystem that can't fsync a directory (`EINVAL` or `EBADF`, as
+  PostgreSQL accepts) counts as done.
+
 ### Rule 2 is the one that gets forgotten
 
 A multi-step operation that isn't retried turns a momentary hiccup into

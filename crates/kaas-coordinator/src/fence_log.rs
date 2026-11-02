@@ -59,7 +59,7 @@ impl FenceLog {
                 "fence log: empty broker id",
             ));
         }
-        fs::create_dir_all(dir)?;
+        crate::atomic_write::create_dir_all_durable(dir)?;
         let path = dir.join(format!("from-{broker_id}.json"));
         Ok(Self {
             path,

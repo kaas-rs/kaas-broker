@@ -591,7 +591,7 @@ impl ActiveSegment {
     /// with leader epoch `epoch`. Opens both files truncated and
     /// returns the active segment with handles ready for append.
     pub fn create(fs: &dyn Fs, dir: &Path, base_offset: i64, epoch: i64) -> io::Result<Self> {
-        fs.mkdir_all(dir)?;
+        fs.mkdir_all_durable(dir)?;
         let log_path = segment_log_path(dir, base_offset, epoch);
         let index_path = segment_index_path(dir, base_offset, epoch);
         let log = fs.create(&log_path)?;
@@ -879,17 +879,26 @@ impl ActiveSegment {
     /// [`RolledTail::finalize`] — call that off the partition mutex
     /// via `tokio::task::spawn_blocking` so the hot path doesn't pay
     /// the index-sync stall.
+    ///
+    /// On failure the old segment comes back intact with the error, so
+    /// the caller can keep appending to it (gh #289). Both failure points
+    /// come before its handles are moved.
     pub fn roll_fast(
         mut self,
         fs: &dyn Fs,
         dir: &Path,
         new_base_offset: i64,
         epoch: i64,
-    ) -> io::Result<(ActiveSegment, RolledTail)> {
+    ) -> Result<(ActiveSegment, RolledTail), Box<(io::Error, ActiveSegment)>> {
         if let Some(log) = self.log.as_deref_mut() {
-            log.sync_all()?;
+            if let Err(e) = log.sync_all() {
+                return Err(Box::new((e, self)));
+            }
         }
-        let new_active = ActiveSegment::create(fs, dir, new_base_offset, epoch)?;
+        let new_active = match ActiveSegment::create(fs, dir, new_base_offset, epoch) {
+            Ok(a) => a,
+            Err(e) => return Err(Box::new((e, self))),
+        };
 
         // Move the closed handles into the tail closure for deferred
         // index fsync + close. The handle drops at the end of
@@ -1618,7 +1627,10 @@ mod tests {
                 .unwrap();
         }
         let pre_size = seg.log_size();
-        let (new_active, tail) = seg.roll_fast(&fs, tmp.path(), 3, 2).unwrap();
+        let (new_active, tail) = seg
+            .roll_fast(&fs, tmp.path(), 3, 2)
+            .map_err(|b| b.0)
+            .unwrap();
 
         // New active is empty and starts at the new base offset.
         assert_eq!(new_active.meta.base_offset, 3);
@@ -1733,8 +1745,10 @@ mod tests {
     #[test]
     fn create_syncs_the_directory_after_both_files() {
         let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("0");
+        std::fs::create_dir(&dir).unwrap();
         let fs = crate::fs::JournalFs::default();
-        let _seg = ActiveSegment::create(&fs, tmp.path(), 0, 1).unwrap();
+        let _seg = ActiveSegment::create(&fs, &dir, 0, 1).unwrap();
         let ops = fs.ops.lock();
         assert_eq!(ops.len(), 3, "{ops:?}");
         assert!(
@@ -1745,7 +1759,24 @@ mod tests {
             ops[1].starts_with("create ") && ops[1].ends_with(".index"),
             "{ops:?}"
         );
-        assert_eq!(ops[2], "fsync_dir");
+        assert_eq!(ops[2], "fsync_dir 0");
+    }
+
+    /// gh #289: when the directory sync fails, `create` takes both new
+    /// files back out rather than leaving a segment nobody holds.
+    #[test]
+    fn create_removes_both_files_when_the_directory_sync_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = crate::fs::JournalFs::default();
+        fs.fail_fsync_dir
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        std::fs::create_dir(tmp.path().join("0")).unwrap();
+        assert!(ActiveSegment::create(&fs, &tmp.path().join("0"), 0, 1).is_err());
+        let left: Vec<_> = std::fs::read_dir(tmp.path().join("0"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
     }
 
     /// gh #209: a fetch positioned near the end of a segment must not

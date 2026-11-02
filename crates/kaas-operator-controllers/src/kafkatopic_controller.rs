@@ -208,7 +208,10 @@ impl KafkaTopicReconciler {
                 .map(String::as_str)
                 .unwrap_or(kaas_storage::DEFAULT_LOG_DIR_NAME);
             let part_dir = self.root_of(name).join(&topic_name).join(p.to_string());
-            std::fs::create_dir_all(&part_dir)?;
+            // gh #289: synced into the topic dir, and a new topic dir into
+            // its root, so the partition dirs survive a crash on a local
+            // filesystem.
+            kaas_storage::fs::create_dir_all_durable(&part_dir)?;
         }
         // gh #220: only now delete the staged copies. The rename in
         // step 1 frees each live path instantly, but a recursive

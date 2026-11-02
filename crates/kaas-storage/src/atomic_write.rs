@@ -58,7 +58,10 @@ fn atomic_write_json_inner<T: Serialize>(
     payload: &T,
     pretty: bool,
 ) -> io::Result<()> {
-    fs.mkdir_all(dir)?;
+    // gh #289: a directory this creates is synced into its parent, or the
+    // file's own rename + dir fsync would make durable an entry in a
+    // directory that itself may not survive.
+    fs.mkdir_all_durable(dir)?;
     let data = if pretty {
         let mut v = serde_json::to_vec_pretty(payload).map_err(io::Error::other)?;
         // The v0.1 writer didn't add a trailing newline either,
@@ -127,15 +130,39 @@ mod tests {
     #[test]
     fn the_directory_is_synced_after_the_rename() {
         let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("d");
+        std::fs::create_dir(&dir).unwrap();
         let fs = crate::fs::JournalFs::default();
         let s = Sample {
             a: 1,
             b: "x".into(),
         };
-        atomic_write_json(&fs, tmp.path(), "m.json", &s).unwrap();
+        atomic_write_json(&fs, &dir, "m.json", &s).unwrap();
         assert_eq!(
             *fs.ops.lock(),
-            ["create m.json.tmp", "rename m.json", "fsync_dir"]
+            ["create m.json.tmp", "rename m.json", "fsync_dir d"]
+        );
+    }
+
+    /// gh #289: a directory the writer has to create is synced into its
+    /// parent before the file goes in, so the file isn't made durable in
+    /// a directory that might itself not survive a crash.
+    #[test]
+    fn a_new_directory_is_synced_into_its_parent_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = crate::fs::JournalFs::default();
+        let s = Sample {
+            a: 1,
+            b: "x".into(),
+        };
+        atomic_write_json(&fs, &tmp.path().join("p/d"), "m.json", &s).unwrap();
+        let ops = fs.ops.lock();
+        assert_eq!(ops[..2], ["mkdir d", "fsync_dir p"], "{ops:?}");
+        assert!(ops[2].starts_with("fsync_dir "), "{ops:?}");
+        assert_eq!(
+            ops[3..],
+            ["create m.json.tmp", "rename m.json", "fsync_dir d"],
+            "{ops:?}"
         );
     }
 

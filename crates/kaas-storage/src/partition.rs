@@ -265,7 +265,8 @@ fn open_blocking_retrying(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedSt
 }
 
 fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, StorageError> {
-    fs.mkdir_all(dir)?;
+    // gh #289: a partition dir created here is synced into its parent.
+    fs.mkdir_all_durable(dir)?;
 
     // Manifest is the source of truth for (epoch, hwm, log_start)
     // when present; segment scan is the fallback.
@@ -307,15 +308,24 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
                  resetting to log start (gh #229)"
             );
         }
+        let mut removed = false;
         for name in [
             PRODUCER_SNAPSHOT_FILENAME,
             TXN_INDEX_SNAPSHOT_FILENAME,
             RECOVERY_CHECKPOINT_FILENAME,
         ] {
             match fs.remove(&dir.join(name)) {
+                Ok(()) => removed = true,
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
-                _ => {}
+                Err(_) => {}
             }
+        }
+        // gh #289: "before the segment is created" has to hold on disk
+        // too. Without this sync, a crash after the new segment's own
+        // directory sync could keep the segment and bring the stale
+        // snapshots back with it.
+        if removed {
+            fs.fsync_dir(dir)?;
         }
     }
 
@@ -902,8 +912,19 @@ impl Partition {
                         max_timestamp: crate::segment::UNKNOWN_MAX_TIMESTAMP,
                     }),
                 );
+                // gh #289: a failed roll hands the old segment back, so the
+                // partition keeps a working active segment and the next
+                // append retries the roll. Losing it left the placeholder
+                // in place, and every append failed until a reopen.
                 let (new_active, tail) =
-                    old_active.roll_fast(self.fs.as_ref(), &dir, new_base, new_epoch)?;
+                    match old_active.roll_fast(self.fs.as_ref(), &dir, new_base, new_epoch) {
+                        Ok(rolled) => rolled,
+                        Err(failed) => {
+                            let (e, old_active) = *failed;
+                            guard.active = old_active;
+                            return Err(StorageError::Io(e));
+                        }
+                    };
                 guard.closed.push(tail.closed_meta);
                 guard.active = new_active;
                 // The checkpoint position counts bytes in the active
@@ -3843,6 +3864,85 @@ mod tests {
                 "expected at least one roll"
             );
             p.close().await.unwrap();
+        });
+    }
+
+    /// gh #289: a roll that fails (here: the new segment's log can't be
+    /// created) hands the old segment back. The append fails, but the
+    /// partition keeps working: the next append rolls and lands. Before,
+    /// the partition was left on a placeholder segment and every append
+    /// failed until it was reopened.
+    #[test]
+    fn a_failed_roll_keeps_the_partition_writable() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let journal = Arc::new(crate::fs::JournalFs::default());
+            let fs: Arc<dyn Fs> = journal.clone();
+            let one_len = u64::try_from(build_batch(1, 1_000).len()).unwrap();
+            let p = Partition::open(
+                fs,
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig {
+                    segment_bytes: one_len,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            p.append(0, -1, build_batch(1, 1_000)).await.unwrap();
+
+            *journal.fail_create_suffix.lock() = Some(segment::LOG_EXT);
+            assert!(p.append(0, -1, build_batch(1, 1_000)).await.is_err());
+            assert_eq!(p.high_watermark(), 1);
+
+            *journal.fail_create_suffix.lock() = None;
+            assert_eq!(p.append(0, -1, build_batch(1, 1_000)).await.unwrap(), 1);
+            assert_eq!(p.high_watermark(), 2);
+            p.close().await.unwrap();
+        });
+    }
+
+    /// gh #289: the gh #229 reset removes the dead log's snapshots and
+    /// syncs that into the directory before the new segment is created,
+    /// so a crash can't keep the new segment and bring the snapshots back.
+    #[test]
+    fn the_gh229_reset_syncs_its_removals_before_creating_the_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("0");
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Partition::open(fs, "t".into(), 0, dir.clone(), PartitionConfig::default())
+                .await
+                .unwrap();
+            p.append(0, -1, build_txn_data_batch(42, 3)).await.unwrap();
+            p.close().await.unwrap();
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(segment::LOG_EXT) || name.ends_with(segment::INDEX_EXT) {
+                    std::fs::remove_file(entry.path()).unwrap();
+                }
+            }
+
+            let journal = Arc::new(crate::fs::JournalFs::default());
+            let fs: Arc<dyn Fs> = journal.clone();
+            let p2 = Partition::open(fs, "t".into(), 0, dir.clone(), PartitionConfig::default())
+                .await
+                .unwrap();
+            let ops = journal.ops.lock().clone();
+            let last_remove = ops.iter().rposition(|o| o.starts_with("remove ")).unwrap();
+            let first_log = ops
+                .iter()
+                .position(|o| o.starts_with("create ") && o.ends_with(segment::LOG_EXT))
+                .unwrap();
+            assert!(
+                ops[last_remove..first_log]
+                    .iter()
+                    .any(|o| o == "fsync_dir 0"),
+                "{ops:?}"
+            );
+            p2.close().await.unwrap();
         });
     }
 

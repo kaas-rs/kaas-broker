@@ -484,7 +484,8 @@ fn build_broker_entries(
 /// `<data_dir>/__cluster` join (gh #221 phase 1).
 fn atomic_write<T: Serialize>(cluster_dir: &std::path::Path, payload: &T) -> io::Result<()> {
     let dir = cluster_dir.to_path_buf();
-    std::fs::create_dir_all(&dir)?;
+    // gh #289: a cluster dir created here is synced into its parent.
+    kaas_storage::fs::create_dir_all_durable(&dir)?;
     let final_path = dir.join(Assignment::FILE_NAME);
     let mut tmp_name = String::from(Assignment::FILE_NAME);
     tmp_name.push_str(".tmp");

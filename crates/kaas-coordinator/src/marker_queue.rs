@@ -65,7 +65,7 @@ impl MarkerQueue {
     /// are created lazily on `enqueue`.
     pub fn open(cluster_dir: &Path) -> io::Result<Self> {
         let root = cluster_dir.join(MARKER_QUEUE_DIR_NAME);
-        fs::create_dir_all(&root)?;
+        crate::atomic_write::create_dir_all_durable(&root)?;
         Ok(Self { root })
     }
 
@@ -85,7 +85,7 @@ impl MarkerQueue {
             ));
         }
         let inbox = self.inbox(target_broker);
-        fs::create_dir_all(&inbox)?;
+        crate::atomic_write::create_dir_all_durable(&inbox)?;
         let name = format!("{}-{}.json", entry.producer_id, entry.producer_epoch);
         atomic_write_json(&inbox, &name, entry)?;
         Ok(())

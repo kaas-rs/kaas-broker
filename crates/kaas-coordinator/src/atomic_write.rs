@@ -13,7 +13,7 @@ use std::path::Path;
 
 /// Atomically write the JSON-serialised payload to `dir/name`.
 ///
-/// 1. `mkdir_all(dir)`
+/// 1. `mkdir_all(dir)`, syncing each new directory into its parent (gh #289)
 /// 2. JSON-encode payload
 /// 3. Write into `dir/<name>.tmp`
 /// 4. `fsync` the tmp file
@@ -24,7 +24,7 @@ pub fn atomic_write_json<T: serde::Serialize>(
     name: &str,
     payload: &T,
 ) -> io::Result<()> {
-    fs::create_dir_all(dir)?;
+    create_dir_all_durable(dir)?;
     let data = serde_json::to_vec(payload).map_err(io::Error::other)?;
 
     let mut tmp_name = String::from(name);
@@ -59,12 +59,38 @@ pub fn atomic_write_json<T: serde::Serialize>(
 /// Sync directory `dir` so a rename into it survives a crash on a local
 /// filesystem (gh #231); a twin of `kaas_storage::fs::fsync_dir`, kept
 /// here because this writer stays independent of the storage crate.
-/// `EINVAL` (a filesystem that can't fsync a directory) counts as done.
-fn fsync_dir(dir: &Path) -> io::Result<()> {
+/// `EINVAL` and `EBADF` (a filesystem that can't fsync a directory) count
+/// as done, as in PostgreSQL's `fsync_fname` (gh #289).
+pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
+    /// `EBADF` on Linux and the BSDs.
+    const EBADF: i32 = 9;
     match File::open(dir)?.sync_all() {
-        Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput || e.raw_os_error() == Some(EBADF) => {
+            Ok(())
+        }
         r => r,
     }
+}
+
+/// `create_dir_all`, then sync each directory it had to create into its
+/// parent (gh #289), so a new `txn_state/`, `marker_queue/to-<n>/` or
+/// fence-log directory survives a crash on a local filesystem along with
+/// the files later renamed into it. A twin of
+/// `kaas_storage::fs::create_dir_all_durable`.
+pub fn create_dir_all_durable(dir: &Path) -> io::Result<()> {
+    let mut missing = Vec::new();
+    let mut cur = Some(dir);
+    while let Some(d) = cur.filter(|d| !d.as_os_str().is_empty() && !d.exists()) {
+        missing.push(d.to_path_buf());
+        cur = d.parent();
+    }
+    fs::create_dir_all(dir)?;
+    for d in &missing {
+        if let Some(parent) = d.parent().filter(|q| !q.as_os_str().is_empty()) {
+            fsync_dir(parent)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

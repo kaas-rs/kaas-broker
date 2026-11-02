@@ -102,6 +102,30 @@ pub trait Fs: Send + Sync + 'static {
 
     fn mkdir_all(&self, p: &Path) -> io::Result<()>;
 
+    /// [`Self::mkdir_all`], then sync each newly created directory into
+    /// its parent (gh #289). Without the parent sync a new `<topic>` or
+    /// partition directory can vanish on crash on a local filesystem, and
+    /// every file in it with it, though each file was fsynced. When the
+    /// directory already exists nothing is synced, so an open of an
+    /// existing partition pays nothing.
+    fn mkdir_all_durable(&self, p: &Path) -> io::Result<()> {
+        let mut missing = Vec::new();
+        let mut cur = Some(p);
+        while let Some(d) = cur.filter(|d| !d.as_os_str().is_empty() && !self.exists(d)) {
+            missing.push(d.to_path_buf());
+            cur = d.parent();
+        }
+        self.mkdir_all(p)?;
+        // Deepest first, so each parent is synced after its new child
+        // exists; the outermost sync makes the whole chain reachable.
+        for d in &missing {
+            if let Some(parent) = d.parent().filter(|q| !q.as_os_str().is_empty()) {
+                self.fsync_dir(parent)?;
+            }
+        }
+        Ok(())
+    }
+
     fn readdir(&self, p: &Path) -> io::Result<Vec<PathBuf>>;
 
     fn stat(&self, p: &Path) -> io::Result<Metadata>;
@@ -257,23 +281,48 @@ pub fn fsync_path(p: &Path) -> io::Result<()> {
 /// it survive a crash (gh #231). For writers that use `std::fs` directly
 /// rather than an [`Fs`]; [`RealFs::fsync_dir`] calls this.
 ///
-/// `EINVAL` counts as success: a filesystem that can't fsync a directory
-/// says so that way, and there is nothing further to do. PostgreSQL's
-/// `fsync_fname` makes the same call.
+/// `EINVAL` and `EBADF` count as success: a filesystem that can't fsync a
+/// directory says so one of those ways, and there is nothing further to
+/// do. PostgreSQL's `fsync_fname` accepts the same two (gh #289 added
+/// `EBADF`).
 pub fn fsync_dir(p: &Path) -> io::Result<()> {
-    match std::fs::File::open(p)?.sync_all() {
-        Err(e) if e.kind() == io::ErrorKind::InvalidInput => Ok(()),
+    tolerate_unsyncable_dir(std::fs::File::open(p)?.sync_all())
+}
+
+/// `EBADF` on Linux and the BSDs.
+const EBADF: i32 = 9;
+
+/// The `fsync_dir` error policy, split out so it can be tested without a
+/// filesystem that actually refuses.
+fn tolerate_unsyncable_dir(r: io::Result<()>) -> io::Result<()> {
+    match r {
+        Err(e) if e.kind() == io::ErrorKind::InvalidInput || e.raw_os_error() == Some(EBADF) => {
+            Ok(())
+        }
         r => r,
     }
 }
 
+/// [`Fs::mkdir_all_durable`] for writers that use `std::fs` directly
+/// (gh #289): create `dir` and any missing ancestors, then sync each new
+/// directory into its parent.
+pub fn create_dir_all_durable(dir: &Path) -> io::Result<()> {
+    RealFs::new().mkdir_all_durable(dir)
+}
+
 /// Test-only [`Fs`] over [`RealFs`] that journals the calls whose order
-/// durability depends on: `create`, `rename` and `fsync_dir` (gh #231).
+/// durability depends on (`mkdir`, `create`, `rename`, `remove`,
+/// `fsync_dir`, each with the entry's name; gh #231, gh #289). It can
+/// also inject failures: a `create` of a name ending in
+/// `fail_create_suffix`, and every `fsync_dir` while `fail_fsync_dir` is
+/// set.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct JournalFs {
     inner: RealFs,
     pub(crate) ops: parking_lot::Mutex<Vec<String>>,
+    pub(crate) fail_create_suffix: parking_lot::Mutex<Option<&'static str>>,
+    pub(crate) fail_fsync_dir: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -297,6 +346,11 @@ impl Fs for JournalFs {
     }
     fn create(&self, p: &Path) -> io::Result<Box<dyn FileWrite>> {
         self.log("create", p);
+        if let Some(suffix) = *self.fail_create_suffix.lock() {
+            if p.to_string_lossy().ends_with(suffix) {
+                return Err(io::Error::other("injected create failure"));
+            }
+        }
         self.inner.create(p)
     }
     fn fsync(&self, f: &mut dyn FileWrite) -> io::Result<()> {
@@ -307,13 +361,25 @@ impl Fs for JournalFs {
         self.inner.rename(from, to)
     }
     fn remove(&self, p: &Path) -> io::Result<()> {
+        if p.exists() {
+            self.log("remove", p);
+        }
         self.inner.remove(p)
     }
     fn fsync_dir(&self, p: &Path) -> io::Result<()> {
-        self.ops.lock().push("fsync_dir".to_owned());
+        self.log("fsync_dir", p);
+        if self
+            .fail_fsync_dir
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(io::Error::other("injected fsync_dir failure"));
+        }
         self.inner.fsync_dir(p)
     }
     fn mkdir_all(&self, p: &Path) -> io::Result<()> {
+        if !p.exists() {
+            self.log("mkdir", p);
+        }
         self.inner.mkdir_all(p)
     }
     fn readdir(&self, p: &Path) -> io::Result<Vec<PathBuf>> {
@@ -440,6 +506,47 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
         let err = Bare.fsync_dir(Path::new("/x")).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+    }
+
+    /// gh #289: every directory `mkdir_all_durable` creates is synced
+    /// into its parent, deepest first, and an existing directory costs
+    /// nothing.
+    #[test]
+    fn mkdir_all_durable_syncs_each_new_directory_into_its_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let fs = JournalFs::default();
+        fs.mkdir_all_durable(&tmp.path().join("a/b")).unwrap();
+        assert_eq!(
+            *fs.ops.lock(),
+            [
+                "mkdir b".to_owned(),
+                "fsync_dir a".to_owned(),
+                format!("fsync_dir {root}")
+            ]
+        );
+        assert!(tmp.path().join("a/b").is_dir());
+
+        fs.ops.lock().clear();
+        fs.mkdir_all_durable(&tmp.path().join("a/b")).unwrap();
+        assert!(fs.ops.lock().is_empty(), "{:?}", fs.ops.lock());
+    }
+
+    /// gh #289: a filesystem that can't fsync a directory says so with
+    /// EINVAL or EBADF, and both count as done (PostgreSQL's rule); any
+    /// other error is a real failure.
+    #[test]
+    fn fsync_dir_tolerates_einval_and_ebadf_only() {
+        assert!(tolerate_unsyncable_dir(Err(io::Error::from(io::ErrorKind::InvalidInput))).is_ok());
+        assert!(tolerate_unsyncable_dir(Err(io::Error::from_raw_os_error(22))).is_ok());
+        assert!(tolerate_unsyncable_dir(Err(io::Error::from_raw_os_error(EBADF))).is_ok());
+        assert!(tolerate_unsyncable_dir(Err(io::Error::from_raw_os_error(5))).is_err());
+        assert!(tolerate_unsyncable_dir(Ok(())).is_ok());
     }
 
     #[test]

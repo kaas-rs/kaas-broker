@@ -719,10 +719,10 @@ fn copy_dir_fresh(src: &Path, dst: &Path) -> Result<(), StorageError> {
     if !src.exists() {
         // Empty partition (never opened): nothing to copy; the target
         // dir is created so the opener finds a valid home.
-        create_dir_all_durable(dst)?;
+        crate::fs::create_dir_all_durable(dst)?;
         return Ok(());
     }
-    create_dir_all_durable(dst)?;
+    crate::fs::create_dir_all_durable(dst)?;
     copy_dir_recursive(src, dst)?;
     Ok(())
 }
@@ -742,24 +742,6 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
         }
     }
     crate::fs::fsync_dir(dst)
-}
-
-/// `create_dir_all`, then fsync the parent of every directory it had to
-/// create, so the new entries survive a crash on a local filesystem.
-fn create_dir_all_durable(dir: &Path) -> std::io::Result<()> {
-    let mut missing = Vec::new();
-    let mut cur = Some(dir);
-    while let Some(d) = cur.filter(|d| !d.exists()) {
-        missing.push(d.to_path_buf());
-        cur = d.parent();
-    }
-    std::fs::create_dir_all(dir)?;
-    for d in &missing {
-        if let Some(parent) = d.parent() {
-            crate::fs::fsync_dir(parent)?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]

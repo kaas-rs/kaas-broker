@@ -136,7 +136,7 @@ pub fn acl_to_entry(principal: &str, acl: &KafkaUserAcl) -> AclEntry {
 /// Atomic write of `acls.json`. Stamps `version = 1`.
 pub fn write_acl_file(cluster_dir: &Path, file: &AclFile) -> Result<(), ControllerError> {
     let cluster_dir = cluster_dir.to_path_buf();
-    std::fs::create_dir_all(&cluster_dir)?;
+    kaas_storage::fs::create_dir_all_durable(&cluster_dir)?;
     let mut stamped = file.clone();
     stamped.version = 1;
     let fs = kaas_storage::fs::RealFs::new();

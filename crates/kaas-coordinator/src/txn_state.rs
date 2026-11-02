@@ -315,7 +315,7 @@ impl TxnStateStore {
             num_slots
         };
         let dir = parent_dir.join("txn_state");
-        fs::create_dir_all(&dir)?;
+        crate::atomic_write::create_dir_all_durable(&dir)?;
         Ok(Self {
             dir,
             num_slots,

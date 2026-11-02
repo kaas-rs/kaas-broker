@@ -147,7 +147,7 @@ pub fn read_credentials(cluster_dir: &Path) -> Result<CredentialsFile, Controlle
 /// readers can gate on it later if we ever bump the format.
 pub fn write_credentials(cluster_dir: &Path, cf: &CredentialsFile) -> Result<(), ControllerError> {
     let cluster_dir = cluster_dir.to_path_buf();
-    std::fs::create_dir_all(&cluster_dir)?;
+    kaas_storage::fs::create_dir_all_durable(&cluster_dir)?;
     let mut stamped = cf.clone();
     stamped.version = 1;
     let fs = kaas_storage::fs::RealFs::new();

@@ -155,6 +155,12 @@ pub fn write_unless_superseded(
         // and saves a write per open on a substrate where writes are the
         // expensive operation.
         if on_disk == *m {
+            // gh #289: the identical manifest may be the one an earlier
+            // write renamed into place before its directory sync failed.
+            // Skipping must not skip that sync too, or the retried open
+            // never makes the rename durable. A directory sync is cheap
+            // next to the write it replaces.
+            fs.fsync_dir(dir)?;
             return Ok(m.epoch);
         }
     }
@@ -177,6 +183,26 @@ mod tests {
     use super::*;
     use crate::fs::RealFs;
     use std::io::Write;
+
+    /// gh #289: skipping an identical manifest still syncs the directory.
+    /// The identical file may be one an earlier write renamed into place
+    /// before its directory sync failed; skipping both would leave that
+    /// rename undurable for good.
+    #[test]
+    fn an_identical_manifest_is_not_rewritten_but_its_directory_is_synced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("0");
+        std::fs::create_dir(&dir).unwrap();
+        let m = Manifest {
+            epoch: 4,
+            high_watermark: 10,
+            log_start_offset: 0,
+        };
+        write_unchecked(&RealFs::new(), &dir, &m).unwrap();
+        let fs = crate::fs::JournalFs::default();
+        assert_eq!(write_unless_superseded(&fs, &dir, &m).unwrap(), 4);
+        assert_eq!(*fs.ops.lock(), ["fsync_dir 0"]);
+    }
 
     /// gh #235: the epoch is the durable seed for the append fence, so
     /// no writer may lower it — every writer reads, works, then writes
