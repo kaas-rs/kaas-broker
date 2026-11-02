@@ -33,7 +33,7 @@ the TLS handshake. Clients learn the full per-broker list from Metadata.
 {{- else }}
 Configure your Kafka clients with any one of the bootstrap servers:
   {{- range $i, $e := until (int $.Values.broker.replicaCount) }}
-  {{ printf $external.hostnamePattern $i }}:{{ $external.port }}
+  {{ printf (include "kaas.externalHostnamePattern" $external) $i }}:{{ $external.port }}
   {{- end }}
 
 Each address resolves to its own broker pod via SNI. Clients learn the full list

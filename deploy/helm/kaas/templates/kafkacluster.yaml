@@ -40,7 +40,7 @@ spec:
       `enabled: false` and the operator never made its Certificate. */}}
       enabled: true
       port: {{ $external.port }}
-      hostnamePattern: {{ $external.hostnamePattern | quote }}
+      hostnamePattern: {{ include "kaas.externalHostnamePattern" $external | quote }}
       {{- with $external.bootstrapHostname }}
       bootstrapHostname: {{ . | quote }}
       {{- end }}

@@ -1,0 +1,18 @@
+# gh #291 verification CI case: an external listener with no
+# hostnamePattern. Must fail naming the value, not with a type error in
+# NOTES.txt or a broker that never becomes Ready.
+listeners:
+  - name: plain
+    port: 9092
+    type: internal
+    tls: false
+    authentication:
+      type: none
+  - name: external
+    port: 9093
+    type: external
+    tls: true
+    certManager:
+      enabled: false
+    authentication:
+      type: none

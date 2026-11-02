@@ -335,3 +335,14 @@ is empty (broker treats unset env as "no superUsers").
 {{- end -}}
 {{ $repo }}:{{ $tag }}
 {{- end -}}
+
+{{/*
+kaas.externalHostnamePattern — the external listener's hostnamePattern,
+required (gh #291 verification). It names every broker's certificate SAN
+and route, and the broker's readiness depends on it, so a missing one used
+to fail NOTES with a type error or render a pod that never got Ready.
+Takes the listener dict.
+*/}}
+{{- define "kaas.externalHostnamePattern" -}}
+{{- required (printf "listeners[%s].hostnamePattern is required for an external listener, e.g. \"broker-%%d.kafka.example.com\" (%%d is the broker ordinal)" .name) .hostnamePattern -}}
+{{- end -}}

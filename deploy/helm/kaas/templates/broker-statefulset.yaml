@@ -312,7 +312,7 @@ spec:
                 fieldRef:
                   fieldPath: metadata.labels['apps.kubernetes.io/pod-index']
             - name: EXTERNAL_HOSTNAME_PATTERN
-              value: {{ $external.hostnamePattern | quote }}
+              value: {{ include "kaas.externalHostnamePattern" $external | quote }}
             {{- if and $external.clientCA $external.clientCA.enabled $external.clientCA.existingSecret }}
             # Mutual TLS: require every TLS client to present a cert
             # signed by this CA bundle.

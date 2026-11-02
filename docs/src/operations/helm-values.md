@@ -199,7 +199,7 @@ the model; this is the field reference. Defaults ship four entries:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `hostnamePattern` | `broker-%d.kafka.example.com` | Per-broker FQDN pattern (`%d` = ordinal), used for certificate SANs and routes. **Honesty note:** the pattern does not currently reach Metadata advertisement — external listeners still advertise the in-cluster FQDN, so external access effectively requires SNI routing that terminates on those internal names. Tracked as a known gap. |
+| `hostnamePattern` | `broker-%d.kafka.example.com` | **Required.** Per-broker FQDN pattern (`%d` = ordinal), used for certificate SANs and routes. A missing one fails the render with a message (it used to fail with a type error, or render a broker that never got Ready). **Honesty note:** the pattern does not currently reach Metadata advertisement — external listeners still advertise the in-cluster FQDN, so external access effectively requires SNI routing that terminates on those internal names. Tracked as a known gap. |
 | `bootstrapHostname` | `""` | Optional single bootstrap CNAME, added to certificate SANs. |
 | `certManager.enabled` / `issuerRef` | `true` / `letsencrypt-prod` (`ClusterIssuer`) | One cert-manager Certificate covering all per-broker hostnames. **Required block** (gh #291): the brokers mount the `<fullname>-broker-tls` Secret, which only this Certificate creates, so leaving `certManager` out fails the render with a message. Set `enabled: false` to bring that Secret yourself. `issuerRef.name` is required when enabled; `kind` defaults to `Issuer`, as in cert-manager. |
 | `clientCA.enabled` / `existingSecret` / `key` | `false` / `""` / `ca.crt` | Require client certs signed by this CA; pair with `authentication.type: mtls`. |

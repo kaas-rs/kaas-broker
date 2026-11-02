@@ -143,6 +143,12 @@ jobs:
             exit 1
           fi
           grep -q "certManager is required" <<<"$out" || { echo "$out" >&2; exit 1; }
+          if out=$(helm template test-release deploy/helm/kaas \
+              -f deploy/helm/ci/external-no-hostname-pattern.invalid.yaml 2>&1); then
+            echo "expected the render to fail without a hostnamePattern" >&2
+            exit 1
+          fi
+          grep -q "hostnamePattern is required" <<<"$out" || { echo "$out" >&2; exit 1; }
 
   docs:
     runs-on: arc-runner-set
