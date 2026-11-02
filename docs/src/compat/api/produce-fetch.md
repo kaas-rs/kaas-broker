@@ -26,16 +26,24 @@ registry with the partition inside its count (else
 partition per the applied `assignment.json` (else
 `NOT_LEADER_FOR_PARTITION`, 6); and the controller-connectivity self-fence
 must see a fresh controller heartbeat — a broker cut off from the
-controller stops acking within 3 s (also 6). A batch larger
+controller stops acking within 3 s (also 6). Between the existence and
+leadership checks, the records must be exactly one magic-v2 batch whose
+`batchLength` spans the field, as Apache's `ProduceRequest.validateRecords`
+requires (`INVALID_RECORD`, 87; a length too small to be a batch, or an unknown
+magic, is `CORRUPT_MESSAGE`, 2). A batch larger
 than Apache's `message.max.bytes` default (1 MiB + 12 bytes batch overhead)
 is rejected with `MESSAGE_TOO_LARGE` (10) before it hits storage — Apache's
 code for a batch over `max.message.bytes`, which the Java producer answers by
 splitting the batch (until gh #285 kaas sent 18, `RECORD_LIST_TOO_LARGE`).
+A batch whose CRC doesn't match is `CORRUPT_MESSAGE` (2) and is never acked.
+The recovery scan would stop at it and truncate every acked record behind it.
 A control batch from a client is refused with `INVALID_RECORD` (87), as in
 Apache's `LogValidator`: COMMIT/ABORT markers are the transaction
 coordinator's to write, and it appends them to the engine directly, not
 through Produce (gh #294). Both checks read only the batch-header
-attributes.
+attributes, and the structural check above is what makes that header
+trustworthy. Before it, a batch with a lying `batchLength` slipped past both
+checks while the append path still read its header.
 
 Inside the engine, under the partition mutex: idempotent-producer
 classification runs first — a duplicate (PID/epoch/sequence already in the
@@ -76,7 +84,10 @@ gets to refresh its metadata (gh #200).
 **Verified by**: `unknown_topic_returns_error_code_3`,
 `a_transactional_batch_needs_write_on_the_transactional_id`,
 `a_non_transactional_request_skips_the_transactional_id_check` and
-`a_client_control_batch_is_invalid_record_87` (handler unit tests),
+`a_client_control_batch_is_invalid_record_87`,
+`malformed_records_are_refused_with_apaches_codes` and
+`a_lying_batch_length_cannot_bypass_the_transactional_checks` (handler unit
+tests),
 `produce_fetch_metadata_roundtrip` in `bins/kaas/tests/smoke.rs` (which
 also asserts the fetched batch is byte-identical to the produced one),
 `append_then_read_byte_identical` in `crates/kaas-storage/src/disk.rs`,

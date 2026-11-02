@@ -15,6 +15,17 @@
 //!   transaction coordinator writes COMMIT/ABORT markers, and it appends
 //!   them straight to the engine, not through Produce. A client-sent
 //!   control batch answers `INVALID_RECORD` (87).
+//!
+//! Both checks rely on the records being exactly what the header says
+//! they are, which is the structural check's job (gh #294 follow-up).
+//! Each partition must carry exactly one magic-v2 batch whose
+//! `batchLength` spans the whole records field (Apache's
+//! `ProduceRequest.validateRecords`: `INVALID_RECORD`, 87). A length too
+//! small to be a batch, an unknown magic, or a CRC that doesn't match is
+//! `CORRUPT_MESSAGE` (2). Without this, a batch whose `batchLength` lied
+//! slipped past both attribute checks while the append path still read
+//! its header. A bad CRC was acked and later truncated every acked record
+//! behind it on recovery, and a second batch reused offsets.
 
 use std::sync::Arc;
 
@@ -29,6 +40,7 @@ use parking_lot::Mutex;
 use crate::broker::Broker;
 
 // Wire error codes (subset). Same numeric values Apache uses.
+const ERR_CORRUPT_MESSAGE: i16 = 2;
 const ERR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 const ERR_LEADER_NOT_AVAILABLE: i16 = 5;
 const ERR_NOT_LEADER_FOR_PARTITION: i16 = 6;
@@ -224,6 +236,14 @@ impl ProduceHandler {
             }
         }
 
+        // Apache's `ProduceRequest.validateRecords`, which runs before the
+        // leadership check: exactly one magic-v2 batch spanning the field.
+        if let Some(records) = p.records.as_deref() {
+            if let Err(code) = validate_structure(records) {
+                return error_partition_bumped(topic, p.index, code);
+            }
+        }
+
         // Phase 5 cluster check: a real `Coordinator` answers "do I
         // lead this partition?" against the most recently applied
         // assignment.json. Dev mode (no coordinator wired) keeps the
@@ -268,6 +288,13 @@ impl ProduceHandler {
             return error_partition_bumped(topic, p.index, ERR_MESSAGE_TOO_LARGE);
         }
 
+        // UnifiedLog's `batch.ensureValid()`, after the size check. A bad
+        // CRC must never be acked: the recovery scan stops at it, and would
+        // truncate every acked record written after it (gh #228).
+        if kaas_codec::crc::verify_batch_crc(&records).is_err() {
+            return error_partition_bumped(topic, p.index, ERR_CORRUPT_MESSAGE);
+        }
+
         // gh #294: control batches are the coordinator's to write. The
         // append path takes any control batch as a COMMIT/ABORT marker,
         // so a client-sent one would forge a transaction outcome.
@@ -309,6 +336,43 @@ impl ProduceHandler {
             }
         }
     }
+}
+
+/// The structural half of Apache's record validation. Reads the batch
+/// header only, so byte opacity holds.
+/// - Fewer than 12 bytes, or a `batchLength` that runs past the field,
+///   is no batch at all: `INVALID_RECORD`.
+/// - A `batchLength` too small for a v2 header is `CORRUPT_MESSAGE`.
+/// - Magic 0/1 is `INVALID_RECORD` ("must use magic v2"); any other value
+///   is `CORRUPT_MESSAGE`.
+/// - Bytes after the batch, i.e. a second batch, is `INVALID_RECORD`
+///   ("exactly one record batch per partition").
+fn validate_structure(records: &[u8]) -> Result<(), i16> {
+    /// A v2 batch header after `baseOffset` + `batchLength`.
+    const MIN_V2_BATCH_LENGTH: usize = 61 - 12;
+    let Some(len4) = records.get(8..12) else {
+        return Err(ERR_INVALID_RECORD);
+    };
+    let declared = i32::from_be_bytes([len4[0], len4[1], len4[2], len4[3]]);
+    let Some(len) = usize::try_from(declared)
+        .ok()
+        .filter(|&l| l >= MIN_V2_BATCH_LENGTH)
+    else {
+        return Err(ERR_CORRUPT_MESSAGE);
+    };
+    let total = 12 + len;
+    if total > records.len() {
+        return Err(ERR_INVALID_RECORD);
+    }
+    match records[16] {
+        2 => {}
+        0 | 1 => return Err(ERR_INVALID_RECORD),
+        _ => return Err(ERR_CORRUPT_MESSAGE),
+    }
+    if total != records.len() {
+        return Err(ERR_INVALID_RECORD);
+    }
+    Ok(())
 }
 
 /// Whether any whole batch in `records` has the attribute bit `flag` set.
@@ -529,7 +593,7 @@ mod tests {
         let h = ProduceHandler::new(broker_with_topic("known", 1)).with_max_message_bytes(32);
         let part = produce::PartitionData {
             index: 0,
-            records: Some(Bytes::from_static(&[0; 64])),
+            records: Some(batch(0, -1, -1)),
         };
         let r = h
             .append_one(&Principal::anonymous(), "known", &part, -1)
@@ -670,5 +734,81 @@ mod tests {
             produce_two(&b, None, run.freeze(), batch(0, -1, -1)).await,
             [87, 0]
         );
+    }
+
+    /// `b` with its `batchLength` field overwritten.
+    fn with_length(b: &Bytes, len: i32) -> Bytes {
+        let mut v = b.to_vec();
+        v[8..12].copy_from_slice(&len.to_be_bytes());
+        Bytes::from(v)
+    }
+
+    /// gh #294 follow-up: Apache's structural checks, with its literal
+    /// codes. Each malformed `orders` batch is refused and appends
+    /// nothing; the well-formed `audit` batch next to it lands.
+    #[tokio::test]
+    async fn malformed_records_are_refused_with_apaches_codes() {
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        let good = batch(0, -1, -1);
+        let real = i32::try_from(good.len() - 12).unwrap();
+        let mut bad_crc = good.to_vec();
+        bad_crc[60] ^= 0xff;
+        let mut magic1 = good.to_vec();
+        magic1[16] = 1;
+        let mut magic9 = good.to_vec();
+        magic9[16] = 9;
+        let mut two = good.to_vec();
+        two.extend_from_slice(&good);
+        let cases: Vec<(&str, Bytes, i16)> = vec![
+            ("short", Bytes::from_static(&[0; 8]), 87),
+            ("length 0", with_length(&good, 0), 2),
+            ("length -1", with_length(&good, -1), 2),
+            ("length past the field", with_length(&good, real + 1), 87),
+            ("length i32::MAX", with_length(&good, i32::MAX), 87),
+            ("trailing bytes", with_length(&good, real - 1), 87),
+            ("two batches", Bytes::from(two), 87),
+            ("magic 1", Bytes::from(magic1), 87),
+            ("magic 9", Bytes::from(magic9), 2),
+            ("bad CRC", Bytes::from(bad_crc), 2),
+        ];
+        for (what, records, code) in cases {
+            let b = txn_broker(Arc::new(DenyNamedAuthorizer("nobody")));
+            assert_eq!(
+                produce_two(&b, None, records, batch(0, -1, -1)).await,
+                [code, 0],
+                "{what}"
+            );
+            assert_eq!(appended(&b, "orders"), 0, "{what} was appended");
+        }
+    }
+
+    /// gh #294 follow-up, the verifier's bypass: a transactional batch or
+    /// a forged marker whose `batchLength` lies used to slip past both
+    /// attribute checks (the batch walker skipped it), while the append
+    /// path still read its header. It opened a phantom transaction or
+    /// recorded an abort, and answered 0. Now nothing is appended and the
+    /// LSO doesn't move.
+    #[tokio::test]
+    async fn a_lying_batch_length_cannot_bypass_the_transactional_checks() {
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        let forged = [
+            batch(ATTR_TRANSACTIONAL, 424_242, 0),
+            batch(ATTR_TRANSACTIONAL | ATTR_CONTROL, 424_242, -1),
+            batch(ATTR_CONTROL, 424_242, -1),
+        ];
+        for b0 in &forged {
+            let real = i32::try_from(b0.len() - 12).unwrap();
+            for len in [0, -1, 1000, i32::MAX, real + 1] {
+                let b = txn_broker(Arc::new(DenyNamedAuthorizer("nobody")));
+                let codes = produce_two(&b, None, with_length(b0, len), batch(0, -1, -1)).await;
+                assert_ne!(codes[0], 0, "length {len} accepted");
+                assert_eq!(appended(&b, "orders"), 0, "length {len} appended");
+                assert_eq!(
+                    b.engine.last_stable_offset("orders", 0).unwrap_or(0),
+                    0,
+                    "length {len} moved the LSO"
+                );
+            }
+        }
     }
 }

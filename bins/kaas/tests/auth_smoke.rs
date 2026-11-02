@@ -317,6 +317,10 @@ fn build_record_batch(num_records: i32, size: usize) -> Bytes {
     buf[23..27].copy_from_slice(&last_offset_delta.to_be_bytes());
     buf[35..43].copy_from_slice(&100i64.to_be_bytes());
     buf[43..51].copy_from_slice(&(-1i64).to_be_bytes());
+    // A real CRC: Produce refuses a batch whose CRC doesn't match
+    // (CORRUPT_MESSAGE, gh #294 follow-up).
+    let crc = kaas_codec::crc::compute(&buf[21..]);
+    buf[17..21].copy_from_slice(&crc.to_be_bytes());
     Bytes::from(buf)
 }
 
