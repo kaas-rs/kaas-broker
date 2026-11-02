@@ -310,14 +310,21 @@ async fn serve_conn(
     cs.is_tls = tls.is_some();
     let state = Arc::new(parking_lot::Mutex::new(cs));
     if let Some(acceptor) = tls {
-        let tls_stream = acceptor.accept(stream).await.map_err(ProtoError::Io)?;
+        // Counted on both outcomes, with a `result` label, so the
+        // dashboard's success rate has something to divide (gh #290
+        // verification: only successes were counted, with no `result`).
+        let accepted = acceptor.accept(stream).await;
         kaas_observability::metrics::global().tls_handshakes.add(
             1,
-            &[kaas_observability::KeyValue::new(
-                "listener",
-                listener_name.clone(),
-            )],
+            &[
+                kaas_observability::KeyValue::new("listener", listener_name.clone()),
+                kaas_observability::KeyValue::new(
+                    "result",
+                    if accepted.is_ok() { "ok" } else { "error" },
+                ),
+            ],
         );
+        let tls_stream = accepted.map_err(ProtoError::Io)?;
         // Run mTLS principal extraction if configured. Failure
         // doesn't drop the connection — the dispatcher's pre-auth
         // gate will reject non-pre-SASL APIs until the client

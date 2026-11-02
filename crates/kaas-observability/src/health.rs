@@ -30,7 +30,7 @@ use serde::Serialize;
 ///
 /// All methods must be safe to call from any thread. Methods that
 /// haven't measured anything yet return `-1` (for `*_ms` fields); the
-/// handler renders those as JSON `null`.
+/// handler omits those fields from the JSON.
 pub trait RuntimeState: Send + Sync {
     fn is_controller(&self) -> bool;
     fn controller_id(&self) -> String;

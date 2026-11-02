@@ -199,6 +199,11 @@ pub struct KubeLeaseElection {
     lease_duration: Duration,
     renew_deadline: Duration,
     retry_period: Duration,
+    /// Record `kaas.controller.failovers` / `.failover.duration` on a
+    /// won election. Only the broker's `kaas-controller` campaign is a
+    /// controller election; the operator's leader lease opts out
+    /// (gh #290 verification).
+    controller_metrics: bool,
 }
 
 impl std::fmt::Debug for KubeLeaseElection {
@@ -227,7 +232,19 @@ impl KubeLeaseElection {
             lease_duration: DEFAULT_LEASE_DURATION,
             renew_deadline: DEFAULT_RENEW_DEADLINE,
             retry_period: DEFAULT_RETRY_PERIOD,
+            controller_metrics: true,
         })
+    }
+
+    /// Don't count wins of this lease as controller failovers: for a
+    /// lease that isn't the cluster controller's, such as the operator's
+    /// leader lease. Without this the operator's elections showed up in
+    /// the per-broker failover panel as an unlabelled series.
+    pub fn without_controller_metrics(mut self: Arc<Self>) -> Arc<Self> {
+        if let Some(inner) = Arc::get_mut(&mut self) {
+            inner.controller_metrics = false;
+        }
+        self
     }
 
     /// Override the lease cadence (test hook).
@@ -597,10 +614,12 @@ impl LeaseElection for KubeLeaseElection {
         loop {
             match self.try_acquire().await {
                 Ok(Some(epoch)) => {
-                    let m = kaas_observability::metrics::global();
-                    m.controller_failovers.add(1, &[]);
-                    m.controller_failover_duration
-                        .record(started.elapsed().as_secs_f64(), &[]);
+                    if self.controller_metrics {
+                        let m = kaas_observability::metrics::global();
+                        m.controller_failovers.add(1, &[]);
+                        m.controller_failover_duration
+                            .record(started.elapsed().as_secs_f64(), &[]);
+                    }
                     return epoch;
                 }
                 Ok(None) => {}

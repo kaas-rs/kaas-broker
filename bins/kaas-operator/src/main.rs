@@ -158,12 +158,14 @@ async fn main() -> Result<()> {
     // elected pod only — multiple replicas are supported but only
     // one drives the loop at a time.
     let identity = std::env::var("HOSTNAME").unwrap_or_else(|_| "kaas-operator-0".into());
+    // Its wins aren't controller failovers (gh #290 verification).
     let election = KubeLeaseElection::new(
         client.clone(),
         namespace.clone(),
         LEADER_LEASE,
         identity.clone(),
-    );
+    )
+    .without_controller_metrics();
     // Timings: KubeLeaseElection's defaults (15/10/2), the one source of
     // truth shared with the broker's controller Lease (gh #281).
     info!(%identity, lease = LEADER_LEASE, "waiting for leader-election");

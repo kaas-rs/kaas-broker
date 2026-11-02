@@ -38,8 +38,9 @@ broker is therefore `sum by (instance)`. The bundled alerts and dashboard
 group that way: no kaas metric carries a `broker_id` label, and until gh #290
 they grouped by one. The broker-state gauges (`kaas_is_controller`,
 `kaas_assignment_version`, the per-partition and per-log-dir gauges) come
-only from brokers. The operator doesn't register them, so it adds no
-unlabelled zero series to per-broker panels.
+only from brokers. The operator doesn't register them, and its own
+leader election isn't counted as a controller failover, so it adds no
+unlabelled series to per-broker panels.
 
 With no endpoint set the SDK still runs and exports go nowhere —
 safe for tests and local dev. Before bootstrap runs, the global metrics
@@ -76,9 +77,9 @@ Both are served on port 8080:
   backend wedged" before the broker accumulates enough queued appenders
   to look outwardly idle.
 
-Fields with no measurement yet return `-1` internally and render as
-JSON `null`, so dashboards show "not measured" rather than a misleading
-zero. In local-dev mode (no cluster runtime) the whole runtime view is
+Fields with no measurement yet return `-1` internally and are left out
+of the JSON, so a missing field means "not measured" rather than a
+misleading zero. In local-dev mode (no cluster runtime) the whole runtime view is
 absent and the handler serves zero-valued fields — the right answer
 when no controller, coordinator, or heartbeat client is running.
 

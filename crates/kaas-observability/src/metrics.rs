@@ -146,7 +146,7 @@ pub fn new_metrics(m: &Meter) -> Metrics {
         controller_failover_duration: latency_hist(
             m,
             "kaas.controller.failover.duration",
-            "Seconds from winning the lease to the first AssignmentLoop write",
+            "Seconds from starting to contend for the controller lease until winning it",
         ),
         controller_lease_conflicts: counter(
             m,

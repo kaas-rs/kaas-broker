@@ -101,7 +101,7 @@
     {
       "id": 9,
       "type": "timeseries",
-      "title": "Controller failover duration p99 (s)",
+      "title": "Controller lease wait before winning, p50 / p99 (s)",
       "gridPos": {"h": 8, "w": 12, "x": 12, "y": 22},
       "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
       "targets": [
