@@ -162,6 +162,15 @@ pub struct GroupIdTooLong;
 /// The longest file name, less the `.tmp` the atomic write adds.
 const MAX_GROUP_FILE_NAME: usize = 255 - ".tmp".len();
 
+/// Can this group's offsets be stored at all? Its file name has to fit, which
+/// is why a longer id answers `INVALID_GROUP_ID` (24), and why no file can exist
+/// for one. Anything that stages offsets checks this up front (gh #318): staged
+/// offsets that could never be written would wedge their transaction.
+#[must_use]
+pub fn group_id_fits(group_id: &str) -> bool {
+    group_file_name(group_id).len() <= MAX_GROUP_FILE_NAME
+}
+
 /// The file holding `group_id`'s offsets. Apache allows any string as a group
 /// id, because it keeps them in a log; here it becomes a file name, so a
 /// separator would let a group ACL matching `../acls` overwrite the cluster's
@@ -355,7 +364,7 @@ impl OffsetStore {
         offsets: HashMap<String, i64>,
         metadata: HashMap<String, String>,
     ) -> io::Result<()> {
-        if group_file_name(group_id).len() > MAX_GROUP_FILE_NAME {
+        if !group_id_fits(group_id) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, GroupIdTooLong));
         }
         let _writer = self.write_lock(group_id);
@@ -540,9 +549,11 @@ impl OffsetStore {
         // Disk first, and the sync whether or not this attempt did the unlink:
         // a retry of a failed sync finds nothing to unlink. On failure the
         // group is as it was, and the answer says so (gh #318).
-        not_found_is_fine(std::fs::remove_file(
-            self.dir().join(group_file_name(group_id)),
-        ))?;
+        if group_id_fits(group_id) {
+            not_found_is_fine(std::fs::remove_file(
+                self.dir().join(group_file_name(group_id)),
+            ))?;
+        }
         not_found_is_fine(crate::atomic_write::fsync_dir(&self.dir()))?;
         let mut s = self.state.write();
         s.cache.remove(group_id);
@@ -653,11 +664,8 @@ impl OffsetStore {
         // `has_group` / `local_groups` report a group this broker never
         // materialised, which the heartbeat path feeds to the
         // controller's assignment loop.
-        let path = self.dir().join(group_file_name(group_id));
-        let data = match std::fs::read(&path) {
-            Ok(d) => d,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
-            Err(e) => return Err(e),
+        let Some(data) = self.read_group_file(group_id)? else {
+            return Ok(0);
         };
         let (mut offsets, metadata) = decode_offsets_file(&data)?;
         let mut metadata = metadata.unwrap_or_default();
@@ -677,6 +685,21 @@ impl OffsetStore {
         Ok(doomed.len())
     }
 
+    /// The bytes of `group_id`'s file, or `None` if it has none. An id too long
+    /// to have a file answers `None`: the read would fail with ENAMETOOLONG,
+    /// which reads as a broken volume, and DeleteGroups would then answer a
+    /// retriable error forever for a group that only ever joined.
+    fn read_group_file(&self, group_id: &str) -> io::Result<Option<Vec<u8>>> {
+        if !group_id_fits(group_id) {
+            return Ok(None);
+        }
+        match std::fs::read(self.dir().join(group_file_name(group_id))) {
+            Ok(data) => Ok(Some(data)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Pull `group_id`'s file into the cache unless it is cached already.
     ///
     /// `load` only runs when a group joins here, so a group this broker
@@ -693,11 +716,8 @@ impl OffsetStore {
         if self.state.read().cache.contains_key(group_id) {
             return Ok(());
         }
-        let path = self.dir().join(group_file_name(group_id));
-        let data = match std::fs::read(&path) {
-            Ok(d) => d,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
+        let Some(data) = self.read_group_file(group_id)? else {
+            return Ok(());
         };
         let (offsets, metadata) = decode_offsets_file(&data)?;
         let mut s = self.state.write();
@@ -714,7 +734,15 @@ impl OffsetStore {
     /// whatever is cached if the file can't be read. Writers propagate
     /// the error instead: rewriting a file they couldn't read would
     /// erase it.
+    ///
+    /// Takes the write lock if it has to read the file, or a cold fill could
+    /// read the file, lose a race with a purge or a delete, and put back what
+    /// they removed. The next commit would then write it out again (gh #318).
     fn ensure_loaded_for_read(&self, group_id: &str) {
+        if self.state.read().cache.contains_key(group_id) {
+            return;
+        }
+        let _writer = self.write_lock(group_id);
         if let Err(err) = self.ensure_loaded(group_id) {
             tracing::warn!(group = group_id, %err, "offsets: could not load group file");
         }
@@ -725,11 +753,12 @@ impl OffsetStore {
     /// Tolerates both the gh #21 v2 envelope and the legacy v1 plain
     /// map.
     pub fn load(&self, group_id: &str) -> io::Result<()> {
-        let path = self.dir().join(group_file_name(group_id));
-        let data = match std::fs::read(&path) {
-            Ok(d) => d,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
+        // This overwrites the cache, so a commit landing between the read and
+        // the insert would be rolled back in memory, and by the next write on
+        // disk too.
+        let _writer = self.write_lock(group_id);
+        let Some(data) = self.read_group_file(group_id)? else {
+            return Ok(());
         };
         let (offsets, metadata) = decode_offsets_file(&data)?;
         let mut s = self.state.write();
@@ -1403,6 +1432,81 @@ mod tests {
         s.delete("g").unwrap();
         assert!(!s.has_offsets("g"));
         assert_eq!(fetch_one(&store(tmp.path()), "g"), None);
+    }
+
+    /// gh #318: an id too long to have a file isn't a broken volume. Every
+    /// path that reads or removes the file answers "nothing there", or
+    /// DeleteGroups would answer a retriable error forever.
+    #[test]
+    fn a_group_id_too_long_for_a_file_has_nothing_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        // The directory has to exist, or these answer ENOENT before the name's
+        // length matters.
+        s.commit("g", one("t1", 0, 1)).unwrap();
+        // Long enough for ENAMETOOLONG on the read, not just on the tmp file.
+        let long = "a".repeat(300);
+        assert!(!group_id_fits(&long));
+        assert!(group_id_fits("g"));
+
+        assert_eq!(fetch_one(&s, &long), None);
+        assert!(!s.has_offsets(&long));
+        s.load(&long).unwrap();
+        assert_eq!(s.purge_topic(&long, "t1").unwrap(), 0);
+        let keys = [offset_key("t1", 0)];
+        assert!(s.delete_partitions(&long, &keys).unwrap().is_empty());
+        s.delete(&long).unwrap();
+    }
+
+    /// gh #318: a cold fill reads the file and then fills the cache, and a
+    /// purge landing in between would be undone, and written back by the next
+    /// commit. So a fill waits for the group's writer. A fetch that finds the
+    /// group cached doesn't, or a slow fsync would stall every read.
+    #[test]
+    fn a_cold_fill_waits_for_the_groups_writer_and_a_cached_read_does_not() {
+        let tmp = tempfile::tempdir().unwrap();
+        store(tmp.path()).commit("g", one("t1", 0, 100)).unwrap();
+
+        type ColdRead = fn(&OffsetStore);
+        let cold_reads: [ColdRead; 2] = [
+            |s| {
+                let _ = fetch_one(s, "g");
+            },
+            |s| s.load("g").unwrap(),
+        ];
+        for cold_read in cold_reads {
+            let s = std::sync::Arc::new(store(tmp.path()));
+            let writer = s.write_lock("g");
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let reader = {
+                let s = s.clone();
+                std::thread::spawn(move || {
+                    cold_read(&s);
+                    done_tx.send(()).unwrap();
+                })
+            };
+            assert!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_millis(200))
+                    .is_err(),
+                "a cold fill didn't wait for the writer"
+            );
+            drop(writer);
+            reader.join().unwrap();
+
+            // Now cached, so the same read goes straight through. On a thread,
+            // so a read that waits fails this rather than deadlocking the test.
+            let writer = s.write_lock("g");
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let reader = {
+                let s = s.clone();
+                std::thread::spawn(move || done_tx.send(fetch_one(&s, "g")).unwrap())
+            };
+            let got = done_rx.recv_timeout(std::time::Duration::from_secs(5));
+            drop(writer);
+            reader.join().unwrap();
+            assert_eq!(got, Ok(Some(100)), "a cached read waited for the writer");
+        }
     }
 
     /// gh #318: the cache now moves after the write, so a group's writers are

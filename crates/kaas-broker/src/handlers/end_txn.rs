@@ -155,6 +155,16 @@ impl EndTxnHandler {
         if !outcome.transition_fired {
             return 0;
         }
+        // Offsets before markers (gh #318): a failed offset write answers
+        // retriably, and with no markers placed the retry doesn't re-append them.
+        if let Err(e) = store.settle_offsets(
+            &req.transactional_id,
+            req.producer_id,
+            req.producer_epoch,
+            req.committed,
+        ) {
+            return map_store_error(&e);
+        }
         let dispatched = crate::txn_markers::dispatch_markers(
             &self.broker,
             &req.transactional_id,
@@ -244,8 +254,8 @@ mod tests {
         w.freeze()
     }
 
-    /// gh #318, through the handler: an offsets-only commit whose offset write
-    /// fails answers a retriable 15 rather than 0, and the retry completes it.
+    /// gh #318, through the handler: a commit whose offset write fails answers
+    /// a retriable 15 rather than 0, and the retry completes it.
     #[tokio::test]
     async fn a_commit_whose_offsets_cant_be_written_answers_15_and_the_retry_completes() {
         struct Hook(std::sync::atomic::AtomicBool);
@@ -265,6 +275,20 @@ mod tests {
         store
             .add_offsets_to_txn("tx-1", pid, epoch, "g", 100)
             .unwrap();
+        store
+            .add_partitions(
+                "tx-1",
+                pid,
+                epoch,
+                &[TxnTopic {
+                    topic: "t".into(),
+                    partitions: vec![0],
+                }],
+                100,
+            )
+            .unwrap();
+        b.engine.create_partition("t", 0).await.unwrap();
+        let hwm_before = b.engine.high_watermark("t", 0).unwrap();
         let h = EndTxnHandler::new(b.clone());
         let req = end_txn::Request {
             transactional_id: "tx-1".into(),
@@ -273,14 +297,24 @@ mod tests {
             committed: true,
         };
 
-        assert_eq!(call(&h, &req).await.error_code, 15);
-        let state = store.snapshot()["tx-1"].state;
-        assert_eq!(state, kaas_coordinator::TxnState::PrepareCommit);
+        // Every failed attempt answers 15 and places no marker. They used to be
+        // placed first, so each retry added a control batch.
+        for _ in 0..3 {
+            assert_eq!(call(&h, &req).await.error_code, 15);
+            let state = store.snapshot()["tx-1"].state;
+            assert_eq!(state, kaas_coordinator::TxnState::PrepareCommit);
+            assert_eq!(b.engine.high_watermark("t", 0).unwrap(), hwm_before);
+        }
 
         hook.0.store(false, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(call(&h, &req).await.error_code, 0);
         let state = store.snapshot()["tx-1"].state;
         assert_eq!(state, kaas_coordinator::TxnState::CompleteCommit);
+        assert_eq!(
+            b.engine.high_watermark("t", 0).unwrap(),
+            hwm_before + 1,
+            "exactly one marker"
+        );
     }
 
     async fn call(h: &EndTxnHandler, req: &end_txn::Request) -> end_txn::Response {

@@ -276,6 +276,16 @@ pub async fn reconcile_pending_markers(
     }
     let mut completed = 0;
     for p in pending {
+        // Offsets before markers, or every pass over a failing write would
+        // re-append a control batch to each partition (gh #318).
+        if let Err(err) = store.settle_offsets(&p.txn_id, p.pid, p.epoch, p.commit) {
+            tracing::warn!(
+                txn_id = %p.txn_id,
+                %err,
+                "txn marker reconcile: offsets not settled; leaving prepared for the next pass",
+            );
+            continue;
+        }
         if let Err(code) =
             dispatch_markers(broker, &p.txn_id, p.pid, p.epoch, p.commit, &p.partitions).await
         {
@@ -295,7 +305,7 @@ pub async fn reconcile_pending_markers(
                     txn_id = %p.txn_id,
                     producer_id = p.pid,
                     commit = p.commit,
-                    "txn marker reconcile: markers placed, transaction completed",
+                    "txn marker reconcile: transaction completed",
                 );
             }
             Err(err) => {
@@ -375,6 +385,62 @@ mod tests {
 
         // Converged — a second pass finds nothing owing.
         assert_eq!(reconcile_pending_markers(&b, &store, None).await, 0);
+    }
+
+    /// gh #318: a prepared transaction whose offset write keeps failing, and
+    /// whose producer is gone. Each pass leaves it prepared and places no
+    /// marker, then finishes it unaided once the write works. Both with a data
+    /// partition and offsets-only, which has no markers at all.
+    #[tokio::test]
+    async fn reconcile_retries_a_failing_offset_write_and_places_no_markers_until_it_lands() {
+        struct Hook(std::sync::atomic::AtomicBool);
+        impl kaas_coordinator::TxnOffsetHook for Hook {
+            fn on_end_txn(&self, _: &str, _: i64, _: bool) -> std::io::Result<()> {
+                if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(std::io::Error::other("disk full"));
+                }
+                Ok(())
+            }
+        }
+        for with_partition in [true, false] {
+            let (_t, b, store) = broker_with_txn();
+            let hook = Arc::new(Hook(std::sync::atomic::AtomicBool::new(true)));
+            store.set_offset_hook(hook.clone());
+            let (pid, epoch) = store.get_or_allocate("tx-1", || 1).unwrap();
+            store
+                .add_offsets_to_txn("tx-1", pid, epoch, "g", 100)
+                .unwrap();
+            if with_partition {
+                store
+                    .add_partitions(
+                        "tx-1",
+                        pid,
+                        epoch,
+                        &[TxnTopic {
+                            topic: "t".into(),
+                            partitions: vec![0],
+                        }],
+                        100,
+                    )
+                    .unwrap();
+                b.engine.create_partition("t", 0).await.unwrap();
+            }
+            store.prepare_end_txn("tx-1", pid, epoch, true).unwrap();
+            let hwm = || b.engine.high_watermark("t", 0).unwrap_or(0);
+            let before = hwm();
+
+            for _ in 0..3 {
+                assert_eq!(reconcile_pending_markers(&b, &store, None).await, 0);
+                assert_eq!(store.snapshot()["tx-1"].state, TxnState::PrepareCommit);
+                assert_eq!(hwm(), before, "a marker was placed");
+            }
+
+            hook.0.store(false, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(reconcile_pending_markers(&b, &store, None).await, 1);
+            assert_eq!(store.snapshot()["tx-1"].state, TxnState::CompleteCommit);
+            assert_eq!(hwm(), before + i64::from(with_partition));
+            assert_eq!(reconcile_pending_markers(&b, &store, None).await, 0);
+        }
     }
 
     /// The other rescue path: the EndTxn handler prepared, dispatch

@@ -85,6 +85,41 @@ pub trait GroupAssignmentSource: Send + Sync + 'static {
     }
 }
 
+/// EndTxn's offset step: materialise or discard what `TxnOffsetCommit` staged.
+///
+/// A group this broker no longer coordinates loses its staged offsets, rather
+/// than writing them. The commit merges into this broker's cache and rewrites
+/// the whole file, so a stale coordinator's retry, once its assignment view has
+/// caught up with the fence, would roll offsets back and erase others (gh #318).
+impl crate::txn_state::TxnOffsetHook for Manager {
+    fn on_end_txn(&self, group_id: &str, producer_id: i64, commit: bool) -> std::io::Result<()> {
+        if !commit {
+            self.offsets.discard_pending(group_id, producer_id);
+            return Ok(());
+        }
+        if !self.is_coordinator(group_id) {
+            if self.offsets.pending_for(group_id, producer_id).is_some() {
+                tracing::warn!(
+                    group_id,
+                    producer_id,
+                    "txn offset hook: group moved off this broker; dropping its staged offsets"
+                );
+                self.offsets.discard_pending(group_id, producer_id);
+            }
+            return Ok(());
+        }
+        self.offsets
+            .commit_pending(group_id, producer_id)
+            .inspect_err(|err| {
+                tracing::warn!(
+                    group_id, producer_id, %err,
+                    "txn offset hook: commit_pending failed; staged offsets remain \
+                     pending and the transaction stays prepared"
+                );
+            })
+    }
+}
+
 /// gh #91 sibling of [`GroupAssignmentSource`] used by
 /// `FindCoordinator(key_type=transaction)`. The Phase 5 broker wires
 /// `kaas-broker::Coordinator` into both seams; Phase 6 brings up the
@@ -928,6 +963,83 @@ mod tests {
         let blocked = tempfile::tempdir().unwrap();
         std::fs::write(blocked.path().join("__consumer_offsets"), b"a file").unwrap();
         assert_eq!(commit(&manager(blocked.path()), "g"), 15);
+    }
+
+    /// gh #318: the hook the broker installs. An abort discards; a commit
+    /// writes, or fails with the offsets still staged for the retry.
+    #[test]
+    fn the_offset_hook_commits_discards_and_reports_failure() {
+        use crate::txn_state::TxnOffsetHook;
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manager(tmp.path());
+        let key = offset_key("t", 0);
+        let staged = || HashMap::from([(key.clone(), 555)]);
+        let committed = |m: &Manager| {
+            let spec = FetchSpec {
+                topic: "t".to_owned(),
+                partitions: vec![0],
+            };
+            m.offsets
+                .fetch("g", std::slice::from_ref(&spec))
+                .get(&key)
+                .copied()
+        };
+
+        m.offsets.store_pending("g", 7, staged());
+        m.on_end_txn("g", 7, false).unwrap();
+        assert!(m.offsets.pending_for("g", 7).is_none());
+        assert_eq!(committed(&m), Some(-1));
+
+        // A directory that can't be written.
+        let dir = tmp.path().join("__consumer_offsets");
+        std::fs::write(&dir, b"x").unwrap();
+        m.offsets.store_pending("g", 7, staged());
+        assert!(m.on_end_txn("g", 7, true).is_err());
+        assert!(m.offsets.pending_for("g", 7).is_some());
+
+        std::fs::remove_file(&dir).unwrap();
+        m.on_end_txn("g", 7, true).unwrap();
+        assert_eq!(committed(&m), Some(555));
+        // Idempotent: a retry after a later step failed finds nothing staged.
+        m.on_end_txn("g", 7, true).unwrap();
+        assert_eq!(committed(&m), Some(555));
+    }
+
+    /// gh #318: a group that has moved off this broker drops its staged
+    /// offsets rather than writing them. A commit rewrites the whole file from
+    /// this broker's cache, which would roll the new coordinator's offsets back.
+    #[test]
+    fn the_offset_hook_never_writes_a_group_this_broker_doesnt_coordinate() {
+        use crate::txn_state::TxnOffsetHook;
+        struct Nobody;
+        impl GroupAssignmentSource for Nobody {
+            fn owns_group(&self, _: &str) -> bool {
+                false
+            }
+            fn group_coordinator(&self, _: &str) -> Option<BrokerId> {
+                Some("kaas-1".to_owned())
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manager(tmp.path());
+        let key = offset_key("t", 0);
+        assert_eq!(
+            m.offset_commit("g", HashMap::from([(key.clone(), 100)]), HashMap::new()),
+            0
+        );
+        m.offsets
+            .store_pending("g", 7, HashMap::from([(key.clone(), 555)]));
+        m.set_group_assignment_source(Arc::new(Nobody));
+
+        m.on_end_txn("g", 7, true).unwrap();
+        assert!(m.offsets.pending_for("g", 7).is_none());
+        let fresh = OffsetStore::new(tmp.path());
+        let spec = FetchSpec {
+            topic: "t".to_owned(),
+            partitions: vec![0],
+        };
+        let got = fresh.fetch("g", std::slice::from_ref(&spec));
+        assert_eq!(got.get(&key), Some(&100), "the file was rewritten");
     }
 
     /// gh #318: a delete that didn't land answers a retriable 15, leaves the

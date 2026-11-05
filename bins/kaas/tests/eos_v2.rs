@@ -94,22 +94,6 @@ fn build_test_broker(topic: &str, partitions: i32, data_dir: &std::path::Path) -
     ))
 }
 
-/// Mirrors cluster.rs's OffsetStoreHook: txn coord → group coord
-/// offset commit/discard. Inlined in the test so we don't depend on
-/// the bin's private modules.
-struct OffsetHook {
-    manager: Arc<Manager>,
-}
-impl TxnOffsetHook for OffsetHook {
-    fn on_end_txn(&self, group_id: &str, producer_id: i64, commit: bool) -> std::io::Result<()> {
-        if !commit {
-            self.manager.offsets.discard_pending(group_id, producer_id);
-            return Ok(());
-        }
-        self.manager.offsets.commit_pending(group_id, producer_id)
-    }
-}
-
 fn install_phase6_surface(broker: &Arc<Broker>) -> (tempfile::TempDir, Arc<Manager>) {
     let tmp = tempfile::tempdir().unwrap();
 
@@ -130,9 +114,7 @@ fn install_phase6_surface(broker: &Arc<Broker>) -> (tempfile::TempDir, Arc<Manag
     let cluster_dir = tmp.path().join("__cluster");
     std::fs::create_dir_all(&cluster_dir).unwrap();
     let txn_state = Arc::new(TxnStateStore::open(&cluster_dir, 0).unwrap());
-    let hook: Arc<dyn TxnOffsetHook> = Arc::new(OffsetHook {
-        manager: manager.clone(),
-    });
+    let hook: Arc<dyn TxnOffsetHook> = manager.clone();
     txn_state.set_offset_hook(hook);
     broker.install_txn_state(txn_state);
 

@@ -25,6 +25,7 @@ const ERR_PRODUCER_FENCED: i16 = 90;
 const ERR_CONCURRENT_TRANSACTIONS: i16 = 51;
 const ERR_INVALID_TXN_STATE: i16 = 48;
 const ERR_GROUP_AUTHZ_FAILED: i16 = 30;
+const ERR_INVALID_GROUP_ID: i16 = 24;
 const ERR_TXN_ID_AUTHZ_FAILED: i16 = 53;
 
 #[derive(Debug)]
@@ -99,6 +100,11 @@ impl AddOffsetsToTxnHandler {
         ) {
             return Some(ERR_GROUP_AUTHZ_FAILED);
         }
+        // A group whose offsets could never be stored, refused now rather than
+        // leaving a transaction that can never finish (gh #318).
+        if !kaas_coordinator::group_id_fits(&req.group_id) {
+            return Some(ERR_INVALID_GROUP_ID);
+        }
         if !self.broker.owns_txn(&req.transactional_id) {
             return Some(ERR_NOT_COORDINATOR);
         }
@@ -155,6 +161,28 @@ mod tests {
         ));
         b.install_txn_state(Arc::new(TxnStateStore::open(tmp.path(), 0).unwrap()));
         (tmp, b)
+    }
+
+    /// gh #318: a group id too long to store answers 24 and isn't recorded.
+    #[tokio::test]
+    async fn a_group_id_too_long_to_store_is_24() {
+        let (_tmp, b) = broker_with_txn();
+        let store = b.txn_state().unwrap();
+        let (pid, epoch) = store.get_or_allocate("tx-1", || 1).unwrap();
+        let h = AddOffsetsToTxnHandler::new(b.clone());
+        for (group, want) in [("a".repeat(247), 24), ("a".repeat(246), 0)] {
+            let req = add_offsets_to_txn::Request {
+                transactional_id: "tx-1".into(),
+                producer_id: pid,
+                producer_epoch: epoch,
+                group_id: group.clone(),
+            };
+            let out = h.handle(&conn(), 3, encode_request(&req, 3)).await.unwrap();
+            let resp = add_offsets_to_txn::decode_response(&mut out.freeze(), 3).unwrap();
+            assert_eq!(resp.error_code, want);
+            let recorded = store.snapshot()["tx-1"].groups.contains(&group);
+            assert_eq!(recorded, want == 0);
+        }
     }
 
     fn encode_request(req: &add_offsets_to_txn::Request, version: i16) -> Bytes {

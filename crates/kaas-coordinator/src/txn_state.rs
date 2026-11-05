@@ -757,15 +757,13 @@ impl TxnStateStore {
     /// `read_committed` consumers with a permanently pinned LSO and no
     /// way for any retry to notice.
     ///
-    /// The offset hook fires here rather than in
-    /// [`Self::prepare_end_txn`] so staged `TxnOffsetCommit` offsets
-    /// only become visible once the markers backing them are durable.
-    ///
-    /// The hook fires before the entry changes (gh #318). It used to fire
-    /// after, and a failed offset write was only logged: EndTxn answered 0 for
-    /// offsets that were gone, with the groups already cleared, so nothing
+    /// The offset hook fires before the entry changes (gh #318). It used to
+    /// fire after, and a failed offset write was only logged: EndTxn answered 0
+    /// for offsets that were gone, with the groups already cleared, so nothing
     /// could retry. Now the entry stays prepared and both the producer's retry
-    /// and the reconcile come back here.
+    /// and the reconcile come back here. Production callers have already run
+    /// [`Self::settle_offsets`], so here it finds nothing left to do. It stays
+    /// for callers with no markers to place, such as the abort on a rejoin.
     ///
     /// Idempotent on `Complete*` with a matching `commit`.
     pub fn complete_end_txn(&self, txn_id: &str, pid: i64, epoch: i16, commit: bool) -> Result<()> {
@@ -800,12 +798,7 @@ impl TxnStateStore {
             return Err(TxnStateError::InvalidState);
         }
 
-        let hook = self.hook.read().clone();
-        if let Some(hook) = hook {
-            for g in &entry.groups {
-                hook.on_end_txn(g, pid, commit)?;
-            }
-        }
+        self.fire_offset_hook(&entry, pid, commit)?;
 
         entry.state = want_complete;
         entry.groups.clear();
@@ -813,6 +806,50 @@ impl TxnStateStore {
         entry.ongoing_since_ms = 0;
         state.insert(txn_id.to_owned(), entry);
         self.persist_slot(slot, &state)?;
+        Ok(())
+    }
+
+    /// Materialise or discard the offsets of a prepared transaction, ahead of
+    /// its markers. A caller runs this **before** placing markers (gh #318): an
+    /// offset write that fails then costs nothing, where placing markers first
+    /// re-appended a control batch to every partition on every retry.
+    ///
+    /// Showing the offsets before the markers are durable is safe. `Prepare*` is
+    /// the decision: the transaction can only finish in that direction, and the
+    /// data stays invisible to `read_committed` until its marker lands.
+    ///
+    /// Idempotent, and a no-op unless the entry is prepared in this direction.
+    pub fn settle_offsets(&self, txn_id: &str, pid: i64, epoch: i16, commit: bool) -> Result<()> {
+        if txn_id.is_empty() {
+            return Err(TxnStateError::EmptyTxnId);
+        }
+        let _guard = self.mu.lock();
+        let state = self.load_slot(self.slot_for(txn_id))?;
+        let entry = state.get(txn_id).ok_or(TxnStateError::UnknownProducer)?;
+        if entry.pid != pid {
+            return Err(TxnStateError::UnknownProducer);
+        }
+        if entry.epoch != epoch {
+            return Err(TxnStateError::EpochFenced);
+        }
+        let prepared = if commit {
+            TxnState::PrepareCommit
+        } else {
+            TxnState::PrepareAbort
+        };
+        if entry.state == prepared {
+            self.fire_offset_hook(entry, pid, commit)?;
+        }
+        Ok(())
+    }
+
+    fn fire_offset_hook(&self, entry: &TxnEntry, pid: i64, commit: bool) -> io::Result<()> {
+        let hook = self.hook.read().clone();
+        if let Some(hook) = hook {
+            for g in &entry.groups {
+                hook.on_end_txn(g, pid, commit)?;
+            }
+        }
         Ok(())
     }
 

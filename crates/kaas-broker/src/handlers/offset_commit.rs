@@ -27,6 +27,7 @@ use super::principal_from;
 use crate::broker::Broker;
 
 const ERR_NOT_COORDINATOR: i16 = 16;
+const ERR_COORDINATOR_NOT_AVAILABLE: i16 = 15;
 const ERR_TOPIC_AUTHZ_FAILED: i16 = 29;
 const ERR_GROUP_AUTHZ_FAILED: i16 = 30;
 
@@ -95,7 +96,18 @@ impl Handler for OffsetCommitHandler {
         } else {
             match self.broker.coord_manager() {
                 None => ERR_NOT_COORDINATOR,
-                Some(mgr) => mgr.offset_commit(&req.group_id, offsets, metadata),
+                // An fsync, behind the group's write lock when others are
+                // committing. On a scheduler worker that parks the runtime, so
+                // one busy group would slow every connection (gh #318, as
+                // gh #209 for reads).
+                Some(mgr) => {
+                    let group_id = req.group_id.clone();
+                    tokio::task::spawn_blocking(move || {
+                        mgr.offset_commit(&group_id, offsets, metadata)
+                    })
+                    .await
+                    .unwrap_or(ERR_COORDINATOR_NOT_AVAILABLE)
+                }
             }
         };
 

@@ -193,9 +193,7 @@ pub fn install(
     );
 
     // EndTxn / reaper → group-coordinator offset commit/discard.
-    let hook: Arc<dyn TxnOffsetHook> = Arc::new(OffsetStoreHook {
-        manager: manager.clone(),
-    });
+    let hook: Arc<dyn TxnOffsetHook> = manager.clone();
     txn_state.set_offset_hook(hook);
 
     let fence_dir = fence_log_dir(&cluster_dir);
@@ -379,35 +377,6 @@ pub fn install(
         marker_queue,
         tasks,
     })
-}
-
-/// Bridges [`TxnOffsetHook`] (from the transactional coordinator)
-/// to the consumer-group `Manager`'s `OffsetStore`. On `EndTxn`
-/// commit, the txn coord fires the hook for each `(group, pid)`
-/// that staged offsets via `TxnOffsetCommit`; the hook materialises
-/// the pending entry into the durable offset map. On abort, it
-/// discards the pending entry.
-struct OffsetStoreHook {
-    manager: Arc<Manager>,
-}
-
-impl TxnOffsetHook for OffsetStoreHook {
-    fn on_end_txn(&self, group_id: &str, producer_id: i64, commit: bool) -> std::io::Result<()> {
-        if !commit {
-            self.manager.offsets.discard_pending(group_id, producer_id);
-            return Ok(());
-        }
-        self.manager
-            .offsets
-            .commit_pending(group_id, producer_id)
-            .inspect_err(|err| {
-                warn!(
-                    group_id, producer_id, %err,
-                    "txn offset hook: commit_pending failed; staged offsets remain \
-                     pending and the transaction stays prepared"
-                );
-            })
-    }
 }
 
 /// [`ProducerEpochFencer`] adapter that bridges the

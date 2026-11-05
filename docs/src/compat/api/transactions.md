@@ -221,6 +221,10 @@ error code. An empty `group_id` is rejected with `INVALID_TXN_STATE` (48).
 
 - The empty-`group_id` rejection is kaas's own; Apache authorizes `Read` on
   the group and adds it like any other.
+- A group id too long for a file name (247 bytes after encoding) answers
+  `INVALID_GROUP_ID` (24), as OffsetCommit does; Apache has no such limit. Its
+  offsets could never be stored, and accepting it would leave a transaction
+  that can't finish (gh #318).
 
 **Source**: `crates/kaas-broker/src/handlers/add_offsets_to_txn.rs`
 (handler), `crates/kaas-codec/src/api/add_offsets_to_txn.rs` (codec),
@@ -254,10 +258,13 @@ partitions** get one queue file per target broker under
 durably written queue entry is the durability boundary for a peer
 partition, since the peer's `MarkerWatcher` (2 s poll) retries until
 the marker applies. Only once every marker is durable does
-`complete_end_txn` run: the offset hook fires per recorded group (commit
-materialises the offsets `TxnOffsetCommit` staged, abort discards them), then
-`Prepare* → Complete*`, lists cleared, `ongoingSinceMs` zeroed. Any dispatch
-failure, or a commit's offset write failing (gh #318), answers the retriable
+`complete_end_txn` run: `Prepare* → Complete*`, lists cleared,
+`ongoingSinceMs` zeroed. The offsets come first of all, right after the prepare:
+the hook fires per recorded group (commit materialises the offsets
+`TxnOffsetCommit` staged, abort discards them), so a failing offset write places
+no markers (gh #318). That's safe because `Prepare*` already decided the direction.
+A group that has moved off this broker drops its staged offsets instead of writing
+them. Any dispatch failure, or a commit's offset write failing, answers the retriable
 `COORDINATOR_NOT_AVAILABLE` (15) and leaves the entry prepared. A producer retry
 or the 10 s marker reconcile re-derives the identical dispatch set and finishes
 the job. The reconcile also reaches a prepared transaction with no partitions,
@@ -366,6 +373,8 @@ is the correct outcome.
 
 **Deviations from Apache 3.7**:
 
+- A group id too long for a file name answers `INVALID_GROUP_ID` (24) on every
+  partition and stages nothing, for the same reason as AddOffsetsToTxn (gh #318).
 - `producer_epoch`, `generation_id`, and `member_id` are decoded but not
   validated. Apache fences zombies at this API with
   `INVALID_PRODUCER_EPOCH` / `ILLEGAL_GENERATION` /

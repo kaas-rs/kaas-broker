@@ -29,6 +29,7 @@ use parking_lot::Mutex;
 use super::principal_from;
 use crate::broker::Broker;
 
+const ERR_INVALID_GROUP_ID: i16 = 24;
 const ERR_NOT_COORDINATOR: i16 = 16;
 const ERR_TOPIC_AUTHZ_FAILED: i16 = 29;
 const ERR_GROUP_AUTHZ_FAILED: i16 = 30;
@@ -73,6 +74,11 @@ impl Handler for TxnOffsetCommitHandler {
             Operation::Read,
         ) {
             return write_response(version, &req, |_| ERR_GROUP_AUTHZ_FAILED);
+        }
+        // Offsets staged for a group that can't be stored could never be
+        // committed, and the transaction could never finish (gh #318).
+        if !kaas_coordinator::group_id_fits(&req.group_id) {
+            return write_response(version, &req, |_| ERR_INVALID_GROUP_ID);
         }
 
         // Group-coordinator gate. Mirrors OffsetCommit: when no
@@ -287,6 +293,25 @@ mod tests {
                 committed_metadata: None,
             }],
         }
+    }
+
+    /// gh #318: a group id too long to store answers 24 and stages nothing.
+    /// These offsets could never be committed, so the transaction could never
+    /// finish: EndTxn answered 15 forever, and only a restart cleared it.
+    #[tokio::test]
+    async fn a_group_id_too_long_to_store_is_24_and_stages_nothing() {
+        let (_t, b, mgr) = broker_with_manager_and_auth(Arc::new(kaas_auth::AllowAllAuthorizer));
+        let h = TxnOffsetCommitHandler::new(b);
+        let mut req = request_for(vec![topic("t")]);
+        req.group_id = "a".repeat(247);
+        let resp = call(&h, &req).await;
+        assert_eq!(resp.topics[0].partitions[0].error_code, 24);
+        assert!(mgr.offsets.pending_for(&req.group_id, 42).is_none());
+
+        req.group_id = "a".repeat(246);
+        let resp = call(&h, &req).await;
+        assert_eq!(resp.topics[0].partitions[0].error_code, 0);
+        assert!(mgr.offsets.pending_for(&req.group_id, 42).is_some());
     }
 
     /// gh #199: no `Write` on the txn id -> 53 on every partition.
