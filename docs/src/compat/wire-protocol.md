@@ -69,8 +69,12 @@ Consequences worth internalizing:
   but Apache also walks the records. So a batch that is consistent on its own
   terms and lies inside is accepted here and refused by Apache: a compressed
   batch with a garbage payload, a compressed batch claiming more records than
-  it holds, or an uncompressed one holding more or fewer than it claims. A
-  consumer then fails on that batch until it seeks past it. Reaching this takes
+  it holds (up to what any codec could expand its bytes into, gh #312), or an
+  uncompressed one holding more or fewer than it claims. A `read_uncommitted`
+  consumer fails on that batch until it seeks past it, or until DeleteRecords
+  or retention removes it. A `read_committed` consumer skips it unread when it
+  belongs to an aborted transaction. Offsets stay jumped by what the batch
+  claimed, but they only move forward. Reaching this takes
   `Write` on the topic and a client that crafts its own batches; real clients
   don't produce them. A compact-only topic also accepts records with no key,
   which Apache refuses with `INVALID_RECORD` (87): kaas can't see keys, and has

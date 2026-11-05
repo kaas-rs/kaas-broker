@@ -80,6 +80,10 @@ const COMPRESSION_ZSTD: i16 = 4;
 /// attributes, timestamp delta, offset delta, key length, value length and
 /// header count.
 const MIN_RECORD_BYTES: i64 = 7;
+/// How far a batch's size can bound its records when compressed: no codec
+/// expands a byte past this. zstd's run-length blocks reach about 32 KiB per
+/// byte, gzip about 1 KiB.
+const MAX_COMPRESSION_RATIO: i64 = 65_536;
 /// Everything before the records in a v2 batch.
 const V2_HEADER_BYTES: usize = 61;
 /// Produce's first version allowed to carry ZSTD (KIP-110).
@@ -458,8 +462,10 @@ fn batch_attributes(b: &[u8]) -> i16 {
 /// count can still be bounded from its size alone: every record takes at
 /// least [`MIN_RECORD_BYTES`]. That stops a header whose two fields agree
 /// with each other while claiming far more records than the batch holds
-/// (gh #305 verification). A compressed batch can't be bounded this way;
-/// see the byte-opacity contract in the wire-protocol docs.
+/// (gh #305 verification). A compressed batch can only be bounded loosely, by
+/// the most any codec can expand: enough that a tiny batch can't claim billions
+/// of records and force a segment roll for almost no bytes (gh #312). The rest
+/// is a limit of the byte-opacity contract; see the wire-protocol docs.
 fn batch_fields_are_valid(b: &[u8]) -> bool {
     let last_offset_delta = i32::from_be_bytes([b[23], b[24], b[25], b[26]]);
     let producer_id = i64::from_be_bytes([b[43], b[44], b[45], b[46], b[47], b[48], b[49], b[50]]);
@@ -468,7 +474,12 @@ fn batch_fields_are_valid(b: &[u8]) -> bool {
     let count_from_offsets = i64::from(last_offset_delta) + 1;
     let uncompressed = batch_attributes(b) & ATTR_COMPRESSION_MASK == 0;
     let payload = i64::try_from(b.len().saturating_sub(V2_HEADER_BYTES)).unwrap_or(i64::MAX);
-    let fits_payload = !uncompressed || i64::from(record_count) * MIN_RECORD_BYTES <= payload;
+    let max_expanded = if uncompressed {
+        payload
+    } else {
+        payload.saturating_mul(MAX_COMPRESSION_RATIO)
+    };
+    let fits_payload = i64::from(record_count) * MIN_RECORD_BYTES <= max_expanded;
     count_from_offsets > 0
         && record_count > 0
         && count_from_offsets == i64::from(record_count)
@@ -1112,5 +1123,33 @@ mod tests {
             -1
         );
         assert_eq!(h.broker.engine.high_watermark("known", 0).unwrap_or(0), 0);
+    }
+
+    /// gh #312: a compressed batch can't claim more records than any codec
+    /// could expand its bytes into. A tiny batch claiming billions forced a
+    /// segment roll for almost no bytes. A count inside the bound is accepted:
+    /// that's the byte-opacity limit, and a real batch can compress that well.
+    #[tokio::test]
+    async fn a_compressed_batch_claiming_impossibly_many_records_is_87() {
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        let gzip = |delta: i32, count: i32| {
+            edited(move |h| {
+                h[21..23].copy_from_slice(&1i16.to_be_bytes());
+                h[23..27].copy_from_slice(&delta.to_be_bytes());
+                h[57..61].copy_from_slice(&count.to_be_bytes());
+            })
+        };
+        let b = txn_broker(Arc::new(DenyNamedAuthorizer("nobody")));
+        assert_eq!(
+            produce_two(&b, None, gzip(i32::MAX - 1, i32::MAX), batch(0, -1, -1)).await,
+            [87, 0]
+        );
+        assert_eq!(appended(&b, "orders"), 0);
+        assert_eq!(
+            produce_two(&b, None, gzip(999, 1000), batch(0, -1, -1)).await,
+            [0, 0],
+            "plausibly compressed"
+        );
+        assert_eq!(appended(&b, "orders"), 1000);
     }
 }

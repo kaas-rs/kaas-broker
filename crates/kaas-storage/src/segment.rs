@@ -481,14 +481,18 @@ pub fn search_index_bytes(data: &[u8], segment_base_offset: i64, target_offset: 
     if n == 0 {
         return 0;
     }
+    // Checked before the conversion below can fail. A target more than 2^31
+    // below this segment overflowed i32 too, and read as "far above", which
+    // started the read at the last entry and silently dropped every earlier
+    // batch in the segment from the response.
+    if target_offset < segment_base_offset {
+        return 0;
+    }
     let Ok(target_rel) = i32::try_from(target_offset - segment_base_offset) else {
         // target_offset much larger than segment_base — clamp; we'll
         // return the last entry below.
         return read_index_entry(data, n - 1).1;
     };
-    if target_rel < 0 {
-        return 0;
-    }
     let mut lo = 0usize;
     let mut hi = n - 1;
     let mut result = 0i64;
@@ -831,7 +835,10 @@ impl ActiveSegment {
         let (base_offset, last_offset_delta, max_timestamp) = parse_batch_offsets(raw)?;
 
         // Sparse index entry when threshold exceeded.
-        let index_due = self.log_size - self.last_indexed_log_pos >= index_interval_bytes;
+        // Saturating: `last_indexed_log_pos` is estimated from the entry count
+        // after a restart, and can exceed the log size.
+        let index_due =
+            self.log_size.saturating_sub(self.last_indexed_log_pos) >= index_interval_bytes;
         if index_due {
             let index = self
                 .index
@@ -1183,6 +1190,23 @@ mod tests {
         run.extend(&partial[..partial.len() - 1]);
         assert_eq!(count_records(&run), 8);
         assert_eq!(count_records(&[]), 0);
+    }
+
+    /// A target far below the segment starts at the beginning, not the last
+    /// entry. More than 2^31 below used to overflow the i32 conversion and
+    /// read as "far above", dropping the segment's earlier batches.
+    #[test]
+    fn a_target_far_below_the_segment_starts_at_the_beginning() {
+        let mut index = Vec::new();
+        for (rel, pos) in [(0i32, 0u32), (10, 4096), (20, 8192)] {
+            index.extend_from_slice(&rel.to_be_bytes());
+            index.extend_from_slice(&pos.to_be_bytes());
+        }
+        let base = 1i64 << 32;
+        assert_eq!(search_index_bytes(&index, base, 0), 0, "over 2^31 below");
+        assert_eq!(search_index_bytes(&index, base, base - 1), 0, "just below");
+        assert_eq!(search_index_bytes(&index, base, base + 15), 4096);
+        assert_eq!(search_index_bytes(&index, base, base + (1 << 40)), 8192);
     }
 
     /// gh #305 verification: an offset the index can't hold fails before

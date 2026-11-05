@@ -3943,6 +3943,11 @@ mod tests {
                 assert_eq!(base, far + i);
             }
             assert!(!p.inner.lock().closed.is_empty(), "expected a roll");
+            // A read from the start returns every batch across the gap. The
+            // index search used to skip the far segment's earlier batches,
+            // silently (gh #312).
+            let one = build_batch(1, 1_000).len();
+            assert_eq!(p.read(0, 1 << 20).await.unwrap().len(), 7 * one);
             p.close().await.unwrap();
 
             let p2 = Partition::open(fs, "t".into(), 0, dir.clone(), cfg())
