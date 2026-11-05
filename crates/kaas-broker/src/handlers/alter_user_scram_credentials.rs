@@ -575,6 +575,7 @@ mod tests {
     /// into the API path, so `alice?x=1` used to rotate `alice`.
     #[tokio::test]
     async fn a_name_that_cannot_be_a_kafka_user_is_91_and_never_written() {
+        let too_long = "a".repeat(254);
         for name in [
             "alice?x=1",
             "alice#frag",
@@ -582,6 +583,12 @@ mod tests {
             "a b",
             "Alice",
             "a%2Fb",
+            "-a",
+            "a-",
+            ".a",
+            "a.",
+            "a..b",
+            too_long.as_str(),
         ] {
             let w = Arc::new(RecordingWriter::default());
             let resp = alter(
