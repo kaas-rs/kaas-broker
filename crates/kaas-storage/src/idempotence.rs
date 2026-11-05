@@ -288,9 +288,10 @@ pub fn classify(states: &HashMap<i64, ProducerEntry>, info: BatchProducerInfo) -
     }
 
     if entry.recent.is_empty() {
-        // Same-epoch entry with empty window can only happen during
-        // snapshot restore where state was preserved but the window
-        // wasn't. Same first-seq=0 acceptance rule.
+        // A cross-partition fence raises the epoch and clears the window,
+        // so this is the first batch of the session after a bump. Apache
+        // requires sequence 0 on an epoch change, and here the epoch change
+        // has already been applied.
         return if info.first_seq == 0 {
             Outcome::Accept
         } else {
