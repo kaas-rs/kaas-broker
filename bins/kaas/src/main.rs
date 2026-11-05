@@ -58,6 +58,9 @@ use tracing::{error, info, warn};
 /// Hot-reload interval for credentials.json + acls.json. 10 s
 /// mtime poll. Swapping in `notify` inotify is an open follow-up.
 const RELOAD_INTERVAL_SECS: u64 = 10;
+/// The wait after each partition the `migrate-to-volume` driver moves
+/// (gh #224).
+const MIGRATION_PACE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Init-container entry point — chown/chmod the data dir
 /// to the broker uid/gid so the broker container (uid=65532) can
@@ -394,40 +397,22 @@ async fn main() -> Result<()> {
                         let name = name.to_string();
                         if migrations_in_flight.lock().insert(name.clone()) {
                             let broker = broker_migrate.clone();
-                            let registry = topics_apply.clone();
                             let in_flight = migrations_in_flight.clone();
                             tokio::spawn(async move {
-                                for p in 0..partitions {
-                                    let actual = broker.engine.partition_log_dir(&name, p);
-                                    let record = registry.volume_assignment(&name, p);
-                                    if !kaas_broker::migration_needed(
-                                        &actual,
-                                        record.as_deref(),
-                                        &target,
-                                    ) {
-                                        continue;
-                                    }
-                                    let code =
-                                        kaas_broker::migrate_partition(&broker, &name, p, &target)
-                                            .await;
-                                    match code {
-                                        0 => {
-                                            // Rate limit: one partition per
-                                            // pass interval, so a drain never
-                                            // saturates the substrate.
-                                            tokio::time::sleep(std::time::Duration::from_secs(3))
-                                                .await;
-                                        }
-                                        57 => {
-                                            warn!(
-                                                topic = name.as_str(),
-                                                target = target.as_str(),
-                                                "migrate-to-volume: unknown log dir; stopping"
-                                            );
-                                            break;
-                                        }
-                                        _ => {} // not led here / transient — next echo retries
-                                    }
+                                let pass = kaas_broker::drive_migration(
+                                    &broker,
+                                    &name,
+                                    partitions,
+                                    &target,
+                                    MIGRATION_PACE,
+                                )
+                                .await;
+                                if pass.is_err() {
+                                    warn!(
+                                        topic = name.as_str(),
+                                        target = target.as_str(),
+                                        "migrate-to-volume: unknown log dir; stopping"
+                                    );
                                 }
                                 in_flight.lock().remove(&name);
                             });
