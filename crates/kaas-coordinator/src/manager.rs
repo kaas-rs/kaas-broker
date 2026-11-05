@@ -539,8 +539,11 @@ impl Manager {
 
     /// Snapshot the listed groups in `ids`. Groups not coordinated
     /// here surface as `None` so the handler can encode
-    /// `NOT_COORDINATOR`; groups coordinated but unknown surface as
-    /// `Some(snapshot_with_empty_state)`.
+    /// `NOT_COORDINATOR`. A coordinated group that isn't in memory is
+    /// `Empty` if it has committed offsets on disk, and otherwise doesn't
+    /// exist: `Dead`, with no error, as in Apache's `handleDescribeGroup`
+    /// (gh #304). `kafka-consumer-groups.sh` reads that as "does not
+    /// exist".
     pub fn describe_groups(&self, ids: &[String]) -> Vec<Option<GroupSnapshot>> {
         ids.iter()
             .map(|id| {
@@ -551,7 +554,11 @@ impl Manager {
                     Some(g) => g.describe(),
                     None => GroupSnapshot {
                         id: id.clone(),
-                        state: "Empty",
+                        state: if self.offsets.has_offsets(id) {
+                            "Empty"
+                        } else {
+                            "Dead"
+                        },
                         protocol_type: String::new(),
                         protocol_name: String::new(),
                         generation_id: 0,
@@ -848,5 +855,32 @@ mod tests {
         let m = manager(tmp.path());
         assert_eq!(m.delete_group("idle"), 0);
         assert!(OffsetStore::new(tmp.path()).group_ids_on_disk().is_empty());
+    }
+
+    /// gh #304: a group that exists nowhere is Apache's `Dead`, and stays
+    /// that way when asked again. One known only through committed offsets
+    /// on disk (idle since this broker became its coordinator) is `Empty`.
+    #[test]
+    fn an_unknown_group_is_dead_and_one_with_offsets_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manager(tmp.path());
+        let state = |m: &Manager, id: &str| {
+            m.describe_groups(&[id.to_owned()])
+                .pop()
+                .flatten()
+                .unwrap()
+                .state
+        };
+        assert_eq!(state(&m, "nobody"), "Dead");
+        assert_eq!(state(&m, "nobody"), "Dead");
+
+        m.offsets
+            .commit("idle", HashMap::from([(offset_key("t", 0), 7)]))
+            .unwrap();
+        assert_eq!(state(&m, "idle"), "Empty");
+        // Off disk alone, as a fresh coordinator sees it.
+        let fresh = manager(tmp.path());
+        assert_eq!(state(&fresh, "idle"), "Empty");
+        assert_eq!(state(&fresh, "nobody"), "Dead");
     }
 }

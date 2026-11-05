@@ -346,7 +346,10 @@ ownership — a group coordinated elsewhere gets a per-group
 unions results across brokers (without the filter, one broker's stale
 in-memory entry reappeared cluster-wide). Owned groups return their live
 snapshot; group-state strings match Apache's exactly (`Empty`,
-`PreparingRebalance`, `CompletingRebalance`, `Stable`, `Dead`).
+`PreparingRebalance`, `CompletingRebalance`, `Stable`, `Dead`). A group that
+isn't in memory is `Empty` if it has committed offsets on disk, and otherwise
+`Dead` with no error, so `kafka-consumer-groups.sh --describe` says it doesn't
+exist (gh #304).
 `authorized_operations` (v3+) is Apache's: `-2147483648` ("not computed")
 unless the request sets `include_authorized_operations`, and on every error
 row; otherwise the bitfield over the group operations `Read`, `Delete` and
@@ -354,8 +357,6 @@ row; otherwise the bitfield over the group operations `Read`, `Delete` and
 
 **Deviations from Apache 3.7**:
 
-- A group this broker coordinates but has no state for is described as
-  `Empty` with no members; Apache describes an unknown group as `Dead`.
 - Per-member `client_host` and `member_metadata` are returned empty (the
   coordinator tracks the host but the snapshot doesn't carry it yet);
   `member_assignment` is populated.
