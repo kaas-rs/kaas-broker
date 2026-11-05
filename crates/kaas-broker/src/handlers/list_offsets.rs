@@ -18,6 +18,11 @@
 //!    debugging replica, which any broker may answer. A non-leader's
 //!    engine has no open partition, so before this it answered 0 for
 //!    both offsets instead of redirecting the client.
+//! 5. With a `Coordinator` wired, the partition is open in the engine,
+//!    else `LEADER_NOT_AVAILABLE` (5, retriable). A broker owns a
+//!    partition as soon as `assignment.json` says so, before its takeover
+//!    has opened it, and the engine answers 0 for an unopened partition.
+//!    A consumer would adopt that as its position (gh #301).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,6 +39,7 @@ use super::principal_from;
 use crate::broker::Broker;
 
 const ERR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
+const ERR_LEADER_NOT_AVAILABLE: i16 = 5;
 const ERR_NOT_LEADER_OR_FOLLOWER: i16 = 6;
 const ERR_TOPIC_AUTHZ_FAILED: i16 = 29;
 const ERR_INVALID_REQUEST: i16 = 42;
@@ -130,11 +136,16 @@ impl ListOffsetsHandler {
         {
             return error_partition(p.partition_index, ERR_UNKNOWN_TOPIC_OR_PARTITION);
         }
-        if req.replica_id != DEBUGGING_REPLICA_ID {
-            if let Some(c) = self.broker.coordinator() {
-                if !c.owns(topic, p.partition_index) {
-                    return error_partition(p.partition_index, ERR_NOT_LEADER_OR_FOLLOWER);
-                }
+        if let Some(c) = self.broker.coordinator() {
+            if req.replica_id != DEBUGGING_REPLICA_ID && !c.owns(topic, p.partition_index) {
+                return error_partition(p.partition_index, ERR_NOT_LEADER_OR_FOLLOWER);
+            }
+            if !self
+                .broker
+                .engine
+                .is_partition_open(topic, p.partition_index)
+            {
+                return error_partition(p.partition_index, ERR_LEADER_NOT_AVAILABLE);
             }
         }
         let (timestamp, offset) = match p.timestamp {
@@ -472,5 +483,52 @@ mod tests {
         let out = h.handle(&conn(), 6, encode_v6(&req)).await.unwrap();
         let resp = list_offsets::decode_response(&mut out.freeze(), 6).unwrap();
         assert_eq!(resp.topics[0].partitions[0].error_code, 0);
+    }
+
+    /// gh #301: this broker owns `t-0` per the assignment, but its takeover
+    /// hasn't opened the partition: LEADER_NOT_AVAILABLE (5), not a made-up
+    /// offset 0 a consumer would adopt. After the takeover, the real
+    /// offsets (HWM 1 here).
+    #[tokio::test]
+    async fn an_owned_partition_not_yet_open_is_leader_not_available() {
+        use crate::handlers::test_cluster::{self, SELF};
+        use kaas_storage::{DiskStorageEngine, Fs, PartitionConfig, RealFs};
+        let tmp = tempfile::tempdir().unwrap();
+        let cluster = tempfile::tempdir().unwrap();
+        let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+        let data = tmp.path().to_path_buf();
+        {
+            let prev = DiskStorageEngine::new(fs.clone(), data.clone(), PartitionConfig::default());
+            prev.create_partition("t", 0).await.unwrap();
+            let mut b = crate::control_batch::build_control_batch(-1, 0, true, 0);
+            b[21..23].copy_from_slice(&0i16.to_be_bytes());
+            let crc = kaas_codec::crc::compute(&b[21..]);
+            b[17..21].copy_from_slice(&crc.to_be_bytes());
+            prev.append("t", 0, 0, -1, Bytes::from(b)).await.unwrap();
+            prev.relinquish("t", 0).await.unwrap();
+        }
+        let engine: Arc<dyn StorageEngine> =
+            Arc::new(DiskStorageEngine::new(fs, data, PartitionConfig::default()));
+        let topics = Arc::new(TopicRegistry::new());
+        topics.insert(TopicMeta {
+            name: "t".to_owned(),
+            partition_count: 1,
+            topic_id: [0; 16],
+        });
+        let b = Arc::new(Broker::new(engine.clone(), topics, "test", 0));
+        test_cluster::install(&b, cluster.path(), &[("t", 0, SELF)]);
+        let h = ListOffsetsHandler::new(b);
+        let ask = || async {
+            let out = h
+                .handle(&conn(), 6, encode_request_v6("t", TS_LATEST))
+                .await
+                .unwrap();
+            let resp = list_offsets::decode_response(&mut out.freeze(), 6).unwrap();
+            let p = &resp.topics[0].partitions[0];
+            (p.error_code, p.offset)
+        };
+        assert_eq!(ask().await, (5, -1));
+        engine.take_over("t", 0, 1).await.unwrap();
+        assert_eq!(ask().await, (0, 1));
     }
 }

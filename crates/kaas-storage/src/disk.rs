@@ -445,6 +445,10 @@ impl StorageEngine for DiskStorageEngine {
         out
     }
 
+    fn is_partition_open(&self, topic: &str, partition: i32) -> bool {
+        self.partitions.contains_key(&(topic.to_owned(), partition))
+    }
+
     fn partition_epoch(&self, topic: &str, partition: i32) -> Option<i64> {
         self.partitions
             .get(&(topic.to_owned(), partition))

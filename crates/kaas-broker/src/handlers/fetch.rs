@@ -19,6 +19,7 @@ use crate::broker::Broker;
 
 const ERR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 const ERR_OFFSET_OUT_OF_RANGE: i16 = 1;
+const ERR_LEADER_NOT_AVAILABLE: i16 = 5;
 const ERR_NOT_LEADER_FOR_PARTITION: i16 = 6;
 const ERR_TOPIC_AUTHORIZATION_FAILED: i16 = 29;
 
@@ -133,6 +134,16 @@ impl FetchHandler {
                     p.partition_index,
                     ERR_NOT_LEADER_FOR_PARTITION,
                 );
+            }
+            // Owned per the assignment but not opened yet: its takeover is
+            // still running. The offset reads below would answer 0, as if
+            // the log were empty (gh #301).
+            if !self
+                .broker
+                .engine
+                .is_partition_open(topic, p.partition_index)
+            {
+                return error_partition_bumped(topic, p.partition_index, ERR_LEADER_NOT_AVAILABLE);
             }
         }
 
@@ -476,5 +487,45 @@ mod tests {
         let allowed = FetchHandler::new(broker());
         let r = allowed.read_one(&anon, "t", &part(999), false).await;
         assert_eq!(r.error_code, ERR_UNKNOWN_TOPIC_OR_PARTITION);
+    }
+
+    /// gh #301: an owned partition its takeover hasn't opened yet is
+    /// LEADER_NOT_AVAILABLE (5). It used to answer HWM 0 with no records,
+    /// as if the log were empty. After the takeover it serves.
+    #[tokio::test]
+    async fn an_owned_partition_not_yet_open_is_leader_not_available() {
+        use crate::handlers::test_cluster::{self, SELF};
+        use kaas_storage::{DiskStorageEngine, Fs, PartitionConfig, RealFs};
+        let tmp = tempfile::tempdir().unwrap();
+        let cluster = tempfile::tempdir().unwrap();
+        let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+        let engine: Arc<dyn StorageEngine> = Arc::new(DiskStorageEngine::new(
+            fs,
+            tmp.path().to_path_buf(),
+            PartitionConfig::default(),
+        ));
+        let topics = Arc::new(TopicRegistry::new());
+        topics.insert(TopicMeta {
+            name: "t".to_owned(),
+            partition_count: 1,
+            topic_id: [0; 16],
+        });
+        let b = Arc::new(Broker::new(engine.clone(), topics, "test", 0));
+        test_cluster::install(&b, cluster.path(), &[("t", 0, SELF)]);
+        let h = FetchHandler::new(b);
+        let part = fetch::Partition {
+            partition_index: 0,
+            current_leader_epoch: -1,
+            fetch_offset: 0,
+            last_fetched_epoch: -1,
+            log_start_offset: -1,
+            partition_max_bytes: 1024,
+        };
+        let anon = Principal::anonymous();
+        let r = h.read_one(&anon, "t", &part, false).await;
+        assert_eq!(r.error_code, 5);
+        engine.take_over("t", 0, 1).await.unwrap();
+        let r = h.read_one(&anon, "t", &part, false).await;
+        assert_eq!(r.error_code, 0);
     }
 }

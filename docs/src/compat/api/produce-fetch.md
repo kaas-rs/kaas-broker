@@ -173,7 +173,9 @@ gh #268); the partition appears once in the request (else `INVALID_REQUEST`,
 `UNKNOWN_TOPIC_OR_PARTITION`, 3); and this broker leads the partition per
 `assignment.json` (else `NOT_LEADER_OR_FOLLOWER`, 6). The leadership gate is
 skipped for `replica_id = -2`, Apache's debugging replica, which any broker
-may answer. The handler then translates the request timestamp: `-2` (EARLIEST) returns the partition's
+may answer. A partition this broker owns but whose takeover hasn't opened it
+yet answers `LEADER_NOT_AVAILABLE` (5, retriable), here and in Fetch; it used
+to answer offset 0, which a consumer would adopt as its position (gh #301). The handler then translates the request timestamp: `-2` (EARLIEST) returns the partition's
 `log_start_offset`, `-1` (LATEST) returns the last offset the client may
 fetch — the last stable offset for `read_committed`, the high watermark
 otherwise (gh #296) — both echoed with `timestamp = -1`, matching Apache's

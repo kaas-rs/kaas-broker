@@ -311,6 +311,16 @@ pub trait StorageEngine: Send + Sync + 'static {
         Vec::new()
     }
 
+    /// Is `(topic, partition)` open here, so its offset reads are real?
+    /// An engine whose reads answer 0 for a partition it hasn't opened
+    /// says `false`, so the handlers can answer a retriable error instead
+    /// of a made-up offset (gh #301). Default `true`, for an engine with
+    /// no such distinction (memory/dev, where a partition exists once
+    /// written and "empty" is the true answer).
+    fn is_partition_open(&self, _topic: &str, _partition: i32) -> bool {
+        true
+    }
+
     /// Leader epoch this engine currently holds `(topic, partition)` at,
     /// or `None` if the partition isn't open here.
     ///
