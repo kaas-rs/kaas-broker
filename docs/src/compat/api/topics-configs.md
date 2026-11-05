@@ -46,6 +46,14 @@ A manual replica assignment (`kafka-topics.sh --create --replica-assignment`,
 empty replica list, a broker named twice, or replica lists of different
 lengths are `INVALID_REPLICA_ASSIGNMENT` (39). The response's replication
 factor is the assignment's.
+
+On v5+ a successful create's row carries the topic's configs (KIP-525, gh #315):
+what DescribeConfigs will report, with overrides from the request as
+`DYNAMIC_TOPIC_CONFIG` and the rest as `DEFAULT_CONFIG`, and the validate-only
+path answers the same. This needs `DescribeConfigs` on the topic. Without it the
+topic is still created, as in Apache: `TopicConfigErrorCode` is 29, the counts
+stay at -1 and the configs are empty, so `CreateTopicsResult.config()` fails with
+`TopicAuthorizationException`.
 Kafka topic names that aren't valid RFC 1123 subdomains (Kafka Streams
 internals, dotted names) get a deterministic synthetic CR name
 `kaas-topic-<16 hex>` with the literal name stashed in `spec.topicName`.

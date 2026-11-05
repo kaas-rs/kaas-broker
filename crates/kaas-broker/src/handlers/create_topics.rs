@@ -59,13 +59,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
+use kaas_auth::{Operation, Principal, Resource};
 use kaas_codec::api::create_topics;
+use kaas_codec::api::describe_configs::source;
 use kaas_protocol::{ConnState, Handler, HandlerError};
 use parking_lot::Mutex;
 
 use super::principal_from;
 use crate::broker::Broker;
-use crate::topic_cr_writer::{create_configs_to_spec, TopicWriteError};
+use crate::topic_config_defaults;
+use crate::topic_cr_writer::{config_key_to_json_field, create_configs_to_spec, TopicWriteError};
 
 const ERR_NONE: i16 = 0;
 const ERR_INVALID_TOPIC_EXCEPTION: i16 = 17;
@@ -223,27 +226,33 @@ impl Handler for CreateTopicsHandler {
                 .iter()
                 .filter_map(|c| c.value.as_ref().map(|v| (c.name.clone(), v.clone())))
                 .collect();
-            if let Err(e) = create_configs_to_spec(&configs) {
-                topics.push(
-                    create_topics::CreatableTopicResult::new(&topic.name, ERR_INVALID_CONFIG)
-                        .with_error_message(e.to_string()),
-                );
-                continue;
-            }
+            let spec = match create_configs_to_spec(&configs) {
+                Ok(spec) => spec,
+                Err(e) => {
+                    topics.push(
+                        create_topics::CreatableTopicResult::new(&topic.name, ERR_INVALID_CONFIG)
+                            .with_error_message(e.to_string()),
+                    );
+                    continue;
+                }
+            };
+            let created = |principal: &Principal| {
+                self.created_row(
+                    principal,
+                    &topic.name,
+                    num_partitions,
+                    replication_factor,
+                    &spec,
+                )
+            };
 
             if req.validate_only {
-                topics.push(
-                    create_topics::CreatableTopicResult::new(&topic.name, ERR_NONE)
-                        .with_created(num_partitions, replication_factor),
-                );
+                topics.push(created(&principal));
                 continue;
             }
 
             match w.create_topic(&topic.name, num_partitions, &configs).await {
-                Ok(()) => topics.push(
-                    create_topics::CreatableTopicResult::new(&topic.name, ERR_NONE)
-                        .with_created(num_partitions, replication_factor),
-                ),
+                Ok(()) => topics.push(created(&principal)),
                 Err(TopicWriteError::AlreadyExists(_)) => topics.push(
                     create_topics::CreatableTopicResult::new(&topic.name, ERR_TOPIC_ALREADY_EXISTS)
                         .with_error_message("topic already exists"),
@@ -276,10 +285,65 @@ impl Handler for CreateTopicsHandler {
     }
 }
 
+/// What DescribeConfigs will report for the new topic (gh #315), from the same
+/// table. The operator hasn't materialised `.config.json` yet, so overrides
+/// come from the request's validated `spec`. An accept-only key isn't stored,
+/// so it reads as the default here, as it will there.
+fn created_topic_configs(
+    spec: &serde_json::Map<String, serde_json::Value>,
+) -> Vec<create_topics::CreatableTopicConfigResult> {
+    topic_config_defaults::ALL_KEYS
+        .iter()
+        .map(|entry| {
+            let stored = config_key_to_json_field(entry.dotted_name)
+                .and_then(|field| spec.get(field))
+                .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_owned));
+            let config_source = if stored.is_some() {
+                source::DYNAMIC_TOPIC_CONFIG
+            } else {
+                source::DEFAULT_CONFIG
+            };
+            create_topics::CreatableTopicConfigResult {
+                name: entry.dotted_name.to_owned(),
+                value: stored.or_else(|| entry.default_value.map(str::to_owned)),
+                read_only: false,
+                config_source,
+                is_sensitive: false,
+            }
+        })
+        .collect()
+}
+
 /// A failed check: the wire code and Apache's message.
 type Refusal = (i16, &'static str);
 
 impl CreateTopicsHandler {
+    /// A successful create's row (KIP-525). The counts and configs need
+    /// DescribeConfigs on the topic, as in Apache: without it they stay at
+    /// their defaults and `TopicConfigErrorCode` says why, while the create
+    /// itself still succeeded. It's a filter, so a denial isn't audited
+    /// (`logIfDenied = false`).
+    fn created_row(
+        &self,
+        principal: &Principal,
+        name: &str,
+        num_partitions: i32,
+        replication_factor: i16,
+        spec: &serde_json::Map<String, serde_json::Value>,
+    ) -> create_topics::CreatableTopicResult {
+        let row = create_topics::CreatableTopicResult::new(name, ERR_NONE);
+        if self.broker.authorizer.authorize_quietly(
+            principal,
+            &Resource::topic(name),
+            Operation::DescribeConfigs,
+        ) {
+            row.with_created(num_partitions, replication_factor)
+                .with_configs(created_topic_configs(spec))
+        } else {
+            row.with_config_error(ERR_TOPIC_AUTHZ_FAILED)
+        }
+    }
+
     /// gh #280, Apache's KIP-464 rules for a request without manual
     /// assignments: -1 asks for the broker default, anything else must
     /// be positive.
@@ -413,6 +477,111 @@ mod tests {
 
     /// One recorded `create_topic` call.
     type CreateCall = (String, i32, Vec<(String, String)>);
+
+    /// gh #315 (KIP-525): a successful create returns the configs
+    /// DescribeConfigs will report: an override as DYNAMIC_TOPIC_CONFIG (1),
+    /// the rest as DEFAULT_CONFIG (5), both on a real create and on
+    /// validate-only.
+    #[tokio::test]
+    async fn a_created_topic_returns_what_describe_configs_will_report() {
+        for validate_only in [false, true] {
+            let writer = Arc::new(RecordingWriter::default());
+            let h = CreateTopicsHandler::new(broker_with_writer(writer));
+            let req = Request {
+                topics: vec![CreatableTopic {
+                    name: "t".into(),
+                    num_partitions: 3,
+                    replication_factor: 1,
+                    assignments: vec![],
+                    configs: vec![
+                        CreatableTopicConfig {
+                            name: "retention.ms".into(),
+                            value: Some("3600000".into()),
+                        },
+                        CreatableTopicConfig {
+                            name: "cleanup.policy".into(),
+                            value: Some("compact".into()),
+                        },
+                    ],
+                }],
+                timeout_ms: 1000,
+                validate_only,
+            };
+            let mut buf = BytesMut::new();
+            create_topics::encode_request(&mut buf, &req, 5).unwrap();
+            let out = h.handle(&conn(), 5, buf.freeze()).await.unwrap();
+            let resp = create_topics::decode_response(&mut out.freeze(), 5).unwrap();
+            let row = &resp.topics[0];
+            assert_eq!(row.error_code, 0);
+            assert_eq!(row.topic_config_error_code, 0);
+            assert_eq!((row.num_partitions, row.replication_factor), (3, 1));
+
+            let names: Vec<_> = row.configs.iter().map(|c| c.name.as_str()).collect();
+            let want: Vec<_> = topic_config_defaults::ALL_KEYS
+                .iter()
+                .map(|e| e.dotted_name)
+                .collect();
+            assert_eq!(names, want);
+            let get = |name: &str| row.configs.iter().find(|c| c.name == name).unwrap();
+            assert_eq!(get("retention.ms").value.as_deref(), Some("3600000"));
+            assert_eq!(get("retention.ms").config_source, 1);
+            assert_eq!(get("cleanup.policy").value.as_deref(), Some("compact"));
+            assert_eq!(get("cleanup.policy").config_source, 1);
+            let segment = get("segment.bytes");
+            assert_eq!(segment.config_source, 5);
+            let default = topic_config_defaults::ALL_KEYS
+                .iter()
+                .find(|e| e.dotted_name == "segment.bytes")
+                .unwrap()
+                .default_value;
+            assert_eq!(segment.value.as_deref(), default);
+            assert!(row.configs.iter().all(|c| !c.read_only && !c.is_sensitive));
+        }
+    }
+
+    /// gh #315: an accept-only key isn't stored, so DescribeConfigs reports it
+    /// as the default, and so does the create.
+    #[tokio::test]
+    async fn an_accept_only_override_reads_as_the_default() {
+        let writer = Arc::new(RecordingWriter::default());
+        let resp = create(
+            broker_with_writer(writer),
+            vec![CreatableTopicConfig {
+                name: "message.timestamp.type".into(),
+                value: Some("CreateTime".into()),
+            }],
+        )
+        .await;
+        let row = &resp.topics[0];
+        assert_eq!(row.error_code, 0);
+        assert!(row.configs.iter().all(|c| c.config_source == 5), "{row:?}");
+    }
+
+    /// gh #315: Create without DescribeConfigs still creates the topic. The
+    /// row says 29 in `TopicConfigErrorCode`, and the counts and configs stay
+    /// at their defaults, as in Apache.
+    #[tokio::test]
+    async fn without_describe_configs_the_create_succeeds_and_the_row_says_29() {
+        use crate::handlers::test_authz::DenyOpAuthorizer;
+        let writer = Arc::new(RecordingWriter::default());
+        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let broker = Arc::new(Broker::with_auth(
+            engine,
+            Arc::new(TopicRegistry::new()),
+            "test",
+            0,
+            Arc::new(DenyOpAuthorizer(Operation::DescribeConfigs)),
+            Arc::new(kaas_auth::NoQuotaChecker),
+        ));
+        broker.install_cr_writer(writer.clone());
+        let resp = create(broker, vec![]).await;
+        let row = &resp.topics[0];
+        assert_eq!(row.error_code, 0);
+        assert_eq!(row.topic_config_error_code, 29);
+        assert_eq!((row.num_partitions, row.replication_factor), (-1, -1));
+        assert!(row.configs.is_empty());
+        assert_eq!(writer.calls.lock().len(), 1, "the topic was still created");
+    }
 
     /// Records `create_topic` calls, configs included, so the tests
     /// can assert the gh #236 threading actually happens.

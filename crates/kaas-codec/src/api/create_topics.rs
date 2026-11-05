@@ -28,6 +28,8 @@ use crate::Bytes;
 
 pub const VERSIONS: (i16, i16) = (0, 7);
 pub const MIN_FLEXIBLE: i16 = 5;
+/// `CreatableTopicResult.TopicConfigErrorCode`'s tag (KIP-525).
+const TOPIC_CONFIG_ERROR_CODE_TAG: u64 = 0;
 
 pub const SPEC: ApiSpec = ApiSpec {
     key: 19,
@@ -104,6 +106,9 @@ pub struct CreatableTopicResult {
     pub replication_factor: i16,
     /// v5+. Effective config values echoed back.
     pub configs: Vec<CreatableTopicConfigResult>,
+    /// v5+, tagged field 0. Why `configs` is missing from a successful
+    /// create: 29 without DescribeConfigs. 0 isn't written.
+    pub topic_config_error_code: i16,
 }
 
 impl CreatableTopicResult {
@@ -118,6 +123,7 @@ impl CreatableTopicResult {
             num_partitions: -1,
             replication_factor: -1,
             configs: Vec::new(),
+            topic_config_error_code: 0,
         }
     }
 
@@ -131,14 +137,24 @@ impl CreatableTopicResult {
         self.replication_factor = replication_factor;
         self
     }
+
+    pub fn with_configs(mut self, configs: Vec<CreatableTopicConfigResult>) -> Self {
+        self.configs = configs;
+        self
+    }
+
+    pub fn with_config_error(mut self, code: i16) -> Self {
+        self.topic_config_error_code = code;
+        self
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CreatableTopicConfigResult {
     pub name: String,
     pub value: Option<String>,
-    /// v5+ config source. Kaas echoes `DEFAULT_CONFIG (5)`.
     pub read_only: bool,
+    /// `DYNAMIC_TOPIC_CONFIG (1)` for an override, `DEFAULT_CONFIG (5)` otherwise.
     pub config_source: i8,
     pub is_sensitive: bool,
 }
@@ -224,10 +240,6 @@ pub fn encode_response(
             write_nullable_str(buf, t.error_message.as_deref(), flexible)?;
         }
         if version >= 5 {
-            // In-band topic-level configs of the created topic. Not
-            // exposed via a topic-level API yet — write num_partitions
-            // + replication_factor from the accepted request; leave
-            // topic_config_error_code (v5+ only, tagged) unset.
             write_i32(buf, t.num_partitions);
             write_i16(buf, t.replication_factor);
             write_array_len(buf, t.configs.len(), flexible)?;
@@ -243,7 +255,16 @@ pub fn encode_response(
             }
         }
         if flexible {
-            tagged::write_empty(buf);
+            // Apache writes the tag only when it isn't the default.
+            if version >= 5 && t.topic_config_error_code != 0 {
+                tagged::write_i16_field(
+                    buf,
+                    TOPIC_CONFIG_ERROR_CODE_TAG,
+                    t.topic_config_error_code,
+                );
+            } else {
+                tagged::write_empty(buf);
+            }
         }
     }
     if flexible {
@@ -305,9 +326,11 @@ pub fn decode_response(buf: &mut Bytes, version: i16) -> Result<Response, CodecE
             // Not on the wire below v5; Apache's schema default is -1.
             (-1, -1, Vec::new())
         };
-        if flexible {
-            tagged::read(buf)?;
-        }
+        let topic_config_error_code = if flexible {
+            tagged::read_i16_field(buf, TOPIC_CONFIG_ERROR_CODE_TAG)?.unwrap_or(0)
+        } else {
+            0
+        };
         resp.topics.push(CreatableTopicResult {
             name,
             topic_id,
@@ -316,6 +339,7 @@ pub fn decode_response(buf: &mut Bytes, version: i16) -> Result<Response, CodecE
             num_partitions,
             replication_factor,
             configs,
+            topic_config_error_code,
         });
     }
     if flexible {
@@ -410,6 +434,7 @@ mod tests {
                     num_partitions: if version >= 5 { 3 } else { -1 },
                     replication_factor: if version >= 5 { 1 } else { -1 },
                     configs: Vec::new(),
+                    topic_config_error_code: 0,
                 },
                 CreatableTopicResult {
                     name: "alt".into(),
@@ -423,6 +448,7 @@ mod tests {
                     num_partitions: -1,
                     replication_factor: -1,
                     configs: Vec::new(),
+                    topic_config_error_code: 0,
                 },
             ],
         }
@@ -462,6 +488,33 @@ mod tests {
     fn v3_roundtrip() {
         roundtrip(3);
     }
+    /// gh #315: `TopicConfigErrorCode` is tagged field 0, written only when
+    /// it isn't 0. Literal bytes: one field, tag 0, two bytes, 29.
+    #[test]
+    fn the_topic_config_error_code_is_tagged_field_zero() {
+        let row = |code| Response {
+            throttle_time_ms: 0,
+            topics: vec![CreatableTopicResult::new("t", 0).with_config_error(code)],
+        };
+        let encoded = |code| {
+            let mut buf = BytesMut::new();
+            encode_response(&mut buf, &row(code), 5).unwrap();
+            buf.freeze()
+        };
+        // The row's block, then the response's own empty block.
+        assert!(
+            encoded(29).ends_with(&[1, 0, 2, 0, 29, 0]),
+            "{:?}",
+            encoded(29)
+        );
+        // No configs (1 = compact empty array), then the two empty blocks.
+        assert!(encoded(0).ends_with(&[1, 0, 0]), "{:?}", encoded(0));
+
+        let mut bytes = encoded(29);
+        assert_eq!(decode_response(&mut bytes, 5).unwrap(), row(29));
+        assert!(bytes.is_empty());
+    }
+
     #[test]
     fn v4_roundtrip() {
         roundtrip(4);

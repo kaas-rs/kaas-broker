@@ -11,7 +11,7 @@
 use bytes::{Bytes, BytesMut};
 
 use crate::errors::CodecError;
-use crate::primitives::{read_uvarint, write_uvarint};
+use crate::primitives::{read_i16, read_uvarint, write_uvarint};
 
 /// Read and discard every tagged field —
 /// unknown tags are silently consumed, and known tags are not surfaced to
@@ -34,6 +34,34 @@ pub fn read(buf: &mut Bytes) -> Result<(), CodecError> {
 /// most common case on the wire.
 pub fn write_empty(buf: &mut BytesMut) {
     write_uvarint(buf, 0);
+}
+
+/// A block holding one `i16` field.
+pub fn write_i16_field(buf: &mut BytesMut, tag: u64, value: i16) {
+    write_uvarint(buf, 1);
+    write_uvarint(buf, tag);
+    write_uvarint(buf, 2);
+    buf.extend_from_slice(&value.to_be_bytes());
+}
+
+/// Read a block, returning the `i16` field tagged `tag` if it's there and
+/// discarding everything else, as [`read`] does.
+pub fn read_i16_field(buf: &mut Bytes, tag: u64) -> Result<Option<i16>, CodecError> {
+    let n = read_uvarint(buf)?;
+    let mut found = None;
+    for _ in 0..n {
+        let field_tag = read_uvarint(buf)?;
+        let size = read_uvarint(buf)?;
+        let size_us = usize::try_from(size).map_err(|_| CodecError::LengthOverflow)?;
+        if buf.len() < size_us {
+            return Err(CodecError::UnexpectedEof);
+        }
+        let mut field = buf.split_to(size_us);
+        if field_tag == tag {
+            found = Some(read_i16(&mut field)?);
+        }
+    }
+    Ok(found)
 }
 
 #[cfg(test)]
