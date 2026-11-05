@@ -75,6 +75,12 @@ const ATTR_CONTROL: i16 = 0x20;
 /// The low three attribute bits name the codec (`CompressionType`).
 const ATTR_COMPRESSION_MASK: i16 = 0x07;
 const COMPRESSION_ZSTD: i16 = 4;
+/// The smallest possible v2 record: one byte each for its length,
+/// attributes, timestamp delta, offset delta, key length, value length and
+/// header count.
+const MIN_RECORD_BYTES: i64 = 7;
+/// Everything before the records in a v2 batch.
+const V2_HEADER_BYTES: usize = 61;
 /// Produce's first version allowed to carry ZSTD (KIP-110).
 const ZSTD_MIN_PRODUCE_VERSION: i16 = 7;
 const ERR_OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = 45;
@@ -428,15 +434,27 @@ fn batch_attributes(b: &[u8]) -> i16 {
 ///   and the append path takes any control batch as one (gh #294).
 /// - A batch with a producer id needs a non-negative base sequence, or it
 ///   skips the dedupe window.
+///
+/// Apache also walks the records and refuses a count that disagrees with
+/// them. Byte opacity rules that out here, but an uncompressed batch's
+/// count can still be bounded from its size alone: every record takes at
+/// least [`MIN_RECORD_BYTES`]. That stops a header whose two fields agree
+/// with each other while claiming far more records than the batch holds
+/// (gh #305 verification). A compressed batch can't be bounded this way;
+/// see the byte-opacity contract in the wire-protocol docs.
 fn batch_fields_are_valid(b: &[u8]) -> bool {
     let last_offset_delta = i32::from_be_bytes([b[23], b[24], b[25], b[26]]);
     let producer_id = i64::from_be_bytes([b[43], b[44], b[45], b[46], b[47], b[48], b[49], b[50]]);
     let base_sequence = i32::from_be_bytes([b[53], b[54], b[55], b[56]]);
     let record_count = i32::from_be_bytes([b[57], b[58], b[59], b[60]]);
     let count_from_offsets = i64::from(last_offset_delta) + 1;
+    let uncompressed = batch_attributes(b) & ATTR_COMPRESSION_MASK == 0;
+    let payload = i64::try_from(b.len().saturating_sub(V2_HEADER_BYTES)).unwrap_or(i64::MAX);
+    let fits_payload = !uncompressed || i64::from(record_count) * MIN_RECORD_BYTES <= payload;
     count_from_offsets > 0
         && record_count > 0
         && count_from_offsets == i64::from(record_count)
+        && fits_payload
         && batch_attributes(b) & ATTR_CONTROL == 0
         && !(producer_id >= 0 && base_sequence < 0)
 }
@@ -944,18 +962,41 @@ mod tests {
         }
     }
 
+    /// gh #305 verification: an uncompressed batch can't hold more records
+    /// than its size allows, even when `lastOffsetDelta` and `recordCount`
+    /// agree. Each record takes at least 7 bytes. Apache also answers 87.
+    #[tokio::test]
+    async fn an_uncompressed_batch_claiming_more_records_than_fit_is_87() {
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        let claiming = |delta: i32, count: i32| {
+            edited(move |h| {
+                h[23..27].copy_from_slice(&delta.to_be_bytes());
+                h[57..61].copy_from_slice(&count.to_be_bytes());
+            })
+        };
+        for (delta, count) in [(i32::MAX - 1, i32::MAX), (9, 10)] {
+            let b = txn_broker(Arc::new(DenyNamedAuthorizer("nobody")));
+            assert_eq!(
+                produce_two(&b, None, claiming(delta, count), batch(0, -1, -1)).await,
+                [87, 0],
+                "count {count}"
+            );
+            assert_eq!(appended(&b, "orders"), 0, "count {count}");
+        }
+    }
+
     /// gh #305: every field of a well-formed multi-record batch is
     /// accepted: the control for the checks above.
     #[tokio::test]
     async fn an_honest_multi_record_batch_is_accepted() {
         use crate::handlers::test_authz::DenyNamedAuthorizer;
         let b = txn_broker(Arc::new(DenyNamedAuthorizer("nobody")));
-        let three = edited(|h| {
-            h[23..27].copy_from_slice(&2i32.to_be_bytes());
-            h[57..61].copy_from_slice(&3i32.to_be_bytes());
+        let two = edited(|h| {
+            h[23..27].copy_from_slice(&1i32.to_be_bytes());
+            h[57..61].copy_from_slice(&2i32.to_be_bytes());
         });
-        assert_eq!(produce_two(&b, None, three, batch(0, -1, -1)).await, [0, 0]);
-        assert_eq!(appended(&b, "orders"), 3);
+        assert_eq!(produce_two(&b, None, two, batch(0, -1, -1)).await, [0, 0]);
+        assert_eq!(appended(&b, "orders"), 2);
     }
 
     /// gh #305: ZSTD needs Produce v7 (KIP-110). Below it, Apache's

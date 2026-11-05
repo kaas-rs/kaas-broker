@@ -372,7 +372,7 @@ fn fetch_v12_request(
 /// records under (pid, epoch). attributes bit 4 set (transactional);
 /// base_sequence = 0 = first batch of the txn.
 fn build_txn_batch(pid: i64, epoch: i16, num_records: i32) -> Bytes {
-    let body_size = 49 + 16;
+    let body_size = 49 + 16 * usize::try_from(num_records).unwrap();
     let total = 12 + body_size;
     let mut buf = vec![0u8; total];
     buf[0..8].copy_from_slice(&0i64.to_be_bytes()); // base_offset (broker rewrites)

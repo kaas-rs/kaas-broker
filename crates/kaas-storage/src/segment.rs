@@ -821,17 +821,18 @@ impl ActiveSegment {
     /// of the log via `write_at`, conditionally emits a sparse index
     /// entry, and updates accounting. Records bytes are NOT inspected
     /// beyond the 43-byte header; byte-opacity preserved.
+    ///
+    /// The index step runs first, so a failure in it leaves nothing in the
+    /// log. The other way round, a batch answered with an error stayed on
+    /// disk past `log_size`, where reads and the recovery scan both found
+    /// it (gh #305 verification). A log write that fails after the entry
+    /// is harmless: the retry lands the same offset at the same position.
     pub fn append_batch(&mut self, raw: &[u8], index_interval_bytes: u64) -> io::Result<()> {
         let (base_offset, last_offset_delta, max_timestamp) = parse_batch_offsets(raw)?;
 
-        let log = self
-            .log
-            .as_deref_mut()
-            .ok_or_else(|| io::Error::other("log handle closed"))?;
-        log.write_at(raw, self.log_size)?;
-
         // Sparse index entry when threshold exceeded.
-        if self.log_size - self.last_indexed_log_pos >= index_interval_bytes {
+        let index_due = self.log_size - self.last_indexed_log_pos >= index_interval_bytes;
+        if index_due {
             let index = self
                 .index
                 .as_deref_mut()
@@ -853,6 +854,14 @@ impl ActiveSegment {
             entry[0..4].copy_from_slice(&rel_offset.to_be_bytes());
             entry[4..8].copy_from_slice(&pos_u32.to_be_bytes());
             io::Write::write_all(index, &entry)?;
+        }
+
+        let log = self
+            .log
+            .as_deref_mut()
+            .ok_or_else(|| io::Error::other("log handle closed"))?;
+        log.write_at(raw, self.log_size)?;
+        if index_due {
             self.last_indexed_log_pos = self.log_size;
         }
 
@@ -1174,6 +1183,21 @@ mod tests {
         run.extend(&partial[..partial.len() - 1]);
         assert_eq!(count_records(&run), 8);
         assert_eq!(count_records(&[]), 0);
+    }
+
+    /// gh #305 verification: an offset the index can't hold fails before
+    /// anything reaches the log, so an append answered with an error can't
+    /// be served or adopted by recovery.
+    #[test]
+    fn an_index_failure_leaves_nothing_in_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = RealFs::new();
+        let mut seg = ActiveSegment::create(&fs, tmp.path(), 0, 1).unwrap();
+        let too_far = build_batch(i64::from(i32::MAX) + 1, 0, 0, 10);
+        assert!(seg.append_batch(&too_far, 0).is_err());
+        assert_eq!(seg.log_size(), 0);
+        let log = tmp.path().join(segment_log_path(tmp.path(), 0, 1));
+        assert_eq!(std::fs::metadata(log).unwrap().len(), 0);
     }
 
     /// gh #294: every whole batch's attributes, in order, so a

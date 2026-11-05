@@ -64,6 +64,15 @@ Consequences worth internalizing:
   is nothing to decode into, and batch bytes are asserted byte-identical
   through the disk engine and over the wire. No metric or alert watches
   it (see [Observability](../architecture/observability.md), gh #275).
+- **What it costs: kaas can't validate what it doesn't read.** Produce checks
+  every header field against the others and against the batch's size (gh #305),
+  but Apache also walks the records. So a batch that is consistent on its own
+  terms and lies inside is accepted here and refused by Apache: a compressed
+  batch with a garbage payload, a compressed batch claiming more records than
+  it holds, or an uncompressed one holding more or fewer than it claims. A
+  consumer then fails on that batch until it seeks past it. Reaching this takes
+  `Write` on the topic and a client that crafts its own batches; real clients
+  don't produce them.
 
 ## Where to dig deeper
 

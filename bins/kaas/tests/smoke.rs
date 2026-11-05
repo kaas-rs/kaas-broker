@@ -42,7 +42,7 @@ use tokio_util::sync::CancellationToken;
 /// id = -1 (non-idempotent) so the engine's dedupe gate never fires.
 /// Same shape as `kaas_storage`'s test helper.
 fn build_record_batch(num_records: i32, max_timestamp: i64) -> Bytes {
-    let body_size = 49 + 16; // header + small synthetic records payload
+    let body_size = 49 + 16 * usize::try_from(num_records).unwrap(); // header + synthetic payload, big enough for the claimed count (gh #305)
     let total = 12 + body_size;
     let mut buf = vec![0u8; total];
     buf[0..8].copy_from_slice(&0i64.to_be_bytes()); // base_offset (engine overwrites)

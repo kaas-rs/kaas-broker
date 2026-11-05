@@ -906,7 +906,16 @@ impl Partition {
                 && cfg
                     .segment_ms
                     .is_some_and(|ms| guard.active.age_ms(self.fs.as_ref()) >= ms);
-            if (too_big || too_old) && guard.active.log_size() > 0 {
+            // The index holds 4-byte offsets relative to the segment base,
+            // so a batch whose last offset doesn't fit needs a new segment
+            // (Apache's `canConvertToRelativeOffset`). Without this every
+            // later append failed with "rel_offset overflowed i32" until
+            // something else rolled the segment (gh #305 verification).
+            let (_, batch_delta, _) = parse_batch_offsets(&batch).map_err(StorageError::Io)?;
+            let offsets_overflow = guard.high_water + i64::from(batch_delta)
+                - guard.active.meta.base_offset
+                > i64::from(i32::MAX);
+            if (too_big || too_old || offsets_overflow) && guard.active.log_size() > 0 {
                 let new_base = guard.high_water;
                 let new_epoch = guard.epoch;
                 let dir = guard.dir.clone();
@@ -3886,6 +3895,43 @@ mod tests {
                 "expected at least one roll"
             );
             p.close().await.unwrap();
+        });
+    }
+
+    /// gh #305 verification: offsets past what the segment index can hold
+    /// roll a new segment, as in Apache's `canConvertToRelativeOffset`.
+    /// Appends after a huge offset jump used to fail with "rel_offset
+    /// overflowed i32" until something else rolled the segment. Reopening
+    /// comes back at the same high watermark.
+    #[test]
+    fn offsets_past_the_index_range_roll_a_new_segment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        let cfg = || PartitionConfig {
+            index_interval_bytes: 1,
+            ..Default::default()
+        };
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Partition::open(fs.clone(), "t".into(), 0, dir.clone(), cfg())
+                .await
+                .unwrap();
+            p.append(0, -1, build_batch(1, 1_000)).await.unwrap();
+            p.append(0, -1, build_batch(i32::MAX, 1_000)).await.unwrap();
+            let far = 1 + i64::from(i32::MAX);
+            assert_eq!(p.high_watermark(), far);
+            for i in 0..5 {
+                let base = p.append(0, -1, build_batch(1, 1_000)).await.unwrap();
+                assert_eq!(base, far + i);
+            }
+            assert!(!p.inner.lock().closed.is_empty(), "expected a roll");
+            p.close().await.unwrap();
+
+            let p2 = Partition::open(fs, "t".into(), 0, dir.clone(), cfg())
+                .await
+                .unwrap();
+            assert_eq!(p2.high_watermark(), far + 5);
+            p2.close().await.unwrap();
         });
     }
 
