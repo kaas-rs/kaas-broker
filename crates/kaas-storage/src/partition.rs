@@ -1131,6 +1131,24 @@ impl Partition {
                 target_offset
             };
             if new_start > guard.log_start {
+                // gh #311: durable before the files go and before the
+                // answer, or a crash brings the purged records back. A
+                // successor's higher epoch means this broker no longer owns
+                // the partition.
+                let m = Manifest {
+                    epoch: guard.epoch,
+                    high_watermark: guard.high_water,
+                    log_start_offset: new_start,
+                };
+                let written = manifest::write_unless_superseded(self.fs.as_ref(), &guard.dir, &m)
+                    .map_err(|e| match e {
+                    manifest::ManifestError::Io(e) => StorageError::Io(e),
+                    manifest::ManifestError::Json(e) => StorageError::Json(e),
+                    other => StorageError::Io(std::io::Error::other(other.to_string())),
+                })?;
+                if written > guard.epoch {
+                    return Err(StorageError::EpochMismatch);
+                }
                 guard.log_start = new_start;
 
                 // Drop closed segments fully below the new log_start.
@@ -3955,6 +3973,60 @@ mod tests {
             assert_eq!(p.high_watermark(), 3);
             assert_eq!(p.last_stable_offset(), 3);
             p.close().await.unwrap();
+        });
+    }
+
+    /// gh #311: DeleteRecords is durable when it answers. A crash used to
+    /// bring the purged records back, because the log start was only written
+    /// on close or takeover. The partition is reopened here without closing,
+    /// as a crash would leave it. A fenced leader purges nothing.
+    #[test]
+    fn delete_records_survives_a_crash_and_a_fenced_leader_purges_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Partition::open(
+                fs.clone(),
+                "t".into(),
+                0,
+                dir.clone(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            for _ in 0..5 {
+                p.append(0, -1, build_batch(1, 1_000)).await.unwrap();
+            }
+            assert_eq!(p.delete_records(3).await.unwrap(), 3);
+
+            // A second open with no close: what a restart after SIGKILL does.
+            let reopened = Partition::open(
+                fs.clone(),
+                "t".into(),
+                0,
+                dir.clone(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(reopened.log_start_offset(), 3, "the purge was lost");
+            assert_eq!(reopened.high_watermark(), 5);
+
+            // A successor has raised the epoch on disk.
+            manifest::write_unchecked(
+                fs.as_ref(),
+                &dir,
+                &Manifest {
+                    epoch: 9,
+                    high_watermark: 5,
+                    log_start_offset: 3,
+                },
+            )
+            .unwrap();
+            let err = p.delete_records(4).await.unwrap_err();
+            assert!(matches!(err, StorageError::EpochMismatch), "{err:?}");
+            assert_eq!(p.log_start_offset(), 3);
         });
     }
 

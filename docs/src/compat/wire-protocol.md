@@ -72,7 +72,9 @@ Consequences worth internalizing:
   it holds, or an uncompressed one holding more or fewer than it claims. A
   consumer then fails on that batch until it seeks past it. Reaching this takes
   `Write` on the topic and a client that crafts its own batches; real clients
-  don't produce them.
+  don't produce them. A compact-only topic also accepts records with no key,
+  which Apache refuses with `INVALID_RECORD` (87): kaas can't see keys, and has
+  no compactor yet.
 
 ## Where to dig deeper
 

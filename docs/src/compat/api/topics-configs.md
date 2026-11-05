@@ -151,7 +151,9 @@ until gh #300 every negative offset purged the whole partition) and returns the
 new low watermark. Records below
 `logStart` become invisible to Fetch immediately, and closed segments that
 fall entirely below it are unlinked from disk on the spot — safe on NFS
-because only the leader holds open handles.
+because only the leader holds open handles. The new log start is durable before
+the answer and before any file goes, so a crash can't bring purged records back
+(gh #311).
 
 **Deviations from Apache 3.7**:
 
