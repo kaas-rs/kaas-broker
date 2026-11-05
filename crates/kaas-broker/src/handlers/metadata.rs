@@ -72,6 +72,7 @@ use crate::topic_cr_writer::TopicWriteError;
 const ERR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 const ERR_LEADER_NOT_AVAILABLE: i16 = 5;
 const ERR_TOPIC_AUTHZ_FAILED: i16 = 29;
+const ERR_INVALID_TOPIC_EXCEPTION: i16 = 17;
 const ERR_INVALID_REQUEST: i16 = 42;
 
 /// Apache's supported operations for the TOPIC resource
@@ -153,6 +154,11 @@ impl MetadataHandler {
         // authorizer.
         if !super::may_create_topic(&self.broker, principal, name) {
             return ERR_TOPIC_AUTHZ_FAILED;
+        }
+        // gh #314: the name would become a directory. After the ACL, so a
+        // principal without rights learns nothing about it.
+        if !kaas_storage::is_valid_topic_name(name) {
+            return ERR_INVALID_TOPIC_EXCEPTION;
         }
         let Some(writer) = self.broker.cr_writer() else {
             // Dev mode / no kube client: nothing can create the topic,
@@ -603,6 +609,21 @@ mod tests {
     }
 
     // --- gh #242: auto.create.topics.enable -----------------------
+
+    /// gh #314: auto-create takes the same rule as CreateTopics. The name
+    /// would become a directory, so an invalid one is Apache's
+    /// INVALID_TOPIC_EXCEPTION (17), and nothing is minted.
+    #[tokio::test]
+    async fn auto_create_refuses_an_invalid_topic_name_17() {
+        let broker = broker_with(vec![]);
+        let writer = Arc::new(RecordingWriter::default());
+        broker.install_cr_writer(writer.clone());
+        let h = MetadataHandler::new(broker, &listeners()).with_auto_create(true, 3);
+        for name in ["a/b", "..", "../../x", "kperf-/../victim"] {
+            assert_eq!(error_code_for(&h, name, true).await, 17, "{name}");
+        }
+        assert!(writer.calls().is_empty(), "an invalid name was minted");
+    }
 
     #[tokio::test]
     async fn auto_create_mints_cr_and_answers_leader_not_available() {

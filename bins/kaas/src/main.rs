@@ -356,6 +356,12 @@ async fn main() -> Result<()> {
                         migrate_to,
                         topic_id,
                     } = ev;
+                    // gh #314: never serve a name that would resolve outside
+                    // the data dir. A CR can be written directly.
+                    if !kaas_storage::is_valid_topic_name(name) {
+                        warn!(topic = %name, "ignoring KafkaTopic with an invalid topic name");
+                        return;
+                    }
                     let prev = topics_apply
                         .all()
                         .into_iter()

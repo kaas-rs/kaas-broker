@@ -57,6 +57,10 @@ As in Apache, an Allow for `Read`, `Write`, `Delete` or `Alter` also grants
 
 Persists a group's consumed positions. Key 8.
 
+A group's offsets live in a file named after it. A group id is any string, as
+in Apache, so the path-unsafe bytes (`/`, NUL and `%`) are percent-encoded in
+the file name, and a group can't reach outside the offsets directory (gh #314).
+
 **Versions**: v2–v8 (flexible from v8)
 
 **Handling**: the handler flattens the nested `(topic, partition)` request

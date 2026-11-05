@@ -21,7 +21,12 @@ Creates topics — the broker side of `kafka-topics.sh --create` and
 
 **Handling**: a name that appears more than once in one request is refused
 with `INVALID_REQUEST` (42) for every entry, before authorization, as Apache's
-`KafkaApis` does (gh #292). Per remaining topic, the handler authorizes `Create` on the
+`KafkaApis` does (gh #292). Per remaining topic, in Apache's order: authorization
+(29, also for `__cluster_metadata`); the name must pass Apache's `Topic.validate`
+(1 to 249 characters of `[a-zA-Z0-9._-]`, not `.` or `..`, else
+`INVALID_TOPIC_EXCEPTION`, 17, gh #314), because it becomes a directory; a topic
+this broker knows of answers `TOPIC_ALREADY_EXISTS` (36), on the validate-only
+path too; and a null config value answers `INVALID_CONFIG` (40). Authorization is `Create` on the
 cluster, else on the topic resource (Apache's rule, shared with Metadata
 auto-create, gh #280), then POSTs a fresh `KafkaTopic` CR. The operator reconciles it
 into partition directories on the shared volume; the broker picks the topic up
@@ -78,8 +83,6 @@ appear in the Application tree without being prune targets — see
   Likewise a manual assignment's broker ids only shape the partition count:
   they aren't checked against the registered brokers (Apache answers 39 for an
   unknown one), and kaas's balancer places the partitions.
-- `validate_only` does not check for an existing topic; it reports success
-  even when a real create would return `TOPIC_ALREADY_EXISTS`.
 
 **Source**: `crates/kaas-broker/src/handlers/create_topics.rs`,
 `crates/kaas-broker/src/topic_cr_writer.rs`,

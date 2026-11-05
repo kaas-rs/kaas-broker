@@ -99,6 +99,18 @@ impl KafkaTopicReconciler {
             self.observer.bump_error();
             return Ok(Action::await_change());
         }
+        // gh #314: the name becomes a directory, and a CR can be written
+        // directly (the CRD limits only the length). `kperf-/../victim`
+        // would reach outside the data dir and clobber another topic's
+        // identity stamp, so nothing on the filesystem is touched.
+        if !kaas_storage::is_valid_topic_name(&topic_name) {
+            tracing::error!(
+                topic = %topic_name,
+                "KafkaTopic has an invalid topic name; refusing to reconcile it (gh #314)"
+            );
+            self.observer.bump_error();
+            return Ok(Action::await_change());
+        }
 
         // Partition-decrease guard:
         // ConditionFalse with reason `InvalidPartitionCount` and DO NOT
@@ -588,6 +600,56 @@ mod tests {
     use super::*;
     use kaas_operator_api::{KafkaTopic, KafkaTopicConfig, KafkaTopicSpec, KafkaTopicStatus};
     use kube::api::ObjectMeta;
+
+    /// gh #314: a CR can be written directly, and the CRD limits only the
+    /// name's length, so the reconciler refuses an invalid one before it
+    /// touches the filesystem. These used to escape the data dir and clobber
+    /// another topic's identity stamp, whose own reconcile then reclaimed its
+    /// directory. Nothing here reaches the API server: the refusal comes first.
+    #[tokio::test]
+    async fn an_invalid_topic_name_touches_nothing_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("deep/data");
+        let victim = data.join("victim");
+        std::fs::create_dir_all(victim.join("0")).unwrap();
+        std::fs::write(victim.join("0/00000000.log"), b"precious").unwrap();
+        let fs = kaas_storage::fs::RealFs::new();
+        let stamp = "11111111-1111-4111-8111-111111111111";
+        kaas_storage::write_topic_identity(&fs, &victim, stamp).unwrap();
+        let identity = std::fs::read(victim.join(".topic-id.json")).unwrap();
+
+        // As `main` does: with the workspace's features unified, the client
+        // can't pick a TLS provider by itself.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let cfg = kube::Config::new("http://127.0.0.1:1".parse().unwrap());
+        let client = kube::Client::try_from(cfg).unwrap();
+        let r = KafkaTopicReconciler::new(client, data.clone(), vec![]);
+        for name in ["kperf-/../victim", "../../escaped", "..", "a/b"] {
+            let t = KafkaTopic {
+                metadata: ObjectMeta {
+                    name: Some("kaas-topic-0000000000000000".into()),
+                    namespace: Some("fake".into()),
+                    ..ObjectMeta::default()
+                },
+                spec: KafkaTopicSpec {
+                    topic_name: name.into(),
+                    partitions: 2,
+                    config: KafkaTopicConfig::default(),
+                    storage: None,
+                },
+                status: None,
+            };
+            let _ = r.reconcile(Arc::new(t)).await;
+        }
+        assert!(!tmp.path().join("escaped").exists(), "escaped the data dir");
+        assert!(!data.join("a").exists());
+        assert_eq!(
+            std::fs::read(victim.join(".topic-id.json")).unwrap(),
+            identity,
+            "the victim's stamp was overwritten"
+        );
+        assert!(victim.join("0/00000000.log").is_file());
+    }
 
     /// gh #203: deleting a topic dir frees the LIVE path immediately
     /// (atomic rename) so a concurrent broker open can't race the

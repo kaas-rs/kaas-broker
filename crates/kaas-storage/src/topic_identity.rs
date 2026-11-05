@@ -100,6 +100,27 @@ pub fn classify(fs: &dyn Fs, topic_dir: &Path, topic_id: &str) -> io::Result<Ide
     }
 }
 
+/// Apache's `Topic.validate`: non-empty, not `.` or `..`, at most 249
+/// characters, and only `[a-zA-Z0-9._-]`.
+///
+/// A topic name becomes a directory, so this is what keeps a name inside the
+/// data dir (gh #314). A prefix ACL matches the raw string, so `kperf-/../x`
+/// passes a grant on `kperf-`. CreateTopics and Metadata auto-create answer
+/// `INVALID_TOPIC_EXCEPTION` (17) with it; the operator and the broker's topic
+/// watch also check, because a CR can be written directly and the CRD limits
+/// only the length.
+#[must_use]
+pub fn is_valid_topic_name(name: &str) -> bool {
+    const MAX_NAME_LENGTH: usize = 249;
+    !name.is_empty()
+        && name != "."
+        && name != ".."
+        && name.len() <= MAX_NAME_LENGTH
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +191,35 @@ mod tests {
             .filter(|n| n.ends_with(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "tmp file leaked: {leftovers:?}");
+    }
+
+    /// gh #314: Apache's `Topic.validate`, including every traversal shape.
+    #[test]
+    fn topic_names_follow_apaches_rule() {
+        for ok in [
+            "events",
+            "a.b_c-1",
+            "__consumer_offsets",
+            "...",
+            &"a".repeat(249),
+        ] {
+            assert!(is_valid_topic_name(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "../x",
+            "../../x",
+            "kperf-/../victim",
+            "a b",
+            "a\\b",
+            "a%2Fb",
+            "caf\u{e9}",
+            &"a".repeat(250),
+        ] {
+            assert!(!is_valid_topic_name(bad), "{bad:?}");
+        }
     }
 }

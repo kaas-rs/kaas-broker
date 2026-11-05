@@ -15,13 +15,15 @@
 //!
 //! - name twice in request → `INVALID_REQUEST` (42), every entry,
 //!   before authorization (gh #292)
-//! - authorization denied → `TOPIC_AUTHORIZATION_FAILED` (29)
+//! - authorization denied, or `__cluster_metadata` → `TOPIC_AUTHORIZATION_FAILED` (29)
+//! - invalid topic name   → `INVALID_TOPIC_EXCEPTION` (17)
+//! - topic already known  → `TOPIC_ALREADY_EXISTS` (36), `validate_only` too
+//! - null config value    → `INVALID_CONFIG` (40)
 //! - assignments + counts → `INVALID_REQUEST` (42)
 //! - bad assignments      → `INVALID_REPLICA_ASSIGNMENT` (39)
 //! - partitions 0 / < -1  → `INVALID_PARTITIONS` (37)
 //! - replication 0 / < -1 → `INVALID_REPLICATION_FACTOR` (38)
 //! - missing CR writer    → `CLUSTER_AUTHORIZATION_FAILED` (31)
-//! - null config value    → `INVALID_CONFIG` (40)
 //! - bad config key/value → `INVALID_CONFIG` (40)
 //! - CR already exists    → `TOPIC_ALREADY_EXISTS` (36)
 //! - RBAC denial          → `CLUSTER_AUTHORIZATION_FAILED` (31)
@@ -66,6 +68,7 @@ use crate::broker::Broker;
 use crate::topic_cr_writer::{create_configs_to_spec, TopicWriteError};
 
 const ERR_NONE: i16 = 0;
+const ERR_INVALID_TOPIC_EXCEPTION: i16 = 17;
 const ERR_TOPIC_ALREADY_EXISTS: i16 = 36;
 const ERR_CLUSTER_AUTHZ_FAILED: i16 = 31;
 const ERR_TOPIC_AUTHZ_FAILED: i16 = 29;
@@ -75,6 +78,9 @@ const ERR_INVALID_REPLICA_ASSIGNMENT: i16 = 39;
 const ERR_INVALID_CONFIG: i16 = 40;
 const ERR_INVALID_REQUEST: i16 = 42;
 const ERR_UNKNOWN_SERVER: i16 = -1;
+
+/// `Topic.CLUSTER_METADATA_TOPIC_NAME`.
+const CLUSTER_METADATA_TOPIC: &str = "__cluster_metadata";
 
 #[derive(Debug)]
 pub struct CreateTopicsHandler {
@@ -130,10 +136,58 @@ impl Handler for CreateTopicsHandler {
                 );
                 continue;
             }
-            if !super::may_create_topic(&self.broker, &principal, &topic.name) {
+            // `__cluster_metadata` is KRaft's own log: Apache leaves it out of
+            // the allowed names, so it reads as unauthorized (gh #314).
+            if topic.name == CLUSTER_METADATA_TOPIC
+                || !super::may_create_topic(&self.broker, &principal, &topic.name)
+            {
                 topics.push(
                     create_topics::CreatableTopicResult::new(&topic.name, ERR_TOPIC_AUTHZ_FAILED)
                         .with_error_message("Authorization failed."),
+                );
+                continue;
+            }
+            // gh #314: the name becomes a directory. After the ACL, so a
+            // principal without rights learns nothing about it.
+            if !kaas_storage::is_valid_topic_name(&topic.name) {
+                topics.push(
+                    create_topics::CreatableTopicResult::new(
+                        &topic.name,
+                        ERR_INVALID_TOPIC_EXCEPTION,
+                    )
+                    .with_error_message(format!(
+                        "Topic name \"{}\" is invalid: it must be 1 to 249 characters of \
+                         [a-zA-Z0-9._-], and not \".\" or \"..\"",
+                        topic.name
+                    )),
+                );
+                continue;
+            }
+            // Apache's order from here: exists, null configs, then the counts
+            // (gh #314). `validate_only` must report an existing topic too; a
+            // topic the watch hasn't delivered yet is caught by the CR create.
+            if self.broker.topics.get(&topic.name).is_some() {
+                topics.push(
+                    create_topics::CreatableTopicResult::new(&topic.name, ERR_TOPIC_ALREADY_EXISTS)
+                        .with_error_message(format!("Topic '{}' already exists.", topic.name)),
+                );
+                continue;
+            }
+            // gh #292: Apache refuses a null config value rather than
+            // reading it as "use the default".
+            let null_configs: Vec<&str> = topic
+                .configs
+                .iter()
+                .filter(|c| c.value.is_none())
+                .map(|c| c.name.as_str())
+                .collect();
+            if !null_configs.is_empty() {
+                topics.push(
+                    create_topics::CreatableTopicResult::new(&topic.name, ERR_INVALID_CONFIG)
+                        .with_error_message(format!(
+                            "Null value not supported for topic configs: {}",
+                            null_configs.join(",")
+                        )),
                 );
                 continue;
             }
@@ -162,24 +216,6 @@ impl Handler for CreateTopicsHandler {
                 continue;
             };
 
-            // gh #292: Apache refuses a null config value rather than
-            // reading it as "use the default".
-            let null_configs: Vec<&str> = topic
-                .configs
-                .iter()
-                .filter(|c| c.value.is_none())
-                .map(|c| c.name.as_str())
-                .collect();
-            if !null_configs.is_empty() {
-                topics.push(
-                    create_topics::CreatableTopicResult::new(&topic.name, ERR_INVALID_CONFIG)
-                        .with_error_message(format!(
-                            "Null value not supported for topic configs: {}",
-                            null_configs.join(",")
-                        )),
-                );
-                continue;
-            }
             // gh #236: validate the config overrides before minting
             // anything (and on the validate_only path too).
             let configs: Vec<(String, String)> = topic
@@ -252,15 +288,16 @@ impl CreateTopicsHandler {
         topic: &create_topics::CreatableTopic,
     ) -> Result<(i32, i16), (i16, String)> {
         let refuse = |(code, msg): Refusal| (code, msg.to_owned());
-        let num_partitions =
-            match topic.num_partitions {
-                -1 => self.default_partitions,
-                n if n > 0 => n,
-                _ => return Err(refuse((
+        let num_partitions = match topic.num_partitions {
+            -1 => self.default_partitions,
+            n if n > 0 => n,
+            _ => {
+                return Err(refuse((
                     ERR_INVALID_PARTITIONS,
-                    "Number of partitions must be larger than 0, or -1 to use the default value.",
-                ))),
-            };
+                    "Number of partitions was set to an invalid non-positive value.",
+                )))
+            }
+        };
         let replication_factor = match topic.replication_factor {
             -1 => 1,
             n if n > 0 => n,
@@ -735,5 +772,96 @@ mod tests {
             let want: &[&str] = if validate_only { &[] } else { &["b"] };
             assert_eq!(minted, want);
         }
+    }
+
+    /// gh #314: Apache's `Topic.validate`, as INVALID_TOPIC_EXCEPTION (17),
+    /// and nothing is minted, on the validate-only path too. A name reaches
+    /// the filesystem, so these used to escape the data dir.
+    #[tokio::test]
+    async fn an_invalid_topic_name_is_17_and_never_minted() {
+        for validate_only in [true, false] {
+            for name in ["a/b", "..", ".", "", "../../x", "kperf-/../victim", "a b"] {
+                let w = Arc::new(RecordingWriter::default());
+                let resp = create_many(&w, vec![topic(name, 1, 1, &[])], validate_only).await;
+                assert_eq!(resp.topics[0].error_code, 17, "{name:?}");
+                assert!(w.calls.lock().is_empty(), "{name:?} was minted");
+            }
+        }
+    }
+
+    /// gh #314: `__cluster_metadata` reads as unauthorized, as in Apache.
+    #[tokio::test]
+    async fn the_cluster_metadata_topic_is_29() {
+        let w = Arc::new(RecordingWriter::default());
+        let resp = create_many(&w, vec![topic("__cluster_metadata", 1, 1, &[])], true).await;
+        assert_eq!(resp.topics[0].error_code, 29);
+    }
+
+    /// gh #314: Apache's order. A denied principal learns nothing about the
+    /// name, and a null config wins over a bad count.
+    #[tokio::test]
+    async fn checks_run_in_apaches_order() {
+        use crate::handlers::test_authz::DenyAllAuthorizer;
+        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let denied = Arc::new(Broker::with_auth(
+            engine,
+            Arc::new(TopicRegistry::new()),
+            "test",
+            0,
+            Arc::new(DenyAllAuthorizer),
+            Arc::new(kaas_auth::NoQuotaChecker),
+        ));
+        let req = Request {
+            topics: vec![topic("../x", 1, 1, &[])],
+            timeout_ms: 1000,
+            validate_only: true,
+        };
+        let mut buf = BytesMut::new();
+        create_topics::encode_request(&mut buf, &req, 5).unwrap();
+        let out = CreateTopicsHandler::new(denied)
+            .handle(&conn(), 5, buf.freeze())
+            .await
+            .unwrap();
+        let resp = create_topics::decode_response(&mut out.freeze(), 5).unwrap();
+        assert_eq!(resp.topics[0].error_code, 29);
+
+        let w = Arc::new(RecordingWriter::default());
+        let mut t = topic("t", 0, 1, &[]);
+        t.configs = vec![CreatableTopicConfig {
+            name: "retention.ms".into(),
+            value: None,
+        }];
+        let resp = create_many(&w, vec![t], true).await;
+        assert_eq!(
+            resp.topics[0].error_code, 40,
+            "null config before the count"
+        );
+    }
+
+    /// gh #314: validate-only reports a topic that exists, as a real create
+    /// would.
+    #[tokio::test]
+    async fn validate_only_reports_an_existing_topic_36() {
+        use crate::topic_registry::TopicMeta;
+        let w = Arc::new(RecordingWriter::default());
+        let b = broker_with_writer(w.clone());
+        b.topics.insert(TopicMeta {
+            name: "t".to_owned(),
+            partition_count: 1,
+            topic_id: [0; 16],
+        });
+        let req = Request {
+            topics: vec![topic("t", 1, 1, &[])],
+            timeout_ms: 1000,
+            validate_only: true,
+        };
+        let mut buf = BytesMut::new();
+        create_topics::encode_request(&mut buf, &req, 5).unwrap();
+        let out = CreateTopicsHandler::new(b)
+            .handle(&conn(), 5, buf.freeze())
+            .await
+            .unwrap();
+        let resp = create_topics::decode_response(&mut out.freeze(), 5).unwrap();
+        assert_eq!(resp.topics[0].error_code, 36);
     }
 }

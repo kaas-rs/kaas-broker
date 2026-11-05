@@ -64,8 +64,8 @@ pub use segment::{
     SegmentMeta, INDEX_ENTRY_SIZE,
 };
 pub use topic_identity::{
-    classify as classify_topic_identity, read_topic_identity, write_topic_identity,
-    IdentityVerdict, TopicIdentity, TOPIC_IDENTITY_FILENAME,
+    classify as classify_topic_identity, is_valid_topic_name, read_topic_identity,
+    write_topic_identity, IdentityVerdict, TopicIdentity, TOPIC_IDENTITY_FILENAME,
 };
 pub use topicconfig::{read_topic_config, write_topic_config, TopicConfigFile};
 pub use txn_index::{AbortedTxn, AbortedTxnIndex, OpenTxnIndex};

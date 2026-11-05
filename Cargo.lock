@@ -1621,6 +1621,7 @@ dependencies = [
  "pbkdf2",
  "rand 0.8.6",
  "regex",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",

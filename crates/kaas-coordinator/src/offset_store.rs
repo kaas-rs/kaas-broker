@@ -151,6 +151,45 @@ struct PendingKey {
     producer_id: i64,
 }
 
+/// The file holding `group_id`'s offsets. Apache allows any string as a group
+/// id, because it keeps them in a log; here it becomes a file name, so a
+/// separator would let a group ACL matching `../acls` overwrite the cluster's
+/// `acls.json` (gh #314). `/` and NUL are percent-encoded, and `%` so that the
+/// encoding round-trips. Every other name's file is unchanged.
+fn group_file_name(group_id: &str) -> String {
+    let mut name = String::with_capacity(group_id.len() + ".json".len());
+    for c in group_id.chars() {
+        match c {
+            '/' => name.push_str("%2F"),
+            '%' => name.push_str("%25"),
+            '\0' => name.push_str("%00"),
+            c => name.push(c),
+        }
+    }
+    name.push_str(".json");
+    name
+}
+
+/// The inverse of [`group_file_name`], for a name with `.json` removed.
+fn group_id_from_stem(stem: &str) -> String {
+    let mut id = String::with_capacity(stem.len());
+    let mut rest = stem;
+    while let Some(at) = rest.find('%') {
+        id.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let (decoded, used) = match tail.get(..3) {
+            Some("%2F") => ('/', 3),
+            Some("%25") => ('%', 3),
+            Some("%00") => ('\0', 3),
+            _ => ('%', 1),
+        };
+        id.push(decoded);
+        rest = &tail[used..];
+    }
+    id.push_str(rest);
+    id
+}
+
 pub struct OffsetStore {
     root: PathBuf,
     state: RwLock<Inner>,
@@ -201,7 +240,7 @@ impl OffsetStore {
     /// refusing commits on a transient read hiccup would be a worse
     /// failure than the race it guards.
     fn on_disk_fence(&self, group_id: &str) -> Option<FenceStamp> {
-        let path = self.dir().join(format!("{group_id}.json"));
+        let path = self.dir().join(group_file_name(group_id));
         let data = std::fs::read(&path).ok()?;
         serde_json::from_slice::<OffsetFileV2>(&data)
             .ok()
@@ -359,7 +398,7 @@ impl OffsetStore {
             metadata,
             fence: local,
         };
-        let name = format!("{group_id}.json");
+        let name = group_file_name(group_id);
         let res = atomic_write_json(&self.dir(), &name, &payload);
         let mut s = self.state.write();
         match &res {
@@ -448,7 +487,7 @@ impl OffsetStore {
             s.metadata.remove(group_id);
             s.dirty.remove(group_id);
         }
-        let path = self.dir().join(format!("{group_id}.json"));
+        let path = self.dir().join(group_file_name(group_id));
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -512,7 +551,7 @@ impl OffsetStore {
                 e.file_name()
                     .to_str()
                     .and_then(|n| n.strip_suffix(".json"))
-                    .map(str::to_owned)
+                    .map(group_id_from_stem)
             })
             .collect()
     }
@@ -566,7 +605,7 @@ impl OffsetStore {
         // `has_group` / `local_groups` report a group this broker never
         // materialised, which the heartbeat path feeds to the
         // controller's assignment loop.
-        let path = self.dir().join(format!("{group_id}.json"));
+        let path = self.dir().join(group_file_name(group_id));
         let data = match std::fs::read(&path) {
             Ok(d) => d,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
@@ -606,7 +645,7 @@ impl OffsetStore {
         if self.state.read().cache.contains_key(group_id) {
             return Ok(());
         }
-        let path = self.dir().join(format!("{group_id}.json"));
+        let path = self.dir().join(group_file_name(group_id));
         let data = match std::fs::read(&path) {
             Ok(d) => d,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -638,7 +677,7 @@ impl OffsetStore {
     /// Tolerates both the gh #21 v2 envelope and the legacy v1 plain
     /// map.
     pub fn load(&self, group_id: &str) -> io::Result<()> {
-        let path = self.dir().join(format!("{group_id}.json"));
+        let path = self.dir().join(group_file_name(group_id));
         let data = match std::fs::read(&path) {
             Ok(d) => d,
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -1200,5 +1239,53 @@ mod tests {
             }],
         );
         assert_eq!(got.get("t1/0"), Some(&42), "dirty group skipped its retry");
+    }
+
+    /// gh #314: a group id is any string, and it becomes a file name. A
+    /// traversal must stay inside the offsets directory, leave what it aimed
+    /// at alone, and still work as a group: offsets read back, also from a
+    /// fresh store off disk, and it is listed and deleted under its own id.
+    #[test]
+    fn a_group_id_cannot_escape_the_offsets_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let acls = tmp.path().join("acls.json");
+        std::fs::write(&acls, b"the real acls").unwrap();
+        for id in ["../acls", "../../x", "a/b", "/abs", "100%", "%2F", "a\0b"] {
+            let s = OffsetStore::new(tmp.path());
+            s.commit(id, HashMap::from([(offset_key("t", 0), 7)]))
+                .unwrap();
+            let spec = [FetchSpec {
+                topic: "t".to_owned(),
+                partitions: vec![0],
+            }];
+            let fresh = OffsetStore::new(tmp.path());
+            fresh.load(id).unwrap();
+            assert_eq!(
+                fresh.fetch(id, &spec).get(&offset_key("t", 0)),
+                Some(&7),
+                "{id:?}"
+            );
+            assert!(fresh.group_ids_on_disk().iter().any(|g| g == id), "{id:?}");
+            fresh.delete(id).unwrap();
+            assert!(!OffsetStore::new(tmp.path()).has_offsets(id), "{id:?}");
+        }
+        assert_eq!(std::fs::read(&acls).unwrap(), b"the real acls");
+        let stray: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .filter(|n| n != "acls.json" && n != "__consumer_offsets")
+            .collect();
+        assert!(stray.is_empty(), "{stray:?}");
+    }
+
+    /// gh #314: an ordinary group keeps its file, so an upgrade finds its
+    /// offsets where they were.
+    #[test]
+    fn ordinary_group_ids_keep_their_file_name() {
+        for id in ["g1", "my group", "app:1", "a.b-c_d", "caf\u{e9}", ".hidden"] {
+            assert_eq!(group_file_name(id), format!("{id}.json"));
+            assert_eq!(group_id_from_stem(id), id);
+        }
     }
 }
