@@ -303,6 +303,7 @@ impl RetentionCleaner {
 
     async fn run_once_inner(&self) -> Result<u32, StorageError> {
         let mut cleaned = 0u32;
+        let mut first_err = None;
         let now = (self.now_ms)();
         for (topic, partition) in self.engine.iter_partition_keys() {
             if !self.ownership.owns_partition(&topic, partition) {
@@ -362,7 +363,20 @@ impl RetentionCleaner {
                 "time"
             };
             let before = p.partition_size();
-            p.delete_records(target).await?;
+            // One stuck partition mustn't cost every other its retention
+            // (gh #311 verification). A full pool volume or a fenced leader
+            // fails here. The pass carries on and reports the first error.
+            if let Err(err) = p.delete_records(target).await {
+                tracing::warn!(
+                    topic,
+                    partition,
+                    target,
+                    %err,
+                    "retention could not advance log start"
+                );
+                first_err.get_or_insert(err);
+                continue;
+            }
             let after = p.partition_size();
             let reclaimed = before.saturating_sub(after);
             cleaned += 1;
@@ -384,7 +398,7 @@ impl RetentionCleaner {
                 );
             }
         }
-        Ok(cleaned)
+        first_err.map_or(Ok(cleaned), Err)
     }
 }
 
@@ -540,6 +554,52 @@ mod tests {
             assert_eq!(a, 1);
             assert_eq!(b, 0);
             assert_eq!(c, 0);
+            e.relinquish_all().await.unwrap();
+        });
+    }
+
+    /// gh #311 verification: `delete_records` can fail on I/O now, and one
+    /// stuck partition mustn't cost the others their retention. The pass
+    /// reports the failure, and the next one finishes the job. Iteration
+    /// order is random, so a regression fails this 7 runs in 8.
+    #[test]
+    fn one_stuck_partition_doesnt_stop_the_others_retention() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let journal = Arc::new(crate::fs::JournalFs::default());
+            let fs: Arc<dyn Fs> = journal.clone();
+            let e = Arc::new(DiskStorageEngine::new(
+                fs,
+                tmp.path().to_path_buf(),
+                PartitionConfig {
+                    segment_bytes: u64::try_from(build_batch(1, 1_000).len()).unwrap(),
+                    ..Default::default()
+                },
+            ));
+            for partition in 0..8 {
+                for _ in 0..3 {
+                    e.append("t", partition, 0, -1, build_batch(1, 1_000_000))
+                        .await
+                        .unwrap();
+                }
+            }
+            *journal.fail_create_suffix.lock() = Some("t/2/manifest.json.tmp");
+            let cleaner = RetentionCleaner::new(e.clone(), time_only(60_000))
+                .with_clock(Arc::new(|| 9_000_000));
+
+            assert!(cleaner.run_once().await.is_err());
+            for partition in 0..8 {
+                let want = if partition == 2 { 0 } else { 2 };
+                assert_eq!(
+                    e.log_start_offset("t", partition).unwrap(),
+                    want,
+                    "partition {partition}"
+                );
+            }
+
+            *journal.fail_create_suffix.lock() = None;
+            assert_eq!(cleaner.run_once().await.unwrap(), 1);
+            assert_eq!(e.log_start_offset("t", 2).unwrap(), 2);
             e.relinquish_all().await.unwrap();
         });
     }

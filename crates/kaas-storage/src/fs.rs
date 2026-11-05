@@ -322,7 +322,9 @@ pub fn create_dir_all_durable(dir: &Path) -> io::Result<()> {
 /// `fail_create_suffix`, every `fsync_dir` while `fail_fsync_dir` is set,
 /// and the next `sync_all` on any file it opened once `fail_next_file_sync`
 /// is set. That one fails once, as Linux does: it reports a writeback error
-/// once per file descriptor, and the next fsync succeeds.
+/// once per file descriptor, and the next fsync succeeds. While `no_space` is
+/// set every `create` answers ENOSPC; `remove_frees_space` makes unlinking a
+/// log clear it, as freeing a whole segment does on a full volume.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct JournalFs {
@@ -331,6 +333,8 @@ pub(crate) struct JournalFs {
     pub(crate) fail_create_suffix: parking_lot::Mutex<Option<&'static str>>,
     pub(crate) fail_fsync_dir: std::sync::atomic::AtomicBool,
     pub(crate) fail_next_file_sync: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) no_space: std::sync::atomic::AtomicBool,
+    pub(crate) remove_frees_space: std::sync::atomic::AtomicBool,
 }
 
 /// A file from [`JournalFs`], for `fail_next_file_sync`.
@@ -406,6 +410,9 @@ impl Fs for JournalFs {
                 return Err(io::Error::other("injected create failure"));
             }
         }
+        if self.no_space.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(io::Error::from_raw_os_error(28));
+        }
         Ok(self.journal_file(self.inner.create(p)?))
     }
     fn fsync(&self, f: &mut dyn FileWrite) -> io::Result<()> {
@@ -418,6 +425,15 @@ impl Fs for JournalFs {
     fn remove(&self, p: &Path) -> io::Result<()> {
         if p.exists() {
             self.log("remove", p);
+        }
+        let log = p.to_string_lossy().ends_with(crate::segment::LOG_EXT);
+        if log
+            && self
+                .remove_frees_space
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.no_space
+                .store(false, std::sync::atomic::Ordering::SeqCst);
         }
         self.inner.remove(p)
     }
