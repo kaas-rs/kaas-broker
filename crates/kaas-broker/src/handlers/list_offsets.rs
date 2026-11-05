@@ -9,13 +9,17 @@
 //! Gates run per partition, as in Apache's `handleListOffsetRequest` and
 //! `fetchOffsetForTimestamp` (gh #295):
 //! 1. `Describe` on the topic (29).
-//! 2. The topic exists and the partition is inside its count (3).
-//! 3. With a cluster `Coordinator` wired, this broker leads the
+//! 2. The partition appears once in the request, else every entry of it
+//!    is `INVALID_REQUEST` (42), as in Apache's `duplicatePartitions`
+//!    (gh #302).
+//! 3. The topic exists and the partition is inside its count (3).
+//! 4. With a cluster `Coordinator` wired, this broker leads the
 //!    partition (6). The exception is `replica_id = -2`, Apache's
 //!    debugging replica, which any broker may answer. A non-leader's
 //!    engine has no open partition, so before this it answered 0 for
 //!    both offsets instead of redirecting the client.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -32,6 +36,7 @@ use crate::broker::Broker;
 const ERR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 const ERR_NOT_LEADER_OR_FOLLOWER: i16 = 6;
 const ERR_TOPIC_AUTHZ_FAILED: i16 = 29;
+const ERR_INVALID_REQUEST: i16 = 42;
 
 const TS_EARLIEST: i64 = -2;
 const TS_LATEST: i64 = -1;
@@ -63,6 +68,15 @@ impl Handler for ListOffsetsHandler {
         let req = list_offsets::decode_request(&mut body, version)?;
         let principal = principal_from(conn);
 
+        let mut occurrences: HashMap<(&str, i32), usize> = HashMap::new();
+        for t in &req.topics {
+            for p in &t.partitions {
+                *occurrences
+                    .entry((t.name.as_str(), p.partition_index))
+                    .or_default() += 1;
+            }
+        }
+
         let mut topics = Vec::with_capacity(req.topics.len());
         for t in &req.topics {
             // gh #268: `Describe` on the topic, ahead of the existence
@@ -74,10 +88,15 @@ impl Handler for ListOffsetsHandler {
             );
             let mut parts = Vec::with_capacity(t.partitions.len());
             for p in &t.partitions {
-                parts.push(if authorized {
-                    self.resolve_one(&t.name, p, &req)
-                } else {
+                let duplicated = occurrences
+                    .get(&(t.name.as_str(), p.partition_index))
+                    .is_some_and(|&n| n > 1);
+                parts.push(if !authorized {
                     error_partition(p.partition_index, ERR_TOPIC_AUTHZ_FAILED)
+                } else if duplicated {
+                    error_partition(p.partition_index, ERR_INVALID_REQUEST)
+                } else {
+                    self.resolve_one(&t.name, p, &req)
                 });
             }
             topics.push(list_offsets::TopicResponse {
@@ -414,5 +433,44 @@ mod tests {
                 "isolation {isolation_level}"
             );
         }
+    }
+
+    /// gh #302: a partition repeated in one request is Apache's
+    /// INVALID_REQUEST (42) for every entry of it, across repeated topic
+    /// entries too. Other partitions are unaffected.
+    #[tokio::test]
+    async fn a_partition_repeated_in_one_request_is_invalid_request_42() {
+        let h = ListOffsetsHandler::new(broker_with_topic("t"));
+        let part = |partition_index| list_offsets::Partition {
+            partition_index,
+            current_leader_epoch: -1,
+            timestamp: TS_LATEST,
+        };
+        let topic = |partitions| list_offsets::Topic {
+            name: "t".to_owned(),
+            partitions,
+        };
+        let req = list_offsets::Request {
+            replica_id: -1,
+            isolation_level: 0,
+            topics: vec![topic(vec![part(0), part(0)]), topic(vec![part(0)])],
+        };
+        let out = h.handle(&conn(), 6, encode_v6(&req)).await.unwrap();
+        let resp = list_offsets::decode_response(&mut out.freeze(), 6).unwrap();
+        let codes: Vec<i16> = resp
+            .topics
+            .iter()
+            .flat_map(|t| t.partitions.iter().map(|p| p.error_code))
+            .collect();
+        assert_eq!(codes, [42, 42, 42]);
+
+        let req = list_offsets::Request {
+            replica_id: -1,
+            isolation_level: 0,
+            topics: vec![topic(vec![part(0)])],
+        };
+        let out = h.handle(&conn(), 6, encode_v6(&req)).await.unwrap();
+        let resp = list_offsets::decode_response(&mut out.freeze(), 6).unwrap();
+        assert_eq!(resp.topics[0].partitions[0].error_code, 0);
     }
 }

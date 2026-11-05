@@ -168,7 +168,8 @@ what `kafka-get-offsets.sh` and every consumer's `auto.offset.reset` ride on
 
 Gates run per partition in Apache's order (gh #295): `Describe` on the topic
 (else `TOPIC_AUTHORIZATION_FAILED`, 29, whether or not the topic exists,
-gh #268); the topic exists and the partition is inside its count (else
+gh #268); the partition appears once in the request (else `INVALID_REQUEST`,
+42, for every entry of it, gh #302); the topic exists and the partition is inside its count (else
 `UNKNOWN_TOPIC_OR_PARTITION`, 3); and this broker leads the partition per
 `assignment.json` (else `NOT_LEADER_OR_FOLLOWER`, 6). The leadership gate is
 skipped for `replica_id = -2`, Apache's debugging replica, which any broker

@@ -139,8 +139,11 @@ Advances a partition's log start offset ([KIP-107](../kip/kip-107.md)) —
 handler runs the same gates as Produce, in Apache's order: `Delete` on the
 topic (else `TOPIC_AUTHORIZATION_FAILED`, 29, and nothing is purged); the topic
 exists and the partition is inside its count (else
-`UNKNOWN_TOPIC_OR_PARTITION`, 3, gh #295); and, with a cluster coordinator
-wired, this broker leads the partition (else `NOT_LEADER_OR_FOLLOWER`, 6). The
+`UNKNOWN_TOPIC_OR_PARTITION`, 3, gh #295); with a cluster coordinator wired,
+this broker leads the partition (else `NOT_LEADER_OR_FOLLOWER`, 6); and the
+topic's `cleanup.policy` includes `delete` (else `POLICY_VIOLATION`, 44,
+gh #302). Engine failures map as in Produce: the retriable not-ready states are
+`LEADER_NOT_AVAILABLE` (5), an I/O failure `KAFKA_STORAGE_ERROR` (56). The
 storage engine then advances `logStart` to
 the target offset (`-1` = purge to the high watermark; a target past the HWM,
 or any other negative offset, is `OFFSET_OUT_OF_RANGE` (1) and deletes nothing —
