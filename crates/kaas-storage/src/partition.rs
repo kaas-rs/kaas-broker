@@ -990,7 +990,11 @@ impl Partition {
             // header attrs + pid + (for control batches) the key's
             // type byte.
             if let Some(txn_info) = parse_batch_txn_info(&owned) {
-                if txn_info.is_transactional {
+                // Only a batch with a producer id takes part (gh #305, as
+                // in Apache's `analyzeAndValidateProducerState`). A
+                // transactional bit with pid -1 would otherwise pin the LSO
+                // under a PID no marker can ever close.
+                if txn_info.is_transactional && txn_info.producer_id >= 0 {
                     if txn_info.is_control {
                         // COMMIT or ABORT marker — close the open txn.
                         if let Some(first_offset) = guard.open_txns.close(txn_info.producer_id) {
@@ -3881,6 +3885,29 @@ mod tests {
                 !p.inner.lock().closed.is_empty(),
                 "expected at least one roll"
             );
+            p.close().await.unwrap();
+        });
+    }
+
+    /// gh #305: a transactional-bit batch with no producer id opens no
+    /// transaction, so it can't pin the LSO under a PID no marker can close.
+    #[test]
+    fn a_transactional_batch_without_a_producer_id_does_not_pin_the_lso() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Partition::open(
+                fs,
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            p.append(0, -1, build_txn_data_batch(-1, 3)).await.unwrap();
+            assert_eq!(p.high_watermark(), 3);
+            assert_eq!(p.last_stable_offset(), 3);
             p.close().await.unwrap();
         });
     }

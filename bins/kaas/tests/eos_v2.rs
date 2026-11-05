@@ -387,6 +387,9 @@ fn build_txn_batch(pid: i64, epoch: i16, num_records: i32) -> Bytes {
     buf[43..51].copy_from_slice(&pid.to_be_bytes());
     buf[51..53].copy_from_slice(&epoch.to_be_bytes());
     // base_sequence stays 0 (first batch).
+    // A record count matching lastOffsetDelta (INVALID_RECORD otherwise,
+    // gh #305).
+    buf[57..61].copy_from_slice(&num_records.to_be_bytes());
     // gh #228: the recovery scan verifies the v2 CRC, so a synthetic
     // batch has to carry a real one or a reopen treats it as bit-rot.
     let crc = kaas_codec::crc::compute(&buf[21..]);

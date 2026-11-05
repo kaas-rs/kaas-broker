@@ -26,6 +26,13 @@
 //! slipped past both attribute checks while the append path still read
 //! its header. A bad CRC was acked and later truncated every acked record
 //! behind it on recovery, and a second batch reused offsets.
+//!
+//! The header's other fields are checked too, as Apache's
+//! `analyzeAndValidateRecords` and `LogValidator.validateBatch` do
+//! (gh #305), because the append path advances the high watermark by
+//! `lastOffsetDelta`. Without these, a CRC-valid batch with
+//! `lastOffsetDelta = -1000` or `i32::MAX` wrecked the partition's offsets
+//! for good.
 
 use std::sync::Arc;
 
@@ -59,11 +66,17 @@ const ERR_RECORD_LIST_TOO_LARGE: i16 = 18;
 const DEFAULT_MAX_MESSAGE_BYTES: usize = 1_048_588;
 const ERR_TOPIC_AUTHORIZATION_FAILED: i16 = 29;
 const ERR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
+const ERR_UNSUPPORTED_COMPRESSION_TYPE: i16 = 76;
 const ERR_INVALID_RECORD: i16 = 87;
 /// v2 RecordBatch attribute bits (`RecordBatch.isTransactional` /
 /// `isControlBatch`).
 const ATTR_TRANSACTIONAL: i16 = 0x10;
 const ATTR_CONTROL: i16 = 0x20;
+/// The low three attribute bits name the codec (`CompressionType`).
+const ATTR_COMPRESSION_MASK: i16 = 0x07;
+const COMPRESSION_ZSTD: i16 = 4;
+/// Produce's first version allowed to carry ZSTD (KIP-110).
+const ZSTD_MIN_PRODUCE_VERSION: i16 = 7;
 const ERR_OUT_OF_ORDER_SEQUENCE_NUMBER: i16 = 45;
 const ERR_DUPLICATE_SEQUENCE_NUMBER: i16 = 46;
 const ERR_INVALID_PRODUCER_EPOCH: i16 = 47;
@@ -141,7 +154,7 @@ impl Handler for ProduceHandler {
                         ERR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
                     )
                 } else {
-                    self.append_one(&principal, &t.name, p, acks).await
+                    self.append_one(&principal, &t.name, p, acks, version).await
                 };
                 partition_responses.push(pr);
             }
@@ -215,6 +228,7 @@ impl ProduceHandler {
         topic: &str,
         p: &produce::PartitionData,
         acks: i16,
+        version: i16,
     ) -> produce::PartitionResponse {
         // Cluster-wide ACL check (gh #126). Topic-level Write is the
         // canonical Apache mapping for Produce. First, so a principal
@@ -240,9 +254,10 @@ impl ProduceHandler {
         }
 
         // Apache's `ProduceRequest.validateRecords`, which runs before the
-        // leadership check: exactly one magic-v2 batch spanning the field.
+        // leadership check: exactly one magic-v2 batch spanning the field,
+        // and no ZSTD below v7.
         if let Some(records) = p.records.as_deref() {
-            if let Err(code) = validate_structure(records) {
+            if let Err(code) = validate_structure(records, version) {
                 return error_partition_bumped(topic, p.index, code);
             }
         }
@@ -280,6 +295,13 @@ impl ProduceHandler {
             return ok_partition(p.index, base, 0);
         };
 
+        // UnifiedLog's `analyzeAndValidateRecords`: a client's batch starts
+        // at 0. The base offset is rewritten on append, so this one only
+        // matters for parity.
+        if batch_base_offset(&records) != 0 {
+            return error_partition_bumped(topic, p.index, ERR_INVALID_RECORD);
+        }
+
         // gh #14: enforce broker-side max.message.bytes. Java
         // producers cap their own batches at max.request.size (1 MB
         // default) but misconfigured clients can still send bigger;
@@ -298,10 +320,15 @@ impl ProduceHandler {
             return error_partition_bumped(topic, p.index, ERR_CORRUPT_MESSAGE);
         }
 
-        // gh #294: control batches are the coordinator's to write. The
-        // append path takes any control batch as a COMMIT/ABORT marker,
-        // so a client-sent one would forge a transaction outcome.
-        if has_batch_with(&records, ATTR_CONTROL) {
+        // `analyzeAndValidateRecords` reads the codec after the CRC, and
+        // `CompressionType.forId` throws on an id it doesn't know, which
+        // reaches the client as UNKNOWN_SERVER_ERROR.
+        if batch_attributes(&records) & ATTR_COMPRESSION_MASK > COMPRESSION_ZSTD {
+            return error_partition_bumped(topic, p.index, ERR_GENERIC);
+        }
+
+        // `LogValidator.validateBatch`, gh #305 and gh #294.
+        if !batch_fields_are_valid(&records) {
             return error_partition_bumped(topic, p.index, ERR_INVALID_RECORD);
         }
 
@@ -348,9 +375,10 @@ impl ProduceHandler {
 /// - A `batchLength` too small for a v2 header is `CORRUPT_MESSAGE`.
 /// - Magic 0/1 is `INVALID_RECORD` ("must use magic v2"); any other value
 ///   is `CORRUPT_MESSAGE`.
+/// - ZSTD below Produce v7 is `UNSUPPORTED_COMPRESSION_TYPE` (76).
 /// - Bytes after the batch, i.e. a second batch, is `INVALID_RECORD`
 ///   ("exactly one record batch per partition").
-fn validate_structure(records: &[u8]) -> Result<(), i16> {
+fn validate_structure(records: &[u8], version: i16) -> Result<(), i16> {
     /// A v2 batch header after `baseOffset` + `batchLength`.
     const MIN_V2_BATCH_LENGTH: usize = 61 - 12;
     let Some(len4) = records.get(8..12) else {
@@ -372,10 +400,45 @@ fn validate_structure(records: &[u8]) -> Result<(), i16> {
         0 | 1 => return Err(ERR_INVALID_RECORD),
         _ => return Err(ERR_CORRUPT_MESSAGE),
     }
+    if version < ZSTD_MIN_PRODUCE_VERSION
+        && batch_attributes(records) & ATTR_COMPRESSION_MASK == COMPRESSION_ZSTD
+    {
+        return Err(ERR_UNSUPPORTED_COMPRESSION_TYPE);
+    }
     if total != records.len() {
         return Err(ERR_INVALID_RECORD);
     }
     Ok(())
+}
+
+// Header readers for a batch `validate_structure` has accepted, so all 61
+// header bytes are there. Headers only: byte opacity holds.
+fn batch_base_offset(b: &[u8]) -> i64 {
+    i64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+}
+fn batch_attributes(b: &[u8]) -> i16 {
+    i16::from_be_bytes([b[21], b[22]])
+}
+
+/// Apache's `LogValidator.validateBatch` for a client's v2 batch:
+/// - `lastOffsetDelta + 1` must be positive and equal a positive
+///   `recordCount`. The high watermark advances by that delta, so a wrong
+///   one moves it backwards or past what a segment can index.
+/// - No control batches: only the coordinator writes COMMIT/ABORT markers,
+///   and the append path takes any control batch as one (gh #294).
+/// - A batch with a producer id needs a non-negative base sequence, or it
+///   skips the dedupe window.
+fn batch_fields_are_valid(b: &[u8]) -> bool {
+    let last_offset_delta = i32::from_be_bytes([b[23], b[24], b[25], b[26]]);
+    let producer_id = i64::from_be_bytes([b[43], b[44], b[45], b[46], b[47], b[48], b[49], b[50]]);
+    let base_sequence = i32::from_be_bytes([b[53], b[54], b[55], b[56]]);
+    let record_count = i32::from_be_bytes([b[57], b[58], b[59], b[60]]);
+    let count_from_offsets = i64::from(last_offset_delta) + 1;
+    count_from_offsets > 0
+        && record_count > 0
+        && count_from_offsets == i64::from(record_count)
+        && batch_attributes(b) & ATTR_CONTROL == 0
+        && !(producer_id >= 0 && base_sequence < 0)
 }
 
 /// Whether any whole batch in `records` has the attribute bit `flag` set.
@@ -581,11 +644,11 @@ mod tests {
         )));
         let anon = Principal::anonymous();
         for topic in ["known", "missing"] {
-            let r = denied.append_one(&anon, topic, &part(0), -1).await;
+            let r = denied.append_one(&anon, topic, &part(0), -1, 9).await;
             assert_eq!(r.error_code, ERR_TOPIC_AUTHORIZATION_FAILED, "{topic}");
         }
         let allowed = ProduceHandler::new(broker_with_topic("known", 1));
-        let r = allowed.append_one(&anon, "known", &part(999), -1).await;
+        let r = allowed.append_one(&anon, "known", &part(999), -1, 9).await;
         assert_eq!(r.error_code, ERR_UNKNOWN_TOPIC_OR_PARTITION);
     }
 
@@ -600,7 +663,7 @@ mod tests {
             records: Some(batch(0, -1, -1)),
         };
         let r = h
-            .append_one(&Principal::anonymous(), "known", &part, -1)
+            .append_one(&Principal::anonymous(), "known", &part, -1, 9)
             .await;
         assert_eq!(r.error_code, 10);
     }
@@ -823,5 +886,94 @@ mod tests {
     fn a_batch_over_segment_bytes_is_record_list_too_large_18() {
         let r = map_error("t", 0, &StorageError::RecordBatchTooLarge);
         assert_eq!(r.error_code, 18);
+    }
+
+    /// `batch(0, -1, -1)` with `edit` applied and the CRC recomputed, so
+    /// only the field under test is wrong.
+    fn edited(edit: impl FnOnce(&mut Vec<u8>)) -> Bytes {
+        let mut b = batch(0, -1, -1).to_vec();
+        edit(&mut b);
+        let crc = kaas_codec::crc::compute(&b[21..]);
+        b[17..21].copy_from_slice(&crc.to_be_bytes());
+        Bytes::from(b)
+    }
+
+    /// gh #305: a CRC-valid batch whose header lies about its offsets or
+    /// count is Apache's INVALID_RECORD (87, `LogValidator.validateBatch`).
+    /// Each of these used to be acked; a bad `lastOffsetDelta` moved the
+    /// high watermark backwards or to 2^31. Nothing is appended, and the
+    /// well-formed batch next to it lands.
+    #[tokio::test]
+    async fn a_lying_batch_header_is_refused_with_apaches_codes() {
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        let delta = |d: i32| move |b: &mut Vec<u8>| b[23..27].copy_from_slice(&d.to_be_bytes());
+        let count = |c: i32| move |b: &mut Vec<u8>| b[57..61].copy_from_slice(&c.to_be_bytes());
+        let cases: Vec<(&str, Bytes, i16)> = vec![
+            ("delta -1000", edited(delta(-1000)), 87),
+            ("delta -1", edited(delta(-1)), 87),
+            ("delta i32::MAX", edited(delta(i32::MAX)), 87),
+            ("delta past the count", edited(delta(1)), 87),
+            ("count -1", edited(count(-1)), 87),
+            ("count 0", edited(count(0)), 87),
+            ("count 5", edited(count(5)), 87),
+            (
+                "base offset 7",
+                edited(|b| b[0..8].copy_from_slice(&7i64.to_be_bytes())),
+                87,
+            ),
+            ("a PID with a negative sequence", batch(0, 7, -1), 87),
+            (
+                "unknown codec 5",
+                edited(|b| b[21..23].copy_from_slice(&5i16.to_be_bytes())),
+                -1,
+            ),
+            (
+                "unknown codec 7",
+                edited(|b| b[21..23].copy_from_slice(&7i16.to_be_bytes())),
+                -1,
+            ),
+        ];
+        for (what, records, code) in cases {
+            let b = txn_broker(Arc::new(DenyNamedAuthorizer("nobody")));
+            assert_eq!(
+                produce_two(&b, None, records, batch(0, -1, -1)).await,
+                [code, 0],
+                "{what}"
+            );
+            assert_eq!(appended(&b, "orders"), 0, "{what} was appended");
+        }
+    }
+
+    /// gh #305: every field of a well-formed multi-record batch is
+    /// accepted: the control for the checks above.
+    #[tokio::test]
+    async fn an_honest_multi_record_batch_is_accepted() {
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        let b = txn_broker(Arc::new(DenyNamedAuthorizer("nobody")));
+        let three = edited(|h| {
+            h[23..27].copy_from_slice(&2i32.to_be_bytes());
+            h[57..61].copy_from_slice(&3i32.to_be_bytes());
+        });
+        assert_eq!(produce_two(&b, None, three, batch(0, -1, -1)).await, [0, 0]);
+        assert_eq!(appended(&b, "orders"), 3);
+    }
+
+    /// gh #305: ZSTD needs Produce v7 (KIP-110). Below it, Apache's
+    /// `validateRecords` answers UNSUPPORTED_COMPRESSION_TYPE (76).
+    #[tokio::test]
+    async fn zstd_below_produce_v7_is_76() {
+        for (version, want) in [(3, 76), (6, 76), (7, 0), (9, 0)] {
+            let h = ProduceHandler::new(broker_with_topic("known", 1));
+            let part = produce::PartitionData {
+                index: 0,
+                records: Some(edited(|b| {
+                    b[21..23].copy_from_slice(&COMPRESSION_ZSTD.to_be_bytes());
+                })),
+            };
+            let r = h
+                .append_one(&Principal::anonymous(), "known", &part, -1, version)
+                .await;
+            assert_eq!(r.error_code, want, "v{version}");
+        }
     }
 }

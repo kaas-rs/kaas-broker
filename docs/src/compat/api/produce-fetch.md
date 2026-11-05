@@ -30,7 +30,9 @@ controller stops acking within 3 s (also 6). Between the existence and
 leadership checks, the records must be exactly one magic-v2 batch whose
 `batchLength` spans the field, as Apache's `ProduceRequest.validateRecords`
 requires (`INVALID_RECORD`, 87; a length too small to be a batch, or an unknown
-magic, is `CORRUPT_MESSAGE`, 2). A batch larger
+magic, is `CORRUPT_MESSAGE`, 2). ZSTD below Produce v7 is
+`UNSUPPORTED_COMPRESSION_TYPE` (76). A base offset other than 0 is
+`INVALID_RECORD` (87). A batch larger
 than Apache's `message.max.bytes` default (1 MiB + 12 bytes batch overhead)
 is rejected with `MESSAGE_TOO_LARGE` (10) before it hits storage — Apache's
 code for a batch over `max.message.bytes`, which the Java producer answers by
@@ -39,6 +41,12 @@ A batch larger than the topic's `segment.bytes`, which no segment can hold,
 is `RECORD_LIST_TOO_LARGE` (18), as in Apache's `UnifiedLog.append`.
 A batch whose CRC doesn't match is `CORRUPT_MESSAGE` (2) and is never acked.
 The recovery scan would stop at it and truncate every acked record behind it.
+An unknown compression codec is `UNKNOWN_SERVER_ERROR` (-1), as in Apache.
+The header's other fields are checked as in Apache's `LogValidator` (gh #305),
+all `INVALID_RECORD` (87): `lastOffsetDelta + 1` must be positive and equal a
+positive `recordCount`, and a batch with a producer id needs a non-negative
+base sequence. The high watermark advances by `lastOffsetDelta`, so a batch
+that lied about it used to wreck the partition's offsets for good.
 A control batch from a client is refused with `INVALID_RECORD` (87), as in
 Apache's `LogValidator`: COMMIT/ABORT markers are the transaction
 coordinator's to write, and it appends them to the engine directly, not
@@ -87,9 +95,10 @@ gets to refresh its metadata (gh #200).
 `a_transactional_batch_needs_write_on_the_transactional_id`,
 `a_non_transactional_request_skips_the_transactional_id_check` and
 `a_client_control_batch_is_invalid_record_87`,
-`malformed_records_are_refused_with_apaches_codes` and
-`a_lying_batch_length_cannot_bypass_the_transactional_checks` (handler unit
-tests),
+`malformed_records_are_refused_with_apaches_codes`,
+`a_lying_batch_length_cannot_bypass_the_transactional_checks`,
+`a_lying_batch_header_is_refused_with_apaches_codes` and
+`zstd_below_produce_v7_is_76` (handler unit tests),
 `produce_fetch_metadata_roundtrip` in `bins/kaas/tests/smoke.rs` (which
 also asserts the fetched batch is byte-identical to the produced one),
 `append_then_read_byte_identical` in `crates/kaas-storage/src/disk.rs`,
