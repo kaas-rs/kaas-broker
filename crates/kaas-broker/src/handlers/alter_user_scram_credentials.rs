@@ -184,7 +184,12 @@ impl AlterUserScramCredentialsHandler {
             );
         }
         for (user, u) in upsertions {
-            let outcome = self.write(&user, u).await;
+            // kaas's own rules run here, after classification, so a user
+            // named twice is 92 whatever its entries were (gh #313).
+            let outcome = match kaas_refusal(&u) {
+                Some((code, msg)) => (code, Some(msg)),
+                None => self.write(&user, u).await,
+            };
             results.insert(user, outcome);
         }
         results
@@ -198,6 +203,16 @@ impl AlterUserScramCredentialsHandler {
     }
 
     async fn write(&self, user: &str, u: ScramCredentialUpsertion) -> (i16, Option<String>) {
+        // A name that can't be a KafkaUser's has no CR, and must never reach
+        // the API path: the client interpolates it, so `alice?x=1` rotated
+        // `alice` and answered success, and `a/b` hit another resource
+        // (gh #313).
+        if user.len() > 253 || !crate::topic_cr_writer::is_rfc1123_subdomain(user) {
+            return (
+                ERR_RESOURCE_NOT_FOUND,
+                Some("no KafkaUser with this name".to_owned()),
+            );
+        }
         let Some(writer) = self.broker.user_cr_writer() else {
             return (
                 ERR_CLUSTER_AUTHZ_FAILED,
@@ -255,10 +270,7 @@ fn validate_name_and_mechanism(name: &str, mech: i8) -> Result<(), (i16, String)
     Ok(())
 }
 
-/// Apache's `validateUpsertion` (iterations within 4096..=16384), then
-/// kaas's two additions: SCRAM-SHA-512 only, and non-empty salt and
-/// salted password. Running them last means an upsertion Apache rejects
-/// gets Apache's answer.
+/// Apache's `validateUpsertion`: iterations within 4096..=16384.
 fn validate_upsertion(u: &ScramCredentialUpsertion) -> Result<(), (i16, String)> {
     validate_name_and_mechanism(&u.name, u.mechanism)?;
     if u.iterations < MIN_ITERATIONS {
@@ -267,19 +279,26 @@ fn validate_upsertion(u: &ScramCredentialUpsertion) -> Result<(), (i16, String)>
     if u.iterations > MAX_ITERATIONS {
         return Err((ERR_UNACCEPTABLE_CREDENTIAL, "Too many iterations".into()));
     }
+    Ok(())
+}
+
+/// kaas's two additions to Apache's rules: SCRAM-SHA-512 only, and non-empty
+/// salt and salted password. Checked after classification, so an upsertion
+/// Apache would reject, or a user named twice, gets Apache's answer.
+fn kaas_refusal(u: &ScramCredentialUpsertion) -> Option<(i16, String)> {
     if u.mechanism != mechanism::SCRAM_SHA_512 {
-        return Err((
+        return Some((
             ERR_UNSUPPORTED_SASL_MECHANISM,
             "kaas supports SCRAM-SHA-512 only".into(),
         ));
     }
     if u.salt.is_empty() || u.salted_password.is_empty() {
-        return Err((
+        return Some((
             ERR_UNACCEPTABLE_CREDENTIAL,
             "salt and saltedPassword must be non-empty".into(),
         ));
     }
-    Ok(())
+    None
 }
 
 #[cfg(test)]
@@ -549,5 +568,70 @@ mod tests {
         .await;
         assert_eq!(codes(&resp), [("alice", 31), ("bob", 31), ("carol", 31)]);
         assert!(w.calls.lock().is_empty());
+    }
+
+    /// gh #313: a name that can't be a KafkaUser's has no CR, so it answers
+    /// 91 and never reaches the writer. The client library interpolates it
+    /// into the API path, so `alice?x=1` used to rotate `alice`.
+    #[tokio::test]
+    async fn a_name_that_cannot_be_a_kafka_user_is_91_and_never_written() {
+        for name in [
+            "alice?x=1",
+            "alice#frag",
+            "alice/status",
+            "a b",
+            "Alice",
+            "a%2Fb",
+        ] {
+            let w = Arc::new(RecordingWriter::default());
+            let resp = alter(
+                broker_with_writer(w.clone()),
+                Request {
+                    deletions: vec![],
+                    upsertions: vec![upsertion(name)],
+                },
+            )
+            .await;
+            assert_eq!(codes(&resp), [(name, 91)]);
+            assert!(w.calls.lock().is_empty(), "{name} reached the writer");
+        }
+    }
+
+    /// gh #313: kaas's own rules don't pre-empt Apache's duplicate rule: a
+    /// user named twice is 92 in either order, whatever its entries were. On
+    /// their own they still answer.
+    #[tokio::test]
+    async fn kaas_only_refusals_do_not_pre_empt_a_duplicate() {
+        let sha256 = |name: &str| {
+            let mut u = upsertion(name);
+            u.mechanism = mechanism::SCRAM_SHA_256;
+            u
+        };
+        let no_salt = |name: &str| {
+            let mut u = upsertion(name);
+            u.salt = vec![];
+            u
+        };
+        let cases: Vec<(Vec<ScramCredentialUpsertion>, i16)> = vec![
+            (vec![sha256("a"), upsertion("a")], 92),
+            (vec![upsertion("a"), sha256("a")], 92),
+            (vec![sha256("a"), sha256("a")], 92),
+            (vec![no_salt("a"), upsertion("a")], 92),
+            (vec![sha256("a")], 33),
+            (vec![no_salt("a")], 93),
+        ];
+        for (upsertions, want) in cases {
+            let w = Arc::new(RecordingWriter::default());
+            let resp = alter(
+                broker_with_writer(w.clone()),
+                Request {
+                    deletions: vec![],
+                    upsertions,
+                },
+            )
+            .await;
+            assert_eq!(codes(&resp), [("a", want)]);
+            assert!(w.calls.lock().is_empty());
+        }
     }
 }

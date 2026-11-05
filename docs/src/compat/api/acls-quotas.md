@@ -269,11 +269,16 @@ answers `INVALID_REQUEST` (42). Empty salt/saltedPassword also answer
 **Deviations from Apache 3.7**:
 
 - **SCRAM-SHA-512 only** — SHA-256 upsertions answer
-  `UNSUPPORTED_SASL_MECHANISM` (33). Apache's own checks run first, so an
-  upsertion Apache would reject gets Apache's answer.
+  `UNSUPPORTED_SASL_MECHANISM` (33). This and the empty-salt check run after
+  Apache's own checks and the duplicate rule, so an upsertion Apache would
+  reject gets Apache's answer (gh #313).
 - **An upsertion can't create a user**: with no `KafkaUser` CR of that name it
   answers `RESOURCE_NOT_FOUND` (91). Apache's upsert never fails this way; in
-  kaas the CR owns the user's lifecycle.
+  kaas the CR owns the user's lifecycle. A name that can't be a CR's (not an RFC
+  1123 subdomain) answers the same, without reaching the API server (gh #313).
+- **A duplicate deletion is 92 even with no credential to delete**, where
+  Apache checks existence first and answers 91. Nothing is written either way,
+  and lone deletions are refused anyway.
 - **Deletions are refused** with `UNSUPPORTED_VERSION` (35): the credential
   lifecycle belongs to the `KafkaUser` CR (delete the CR or change its
   `authentication.type`). The operator would re-materialise anything the

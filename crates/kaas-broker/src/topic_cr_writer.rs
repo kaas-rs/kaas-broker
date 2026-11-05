@@ -391,7 +391,7 @@ pub fn name_for_cr(kafka_name: &str) -> (String, String) {
 /// K8s resource-name validation: lowercase alphanumeric labels with
 /// interior hyphens, dot-separated. Implements the rfc1123
 /// check without pulling the regex crate in.
-fn is_rfc1123_subdomain(s: &str) -> bool {
+pub(crate) fn is_rfc1123_subdomain(s: &str) -> bool {
     !s.is_empty()
         && s.split('.').all(|label| {
             !label.is_empty()
