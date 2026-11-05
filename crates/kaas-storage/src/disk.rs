@@ -304,6 +304,13 @@ impl DiskStorageEngine {
         topic: &str,
         partition: i32,
     ) -> Result<Arc<Partition>, StorageError> {
+        // The last line of defence, whatever route a name took to get here:
+        // a topic name is a path component, so an invalid one must never be
+        // opened, because opening creates the directory (gh #314). The handlers
+        // check too, but this holds for any handler added later.
+        if partition < 0 || !crate::topic_identity::is_valid_topic_name(topic) {
+            return Err(StorageError::UnknownTopicOrPartition);
+        }
         let key = (topic.to_owned(), partition);
         if self.migrating.contains_key(&key) {
             return Err(StorageError::Migrating);
@@ -1299,6 +1306,38 @@ mod tests {
                 "no placement record yet, so nothing for the warning to report"
             );
             e.relinquish_all().await.unwrap();
+        });
+    }
+
+    /// gh #314: the engine refuses to open a name that isn't a valid topic,
+    /// or a negative partition, whichever handler asked. Opening creates the
+    /// directory, so this is what keeps every route inside the data dir.
+    #[test]
+    fn the_engine_never_opens_an_invalid_topic_name() {
+        rt().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let data = tmp.path().join("deep/data");
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let e = DiskStorageEngine::new(fs, data.clone(), PartitionConfig::default());
+            for name in [
+                "../../escaped",
+                "kperf-/../victim",
+                "a/b",
+                "..",
+                "__cluster",
+            ] {
+                assert!(
+                    matches!(
+                        e.create_partition(name, 0).await,
+                        Err(StorageError::UnknownTopicOrPartition)
+                    ),
+                    "{name}"
+                );
+                assert!(e.take_over(name, 0, 1).await.is_err(), "{name}");
+            }
+            assert!(e.create_partition("t", -7).await.is_err());
+            assert!(!tmp.path().join("escaped").exists());
+            assert!(!data.exists(), "nothing may have been created");
         });
     }
 

@@ -60,6 +60,9 @@ Persists a group's consumed positions. Key 8.
 A group's offsets live in a file named after it. A group id is any string, as
 in Apache, so the path-unsafe bytes (`/`, NUL and `%`) are percent-encoded in
 the file name, and a group can't reach outside the offsets directory (gh #314).
+An id too long for a file name (247 bytes after encoding) answers
+`INVALID_GROUP_ID` (24), a deviation: Apache has no such limit. A commit whose
+write fails answers `COORDINATOR_NOT_AVAILABLE` (15) rather than acking it.
 
 **Versions**: v2–v8 (flexible from v8)
 

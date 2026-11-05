@@ -162,6 +162,13 @@ what actually starts the transaction.
 
 **Versions**: v0–v3 (flexible from v3).
 
+A partition that doesn't exist answers `UNKNOWN_TOPIC_OR_PARTITION` (3) and the
+others in the request `OPERATION_NOT_ATTEMPTED` (55), and nothing is added, as in
+Apache (gh #314). EndTxn writes a marker to each recorded partition, so this also
+keeps a transaction from creating one. A recorded partition whose topic has since
+been deleted has nothing to mark and is skipped; one the assignment hasn't caught
+up to stays prepared for the reconcile.
+
 **Handling** — after the shared gates, the store unions the requested
 `(topic, partition)` tuples into the entry's partition list. Validation
 order matches Apache: missing entry → 49, PID mismatch → 49, epoch

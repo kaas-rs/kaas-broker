@@ -101,7 +101,11 @@ pub fn classify(fs: &dyn Fs, topic_dir: &Path, topic_id: &str) -> io::Result<Ide
 }
 
 /// Apache's `Topic.validate`: non-empty, not `.` or `..`, at most 249
-/// characters, and only `[a-zA-Z0-9._-]`.
+/// characters, and only `[a-zA-Z0-9._-]`. Plus two names Apache allows but
+/// kaas can't, because a topic's directory sits in the data dir beside them:
+/// `__cluster` (the default cluster-state dir; a topic there would be reclaimed
+/// along with `acls.json` and the rest) and `.deleting-*` (the reclaim's staging
+/// prefix, which the sweep removes).
 ///
 /// A topic name becomes a directory, so this is what keeps a name inside the
 /// data dir (gh #314). A prefix ACL matches the raw string, so `kperf-/../x`
@@ -115,6 +119,8 @@ pub fn is_valid_topic_name(name: &str) -> bool {
     !name.is_empty()
         && name != "."
         && name != ".."
+        && name != "__cluster"
+        && !name.starts_with(".deleting-")
         && name.len() <= MAX_NAME_LENGTH
         && name
             .bytes()
@@ -218,6 +224,8 @@ mod tests {
             "a%2Fb",
             "caf\u{e9}",
             &"a".repeat(250),
+            "__cluster",
+            ".deleting-foo.1",
         ] {
             assert!(!is_valid_topic_name(bad), "{bad:?}");
         }

@@ -583,8 +583,12 @@ pub(crate) fn stage_topic_dir(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    // Topic names run to 249 characters, and the prefix and timestamp don't
+    // fit in a 255-byte file name on top of that. It only has to be unique,
+    // which the timestamp makes it (gh #314 verification).
+    let short = name.get(..200).unwrap_or(name);
     let staged = data_dir.join(format!(
-        "{}{name}.{nanos}",
+        "{}{short}.{nanos}",
         crate::sweep::STAGED_DELETE_PREFIX
     ));
     match std::fs::rename(&path, &staged) {
@@ -649,6 +653,19 @@ mod tests {
             "the victim's stamp was overwritten"
         );
         assert!(victim.join("0/00000000.log").is_file());
+    }
+
+    /// gh #314 verification: the longest legal topic name can still be staged
+    /// for reclaim. `.deleting-<name>.<nanos>` used to overflow a file name, so
+    /// such a topic couldn't be recreated.
+    #[test]
+    fn the_longest_topic_name_can_be_staged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let name = "a".repeat(249);
+        std::fs::create_dir_all(tmp.path().join(&name).join("0")).unwrap();
+        let staged = stage_topic_dir(tmp.path(), &name).unwrap().expect("staged");
+        assert!(staged.join("0").is_dir());
+        assert!(!tmp.path().join(&name).exists());
     }
 
     /// gh #203: deleting a topic dir frees the LIVE path immediately

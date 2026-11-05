@@ -196,6 +196,12 @@ impl TopicRegistry {
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Has the `KafkaTopic` watch completed a full list? Until it has, a
+    /// topic's absence here means nothing.
+    pub fn is_synced(&self) -> bool {
+        self.synced.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The incarnation this broker believes `topic` is at (gh #241).
     ///
     /// The absent-key case is the subtle one. Before the watch has ever

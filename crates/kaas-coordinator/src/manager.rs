@@ -409,9 +409,20 @@ impl Manager {
             {
                 16
             }
-            // Best-effort: handler logs but reports success per
-            // Apache's "offset commit eventual consistency".
-            Err(_) => 0,
+            Err(e)
+                if e.get_ref()
+                    .is_some_and(|inner| inner.is::<crate::offset_store::GroupIdTooLong>()) =>
+            {
+                24 // INVALID_GROUP_ID
+            }
+            // A write that failed mustn't be acked: the client would treat the
+            // offset as committed, and after a restart it reads as never
+            // committed. COORDINATOR_NOT_AVAILABLE is retriable (gh #314
+            // verification; this used to answer 0 for ENOSPC or EIO).
+            Err(e) => {
+                tracing::warn!(group = group_id, error = %e, "offset commit write failed");
+                15
+            }
         }
     }
 
@@ -882,5 +893,27 @@ mod tests {
         let fresh = manager(tmp.path());
         assert_eq!(state(&fresh, "idle"), "Empty");
         assert_eq!(state(&fresh, "nobody"), "Dead");
+    }
+
+    /// gh #314 verification: a commit that didn't reach the disk isn't acked.
+    /// A write failure is retriable (15), and a group id too long for a file
+    /// name is refused (24); both used to answer 0. An ordinary long id works.
+    #[test]
+    fn a_failed_offset_write_is_not_acked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manager(tmp.path());
+        let commit = |m: &Manager, id: &str| {
+            m.offset_commit(id, HashMap::from([(offset_key("t", 0), 7)]), HashMap::new())
+        };
+        assert_eq!(commit(&m, "g"), 0);
+        // ".json" and ".tmp" must fit in a 255-byte file name.
+        assert_eq!(commit(&m, &"a".repeat(246)), 0);
+        assert_eq!(commit(&m, &"a".repeat(247)), 24);
+        // Encoded: each `/` takes three bytes.
+        assert_eq!(commit(&m, &"/".repeat(90)), 24);
+
+        let blocked = tempfile::tempdir().unwrap();
+        std::fs::write(blocked.path().join("__consumer_offsets"), b"a file").unwrap();
+        assert_eq!(commit(&manager(blocked.path()), "g"), 15);
     }
 }

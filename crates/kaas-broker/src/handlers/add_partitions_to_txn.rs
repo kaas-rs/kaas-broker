@@ -18,6 +18,7 @@ use parking_lot::Mutex;
 use super::principal_from;
 use crate::broker::Broker;
 
+const ERR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 const ERR_INVALID_REQUEST: i16 = 42;
 const ERR_NOT_COORDINATOR: i16 = 16;
 const ERR_COORDINATOR_NOT_AVAILABLE: i16 = 15;
@@ -54,7 +55,7 @@ impl Handler for AddPartitionsToTxnHandler {
 
         let mut resp = match self.classify(&principal, &req) {
             Some(code) => build_response(&req, code),
-            None => match self.authorize_topics(&principal, &req) {
+            None => match self.check_partitions(&principal, &req) {
                 Some(resp) => resp,
                 None => {
                     let code = match self.broker.txn_state() {
@@ -109,11 +110,17 @@ impl AddPartitionsToTxnHandler {
         None
     }
 
-    /// gh #199 per-topic gate — Apache's shape: if any topic in the
-    /// request lacks `Write`, NOTHING is added to the transaction;
-    /// denied topics answer `TOPIC_AUTHORIZATION_FAILED` and the rest
-    /// `OPERATION_NOT_ATTEMPTED`. Returns `None` when fully authorized.
-    fn authorize_topics(
+    /// Apache's per-partition gate: a topic without `Write` answers
+    /// `TOPIC_AUTHORIZATION_FAILED` (gh #199), a partition that doesn't exist
+    /// `UNKNOWN_TOPIC_OR_PARTITION` (gh #314), and if either fired, NOTHING is
+    /// added and the rest answer `OPERATION_NOT_ATTEMPTED`. Returns `None`
+    /// when every partition passes.
+    ///
+    /// The existence check isn't only parity. EndTxn writes a marker to each
+    /// partition recorded here, and writing creates the partition, so an
+    /// unchecked name was a route outside the data dir and could conjure
+    /// phantom partitions under a real topic.
+    fn check_partitions(
         &self,
         principal: &Principal,
         req: &add_partitions_to_txn::Request,
@@ -130,29 +137,39 @@ impl AddPartitionsToTxnHandler {
             })
             .map(|t| t.name.as_str())
             .collect();
-        if denied.is_empty() {
+        let exists = |topic: &str, partition: i32| {
+            self.broker
+                .topics
+                .get(topic)
+                .is_some_and(|m| (0..m.partition_count).contains(&partition))
+        };
+        let all_pass = denied.is_empty()
+            && req
+                .topics
+                .iter()
+                .all(|t| t.partitions.iter().all(|p| exists(&t.name, *p)));
+        if all_pass {
             return None;
         }
         let results = req
             .topics
             .iter()
-            .map(|t| {
-                let code = if denied.contains(t.name.as_str()) {
-                    ERR_TOPIC_AUTHZ_FAILED
-                } else {
-                    ERR_OPERATION_NOT_ATTEMPTED
-                };
-                add_partitions_to_txn::TopicResult {
-                    name: t.name.clone(),
-                    partition_results: t
-                        .partitions
-                        .iter()
-                        .map(|p| add_partitions_to_txn::PartitionResult {
-                            partition_index: *p,
-                            error_code: code,
-                        })
-                        .collect(),
-                }
+            .map(|t| add_partitions_to_txn::TopicResult {
+                name: t.name.clone(),
+                partition_results: t
+                    .partitions
+                    .iter()
+                    .map(|p| add_partitions_to_txn::PartitionResult {
+                        partition_index: *p,
+                        error_code: if denied.contains(t.name.as_str()) {
+                            ERR_TOPIC_AUTHZ_FAILED
+                        } else if !exists(&t.name, *p) {
+                            ERR_UNKNOWN_TOPIC_OR_PARTITION
+                        } else {
+                            ERR_OPERATION_NOT_ATTEMPTED
+                        },
+                    })
+                    .collect(),
             })
             .collect();
         Some(add_partitions_to_txn::Response {
@@ -245,12 +262,13 @@ mod tests {
     fn broker_with_txn() -> (tempfile::TempDir, Arc<Broker>) {
         let tmp = tempfile::tempdir().unwrap();
         let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
-        let b = Arc::new(Broker::new(
-            engine,
-            Arc::new(TopicRegistry::new()),
-            "test",
-            0,
-        ));
+        let topics = Arc::new(TopicRegistry::new());
+        topics.insert(crate::topic_registry::TopicMeta {
+            name: "t".to_owned(),
+            partition_count: 2,
+            topic_id: [0; 16],
+        });
+        let b = Arc::new(Broker::new(engine, topics, "test", 0));
         b.install_txn_state(Arc::new(TxnStateStore::open(tmp.path(), 0).unwrap()));
         (tmp, b)
     }
@@ -296,9 +314,17 @@ mod tests {
     ) -> (tempfile::TempDir, Arc<Broker>) {
         let tmp = tempfile::tempdir().unwrap();
         let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let topics = Arc::new(TopicRegistry::new());
+        for name in ["allowed", "secret", "t", "orders", "audit"] {
+            topics.insert(crate::topic_registry::TopicMeta {
+                name: name.to_owned(),
+                partition_count: 2,
+                topic_id: [0; 16],
+            });
+        }
         let b = Arc::new(Broker::with_auth(
             engine,
-            Arc::new(TopicRegistry::new()),
+            topics,
             "test",
             0,
             auth,
@@ -473,5 +499,58 @@ mod tests {
                 .collect();
             assert_eq!(codes, [want], "v{version}");
         }
+    }
+
+    /// gh #314: a partition that doesn't exist is Apache's
+    /// UNKNOWN_TOPIC_OR_PARTITION (3), the others in the request are
+    /// OPERATION_NOT_ATTEMPTED (55), and nothing is added. EndTxn writes a
+    /// marker to each recorded partition, and writing creates it, so this used
+    /// to reach outside the data dir with a path-like name.
+    #[tokio::test]
+    async fn a_partition_that_does_not_exist_is_3_and_nothing_is_added() {
+        let (_t, b) = broker_with_txn();
+        let store = b.txn_state().unwrap();
+        let (pid, epoch) = store.get_or_allocate("tx-1", || 42).unwrap();
+        let h = AddPartitionsToTxnHandler::new(b);
+        let topic = |name: &str, partitions: Vec<i32>| add_partitions_to_txn::Topic {
+            name: name.into(),
+            partitions,
+        };
+        let req = add_partitions_to_txn::Request {
+            transactional_id: "tx-1".into(),
+            producer_id: pid,
+            producer_epoch: epoch,
+            topics: vec![
+                topic("t", vec![0, 1, 2, -7, 99]),
+                topic("../../escaped", vec![0]),
+                topic("missing", vec![0]),
+            ],
+        };
+        let resp = call(&h, &req).await;
+        let codes: Vec<(&str, i32, i16)> = resp
+            .results
+            .iter()
+            .flat_map(|t| {
+                t.partition_results
+                    .iter()
+                    .map(|p| (t.name.as_str(), p.partition_index, p.error_code))
+            })
+            .collect();
+        assert_eq!(
+            codes,
+            [
+                ("t", 0, 55),
+                ("t", 1, 55),
+                ("t", 2, 3),
+                ("t", -7, 3),
+                ("t", 99, 3),
+                ("../../escaped", 0, 3),
+                ("missing", 0, 3),
+            ]
+        );
+        assert!(
+            store.snapshot()["tx-1"].partitions.is_empty(),
+            "nothing added"
+        );
     }
 }

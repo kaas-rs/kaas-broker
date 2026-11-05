@@ -343,6 +343,9 @@ impl Handler for MetadataHandler {
                     // has no flag and decodes to Apache's `true` default.
                     let error_code = if self.auto_create && req.allow_auto_topic_creation {
                         self.auto_create_topic(&principal, &name).await
+                    } else if !kaas_storage::is_valid_topic_name(&name) {
+                        // Apache's `Topic.validate` on this path too (gh #314).
+                        ERR_INVALID_TOPIC_EXCEPTION
                     } else {
                         ERR_UNKNOWN_TOPIC_OR_PARTITION
                     };
@@ -623,6 +626,9 @@ mod tests {
             assert_eq!(error_code_for(&h, name, true).await, 17, "{name}");
         }
         assert!(writer.calls().is_empty(), "an invalid name was minted");
+        // Without auto-create too; a valid unknown name stays 3.
+        assert_eq!(error_code_for(&h, "a/b", false).await, 17);
+        assert_eq!(error_code_for(&h, "unknown", false).await, 3);
     }
 
     #[tokio::test]

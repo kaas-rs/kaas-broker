@@ -78,6 +78,11 @@ appear in the Application tree without being prune targets — see
 - The v7+ response `topic_id` ([KIP-516](../kip/kip-516.md)) is always the
   all-zero UUID: the real TopicID is minted by the operator on first
   reconcile, after the response has gone out.
+- Two names Apache allows are refused with `INVALID_TOPIC_EXCEPTION` (17),
+  because a topic's directory sits in the data dir beside them: `__cluster` (the
+  default cluster-state dir) and `.deleting-*` (the reclaim's staging prefix).
+  Apache's check that `a.b` collides with `a_b` isn't implemented: kaas's metric
+  names don't collapse the two.
 - `replication_factor` is accepted and echoed but has no effect — kaas is
   single-writer-per-partition by design (see [Non-goals](../non-goals.md)).
   Likewise a manual assignment's broker ids only shape the partition count:

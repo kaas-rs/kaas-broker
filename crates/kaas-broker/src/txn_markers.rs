@@ -68,7 +68,34 @@ pub async fn dispatch_markers(
     let coord = broker.coordinator();
     for TxnTopic { topic, partitions } in partitions {
         for &p in partitions {
-            let leader = coord.as_ref().and_then(|c| c.leader_for(topic, p));
+            let leader = match coord.as_ref() {
+                None => None, // dev mode: everything is local
+                Some(c) => match c.leader_for(topic, p) {
+                    Some(leader) => Some(leader),
+                    None => {
+                        // Unassigned with a coordinator installed. Treating
+                        // this as local created the partition to write the
+                        // marker, conjuring a directory for a topic that no
+                        // longer exists (gh #314). A topic that's gone has
+                        // nothing to mark. Anything else (the watch hasn't
+                        // listed yet, or the assignment hasn't caught up to
+                        // the topic) stays prepared, and the reconcile retries.
+                        let exists = broker
+                            .topics
+                            .get(topic)
+                            .is_some_and(|m| (0..m.partition_count).contains(&p));
+                        if broker.topics.is_synced() && !exists {
+                            tracing::info!(
+                                topic,
+                                partition = p,
+                                "txn marker skipped: the partition no longer exists"
+                            );
+                            continue;
+                        }
+                        return Err(ERR_COORDINATOR_NOT_AVAILABLE);
+                    }
+                },
+            };
             by_target
                 .entry(leader)
                 .or_default()
@@ -82,7 +109,7 @@ pub async fn dispatch_markers(
     let mut queued: HashMap<String, Vec<(String, i32)>> = HashMap::new();
     for (target, parts) in by_target {
         match target {
-            None => local_partitions.extend(parts), // dev mode
+            None => local_partitions.extend(parts), // dev mode only, see above
             Some(id) if id == self_id => local_partitions.extend(parts),
             Some(id) => {
                 queued.entry(id).or_default().extend(parts);
@@ -410,5 +437,62 @@ mod tests {
             TxnState::PrepareCommit,
             "another broker's transaction must be left alone"
         );
+    }
+
+    /// gh #314: with a coordinator installed, an unassigned partition is not
+    /// "local". Writing its marker created the partition, conjuring a directory
+    /// for a topic that doesn't exist, and with a path-like name, one outside
+    /// the data dir. A topic that's gone has nothing to mark; otherwise the
+    /// transaction stays prepared for the reconcile.
+    #[tokio::test]
+    async fn an_unassigned_partition_is_never_written_locally() {
+        use crate::handlers::test_cluster;
+        use crate::topic_registry::{TopicMeta, TopicRegistry};
+        use kaas_storage::{DiskStorageEngine, Fs, PartitionConfig, RealFs, StorageEngine};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("deep/data");
+        let cluster = tempfile::tempdir().unwrap();
+        let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+        let engine: Arc<dyn StorageEngine> = Arc::new(DiskStorageEngine::new(
+            fs,
+            data.clone(),
+            PartitionConfig::default(),
+        ));
+        let topics = Arc::new(TopicRegistry::new());
+        topics.insert(TopicMeta {
+            name: "real".to_owned(),
+            partition_count: 1,
+            topic_id: [0; 16],
+        });
+        let b = Arc::new(Broker::new(engine, topics, "test", 0));
+        test_cluster::install(&b, cluster.path(), &[]);
+        let dispatch = |topic: &str, partition: i32| {
+            let b = b.clone();
+            let parts = vec![TxnTopic {
+                topic: topic.to_owned(),
+                partitions: vec![partition],
+            }];
+            async move { dispatch_markers(&b, "tx", 7, 0, true, &parts).await }
+        };
+
+        // Before the watch has listed, absence means nothing: retry.
+        assert!(dispatch("gone", 0).await.is_err());
+        b.topics.mark_synced();
+        // Listed and absent: gone, so there's nothing to mark.
+        for (topic, partition) in [
+            ("gone", 0),
+            ("../../escaped", 0),
+            ("real", 99),
+            ("real", -7),
+        ] {
+            assert_eq!(dispatch(topic, partition).await, Ok(()), "{topic}");
+        }
+        // It exists, and the assignment hasn't caught up: retry.
+        assert!(dispatch("real", 0).await.is_err());
+
+        assert!(!tmp.path().join("escaped").exists());
+        assert!(!data.join("gone").exists());
+        assert!(!data.join("real").exists());
     }
 }

@@ -151,6 +151,16 @@ struct PendingKey {
     producer_id: i64,
 }
 
+/// A group id too long to be a file name. Apache allows it; kaas keeps each
+/// group's offsets in a file named after it, so this is a documented limit,
+/// answered `INVALID_GROUP_ID` rather than a failed write that looks retriable.
+#[derive(Debug, thiserror::Error)]
+#[error("group id too long for a file name")]
+pub struct GroupIdTooLong;
+
+/// The longest file name, less the `.tmp` the atomic write adds.
+const MAX_GROUP_FILE_NAME: usize = 255 - ".tmp".len();
+
 /// The file holding `group_id`'s offsets. Apache allows any string as a group
 /// id, because it keeps them in a log; here it becomes a file name, so a
 /// separator would let a group ACL matching `../acls` overwrite the cluster's
@@ -324,6 +334,9 @@ impl OffsetStore {
         offsets: HashMap<String, i64>,
         metadata: HashMap<String, String>,
     ) -> io::Result<()> {
+        if group_file_name(group_id).len() > MAX_GROUP_FILE_NAME {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, GroupIdTooLong));
+        }
         // The merge below rewrites the whole file from the cache entry,
         // so an entry that doesn't hold the file yet would erase every
         // offset this commit doesn't name.
