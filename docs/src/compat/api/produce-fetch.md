@@ -27,10 +27,12 @@ partition per the applied `assignment.json` (else
 `NOT_LEADER_FOR_PARTITION`, 6); and the controller-connectivity self-fence
 must see a fresh controller heartbeat — a broker cut off from the
 controller stops acking within 3 s (also 6). Between the existence and
-leadership checks, the records must be exactly one magic-v2 batch whose
-`batchLength` spans the field, as Apache's `ProduceRequest.validateRecords`
-requires (`INVALID_RECORD`, 87; a length too small to be a batch, or an unknown
-magic, is `CORRUPT_MESSAGE`, 2). ZSTD below Produce v7 is
+leadership checks, the records must be exactly one magic-v2 batch, as Apache's
+`ProduceRequest.validateRecords` requires (`INVALID_RECORD`, 87; a length too
+small to be a batch, or an unknown magic, is `CORRUPT_MESSAGE`, 2). An
+incomplete tail after the batch isn't a second batch: it is dropped, as
+Apache's `trimInvalidBytes` does (gh #307). Invalid `acks` answer
+`INVALID_REQUIRED_ACKS` (21) and null records `UNKNOWN_SERVER_ERROR` (-1). ZSTD below Produce v7 is
 `UNSUPPORTED_COMPRESSION_TYPE` (76). A base offset other than 0 is
 `INVALID_RECORD` (87). A batch larger
 than Apache's `message.max.bytes` default (1 MiB + 12 bytes batch overhead)

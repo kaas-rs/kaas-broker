@@ -65,6 +65,7 @@ const ERR_RECORD_LIST_TOO_LARGE: i16 = 18;
 /// from `KAAS_MAX_MESSAGE_BYTES` (gh #253).
 const DEFAULT_MAX_MESSAGE_BYTES: usize = 1_048_588;
 const ERR_TOPIC_AUTHORIZATION_FAILED: i16 = 29;
+const ERR_INVALID_REQUIRED_ACKS: i16 = 21;
 const ERR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
 const ERR_UNSUPPORTED_COMPRESSION_TYPE: i16 = 76;
 const ERR_INVALID_RECORD: i16 = 87;
@@ -262,10 +263,16 @@ impl ProduceHandler {
         // Apache's `ProduceRequest.validateRecords`, which runs before the
         // leadership check: exactly one magic-v2 batch spanning the field,
         // and no ZSTD below v7.
-        if let Some(records) = p.records.as_deref() {
-            if let Err(code) = validate_structure(records, version) {
-                return error_partition_bumped(topic, p.index, code);
-            }
+        let batch_size = match p.records.as_deref().map(|r| validate_structure(r, version)) {
+            Some(Ok(size)) => Some(size),
+            Some(Err(code)) => return error_partition_bumped(topic, p.index, code),
+            None => None,
+        };
+
+        // Apache's `ReplicaManager.appendRecords` refuses these acks before
+        // it looks at leadership.
+        if !matches!(acks, -1..=1) {
+            return error_partition_bumped(topic, p.index, ERR_INVALID_REQUIRED_ACKS);
         }
 
         // Phase 5 cluster check: a real `Coordinator` answers "do I
@@ -289,17 +296,13 @@ impl ProduceHandler {
             }
         }
 
-        let Some(records) = p.records.clone() else {
-            // Null records is a no-op produce per Apache. Echo the
-            // current HWM so the client's offset accounting stays
-            // sane.
-            let base = self
-                .broker
-                .engine
-                .high_watermark(topic, p.index)
-                .unwrap_or(0);
-            return ok_partition(p.index, base, 0);
+        // Null records: Apache's append path has no records to read and
+        // answers UNKNOWN_SERVER_ERROR (gh #307).
+        let (Some(records), Some(batch_size)) = (p.records.clone(), batch_size) else {
+            return error_partition_bumped(topic, p.index, ERR_GENERIC);
         };
+        // An incomplete tail isn't part of the batch (`trimInvalidBytes`).
+        let records = records.slice(..batch_size);
 
         // UnifiedLog's `analyzeAndValidateRecords`: a client's batch starts
         // at 0. The base offset is rewritten on append, so this one only
@@ -374,47 +377,62 @@ impl ProduceHandler {
     }
 }
 
-/// The structural half of Apache's record validation. Reads the batch
-/// header only, so byte opacity holds.
-/// - Fewer than 12 bytes, or a `batchLength` that runs past the field,
-///   is no batch at all: `INVALID_RECORD`.
-/// - A `batchLength` too small for a v2 header is `CORRUPT_MESSAGE`.
-/// - Magic 0/1 is `INVALID_RECORD` ("must use magic v2"); any other value
-///   is `CORRUPT_MESSAGE`.
-/// - ZSTD below Produce v7 is `UNSUPPORTED_COMPRESSION_TYPE` (76).
-/// - Bytes after the batch, i.e. a second batch, is `INVALID_RECORD`
-///   ("exactly one record batch per partition").
-fn validate_structure(records: &[u8], version: i16) -> Result<(), i16> {
-    /// A v2 batch header after `baseOffset` + `batchLength`.
-    const MIN_V2_BATCH_LENGTH: usize = 61 - 12;
-    let Some(len4) = records.get(8..12) else {
-        return Err(ERR_INVALID_RECORD);
+/// One step of Apache's batch iterator (`ByteBufferLogInputStream.nextBatch`)
+/// over `rest`: the size of the whole batch at its front, `None` if there
+/// isn't a complete one, or `CORRUPT_MESSAGE` for a length too small to be
+/// any record format or an impossible magic.
+fn next_batch_size(rest: &[u8]) -> Result<Option<usize>, i16> {
+    /// `LegacyRecord.RECORD_OVERHEAD_V0`, the iterator's lower bound.
+    const MIN_BATCH_LENGTH: i32 = 14;
+    /// `HEADER_SIZE_UP_TO_MAGIC`.
+    const BYTES_THROUGH_MAGIC: usize = 17;
+    let Some(len4) = rest.get(8..12) else {
+        return Ok(None);
     };
     let declared = i32::from_be_bytes([len4[0], len4[1], len4[2], len4[3]]);
-    let Some(len) = usize::try_from(declared)
-        .ok()
-        .filter(|&l| l >= MIN_V2_BATCH_LENGTH)
-    else {
+    if declared < MIN_BATCH_LENGTH {
         return Err(ERR_CORRUPT_MESSAGE);
-    };
-    let total = 12 + len;
-    if total > records.len() {
-        return Err(ERR_INVALID_RECORD);
     }
-    match records[16] {
-        2 => {}
-        0 | 1 => return Err(ERR_INVALID_RECORD),
-        _ => return Err(ERR_CORRUPT_MESSAGE),
+    if rest.len() < BYTES_THROUGH_MAGIC {
+        return Ok(None);
+    }
+    if rest[16] > 2 {
+        return Err(ERR_CORRUPT_MESSAGE);
+    }
+    let size = 12 + usize::try_from(declared).unwrap_or(usize::MAX - 12);
+    Ok((size <= rest.len()).then_some(size))
+}
+
+/// The structural half of Apache's record validation, returning the size
+/// of the one batch to append. Reads the batch header only, so byte opacity
+/// holds. Follows the iterator's rules (gh #307):
+/// - No complete batch is `INVALID_RECORD`.
+/// - Magic 0/1 is `INVALID_RECORD` ("must use magic v2").
+/// - ZSTD below Produce v7 is `UNSUPPORTED_COMPRESSION_TYPE` (76).
+/// - A complete second batch is `INVALID_RECORD` ("exactly one record batch
+///   per partition"). An incomplete tail isn't a batch at all: Apache's
+///   `trimInvalidBytes` drops it, and so does the caller here.
+/// - A magic-2 batch too short for its header is `CORRUPT_MESSAGE`, where
+///   Apache's `isValid` fails it.
+fn validate_structure(records: &[u8], version: i16) -> Result<usize, i16> {
+    let Some(size) = next_batch_size(records)? else {
+        return Err(ERR_INVALID_RECORD);
+    };
+    if records[16] != 2 {
+        return Err(ERR_INVALID_RECORD);
     }
     if version < ZSTD_MIN_PRODUCE_VERSION
         && batch_attributes(records) & ATTR_COMPRESSION_MASK == COMPRESSION_ZSTD
     {
         return Err(ERR_UNSUPPORTED_COMPRESSION_TYPE);
     }
-    if total != records.len() {
+    if next_batch_size(&records[size..])?.is_some() {
         return Err(ERR_INVALID_RECORD);
     }
-    Ok(())
+    if size < V2_HEADER_BYTES {
+        return Err(ERR_CORRUPT_MESSAGE);
+    }
+    Ok(size)
 }
 
 // Header readers for a batch `validate_structure` has accepted, so all 61
@@ -850,7 +868,8 @@ mod tests {
             ("length -1", with_length(&good, -1), 2),
             ("length past the field", with_length(&good, real + 1), 87),
             ("length i32::MAX", with_length(&good, i32::MAX), 87),
-            ("trailing bytes", with_length(&good, real - 1), 87),
+            // One short: a batch whose CRC can't match, plus a one-byte tail.
+            ("length one short", with_length(&good, real - 1), 2),
             ("two batches", Bytes::from(two), 87),
             ("magic 1", Bytes::from(magic1), 87),
             ("magic 9", Bytes::from(magic9), 2),
@@ -1016,5 +1035,82 @@ mod tests {
                 .await;
             assert_eq!(r.error_code, want, "v{version}");
         }
+    }
+
+    /// gh #307: Apache's iterator ends at an incomplete tail rather than
+    /// failing, and `trimInvalidBytes` drops it, so the batch in front lands
+    /// and only its own bytes are stored. A *complete* second batch is 87.
+    #[tokio::test]
+    async fn an_incomplete_tail_is_trimmed_not_refused() {
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        let good = batch(0, -1, -1);
+        for (what, tail) in [
+            ("5 stray bytes", good[..5].to_vec()),
+            ("a partial batch", good[..30].to_vec()),
+        ] {
+            let b = txn_broker(Arc::new(DenyNamedAuthorizer("nobody")));
+            let mut records = good.to_vec();
+            records.extend_from_slice(&tail);
+            assert_eq!(
+                produce_two(&b, None, Bytes::from(records), batch(0, -1, -1)).await,
+                [0, 0],
+                "{what}"
+            );
+            let stored = b.engine.read("orders", 0, 0, 1 << 20).await.unwrap();
+            assert_eq!(stored.len(), good.len(), "{what}: the tail was stored");
+        }
+    }
+
+    /// gh #307: the short-field and magic orderings, Apache's literal codes
+    /// from sending the same bytes to a 3.7.2 broker.
+    #[tokio::test]
+    async fn short_fields_answer_apaches_codes() {
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        let with = |len: usize, declared: i32, magic: u8| {
+            let mut v = vec![0u8; len];
+            v[8..12].copy_from_slice(&declared.to_be_bytes());
+            if len > 16 {
+                v[16] = magic;
+            }
+            Bytes::from(v)
+        };
+        for (what, records, code) in [
+            ("15 bytes, length 20", with(15, 20, 2), 87),
+            ("length 20, magic 1", with(32, 20, 1), 87),
+            ("length 20, magic 2", with(32, 20, 2), 2),
+            ("length 13", with(32, 13, 2), 2),
+        ] {
+            let b = txn_broker(Arc::new(DenyNamedAuthorizer("nobody")));
+            assert_eq!(
+                produce_two(&b, None, records, batch(0, -1, -1)).await,
+                [code, 0],
+                "{what}"
+            );
+        }
+    }
+
+    /// gh #307: invalid acks are Apache's INVALID_REQUIRED_ACKS (21), and
+    /// null records its UNKNOWN_SERVER_ERROR (-1). Neither writes anything.
+    #[tokio::test]
+    async fn invalid_acks_and_null_records() {
+        let h = ProduceHandler::new(broker_with_topic("known", 1));
+        let anon = Principal::anonymous();
+        let good = produce::PartitionData {
+            index: 0,
+            records: Some(batch(0, -1, -1)),
+        };
+        for acks in [2, -2] {
+            let r = h.append_one(&anon, "known", &good, acks, 9).await;
+            assert_eq!(r.error_code, 21, "acks {acks}");
+        }
+        let null = produce::PartitionData {
+            index: 0,
+            records: None,
+        };
+        assert_eq!(
+            h.append_one(&anon, "known", &null, -1, 9).await.error_code,
+            -1
+        );
+        assert_eq!(h.broker.engine.high_watermark("known", 0).unwrap_or(0), 0);
     }
 }
