@@ -129,11 +129,10 @@ pub fn parse_batch_producer_info(raw: &[u8]) -> Result<BatchProducerInfo, Idempo
         producer_id,
         epoch,
         first_seq: base_seq,
-        // `last_seq = first_seq + last_offset_delta`. For PID == -1
-        // the values are arbitrary and ignored downstream, so we
-        // don't validate overflow here — the silent
-        // promotion is intentional.
-        last_seq: base_seq.wrapping_add(last_offset_delta),
+        // `last_seq = first_seq + last_offset_delta`, wrapping past
+        // i32::MAX to 0 as producers do. For PID == -1 the values are
+        // arbitrary and ignored downstream.
+        last_seq: increment_sequence(base_seq, last_offset_delta),
     })
 }
 
@@ -225,6 +224,23 @@ pub fn parse_batch_txn_info(raw: &[u8]) -> Option<BatchTxnInfo> {
 // Pure classifier
 // ---------------------------------------------------------------------------
 
+/// Apache's `DefaultRecordBatch.incrementSequence`: sequences wrap from
+/// i32::MAX to 0, not to i32::MIN (gh #306).
+fn increment_sequence(sequence: i32, increment: i32) -> i32 {
+    let next = i64::from(sequence) + i64::from(increment);
+    let wrapped = if next > i64::from(i32::MAX) {
+        next - i64::from(i32::MAX) - 1
+    } else {
+        next
+    };
+    i32::try_from(wrapped).unwrap_or(i32::MAX)
+}
+
+/// Apache's `ProducerAppendInfo.inSequence`.
+fn in_sequence(last_seq: i32, next_seq: i32) -> bool {
+    i64::from(next_seq) == i64::from(last_seq) + 1 || (next_seq == 0 && last_seq == i32::MAX)
+}
+
 /// Decide what to do with `info` given the partition's current
 /// per-PID map. Pure function: no I/O, no mutation. Caller holds the
 /// partition mutex throughout the `classify → record_accepted` pair.
@@ -242,15 +258,12 @@ pub fn classify(states: &HashMap<i64, ProducerEntry>, info: BatchProducerInfo) -
 
     let entry = match states.get(&info.producer_id) {
         Some(e) => e,
-        None => {
-            // First batch ever from this PID. First-seq must be 0;
-            // anything else is a gap.
-            return if info.first_seq == 0 {
-                Outcome::Accept
-            } else {
-                Outcome::OutOfOrder
-            };
-        }
+        // No state for this PID: any sequence is accepted, as in Apache's
+        // `ProducerAppendInfo.checkSequence`. A live producer legitimately
+        // arrives here with a non-zero sequence once its entry has expired
+        // or its records have been deleted; refusing it wedged the producer
+        // on 45 (gh #306).
+        None => return Outcome::Accept,
     };
 
     if info.epoch > entry.epoch {
@@ -286,7 +299,7 @@ pub fn classify(states: &HashMap<i64, ProducerEntry>, info: BatchProducerInfo) -
     }
 
     let last = entry.recent[entry.recent.len() - 1];
-    if info.first_seq == last.last_seq.wrapping_add(1) {
+    if in_sequence(last.last_seq, info.first_seq) {
         Outcome::Accept
     } else {
         Outcome::OutOfOrder
@@ -510,10 +523,12 @@ mod tests {
     }
 
     #[test]
-    fn fresh_pid_first_seq_must_be_zero() {
+    fn a_pid_with_no_state_accepts_any_sequence() {
         let m = HashMap::new();
         assert_eq!(classify(&m, pi(1, 0, 0, 0)), Outcome::Accept);
-        assert_eq!(classify(&m, pi(1, 0, 5, 5)), Outcome::OutOfOrder);
+        // gh #306: Apache's rule. The PID's state may have expired or been
+        // deleted while the producer lives on.
+        assert_eq!(classify(&m, pi(1, 0, 5, 5)), Outcome::Accept);
     }
 
     #[test]
@@ -611,5 +626,30 @@ mod tests {
             restored.classify(pi(2, 3, 0, 4)),
             Outcome::Duplicate { base_offset: 200 }
         );
+    }
+
+    /// gh #306: sequences wrap from i32::MAX to 0 (Apache's
+    /// `incrementSequence` and `inSequence`). `wrapping_add` went to
+    /// i32::MIN, so a producer that wrapped was refused with 45 for good.
+    #[test]
+    fn sequences_wrap_to_zero() {
+        assert_eq!(increment_sequence(i32::MAX, 1), 0);
+        assert_eq!(increment_sequence(i32::MAX - 1, 4), 2);
+        assert_eq!(increment_sequence(5, 2), 7);
+
+        // Last sequence i32::MAX, next 0.
+        let mut m = HashMap::new();
+        record_accepted(&mut m, pi(1, 0, i32::MAX, i32::MAX), 0);
+        assert_eq!(classify(&m, pi(1, 0, 0, 0)), Outcome::Accept);
+        assert_eq!(classify(&m, pi(1, 0, 1, 1)), Outcome::OutOfOrder);
+
+        // A batch straddling the wrap: base i32::MAX-1, 5 records, last 2.
+        let mut m = HashMap::new();
+        record_accepted(
+            &mut m,
+            pi(1, 0, i32::MAX - 1, increment_sequence(i32::MAX - 1, 4)),
+            0,
+        );
+        assert_eq!(classify(&m, pi(1, 0, 3, 3)), Outcome::Accept);
     }
 }

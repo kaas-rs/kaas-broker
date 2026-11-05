@@ -12,8 +12,8 @@ pub enum StorageError {
     #[error("epoch mismatch")]
     EpochMismatch,
 
-    /// Idempotent-producer guard: the batch's sequence has a gap or
-    /// starts after a non-zero value on a fresh PID. Wire error 45.
+    /// Idempotent-producer guard: the batch's sequence has a gap after the
+    /// producer's last one, or a new epoch doesn't start at 0. Wire error 45.
     #[error("out of order sequence number")]
     OutOfOrderSequence,
 
