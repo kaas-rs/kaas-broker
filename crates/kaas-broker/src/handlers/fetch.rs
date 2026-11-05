@@ -588,4 +588,83 @@ mod tests {
             }
         }
     }
+
+    /// One record of a v2 batch with the given attributes and producer.
+    fn batch_of(attributes: i16, producer_id: i64) -> Bytes {
+        let body = 49 + 16;
+        let mut b = vec![0u8; 12 + body];
+        b[8..12].copy_from_slice(&i32::try_from(body).unwrap().to_be_bytes());
+        b[16] = 2;
+        b[21..23].copy_from_slice(&attributes.to_be_bytes());
+        b[43..51].copy_from_slice(&producer_id.to_be_bytes());
+        if producer_id < 0 {
+            b[53..57].copy_from_slice(&(-1i32).to_be_bytes());
+        }
+        Bytes::from(b)
+    }
+
+    /// gh #310, on the disk engine with a real open transaction. A
+    /// `read_committed` consumer between the LSO and the HWM is caught up,
+    /// not out of range: the bound is the log end, not what it may read.
+    /// Bounding it by the LSO would answer 1 during every open transaction,
+    /// and each such consumer would reset its position.
+    #[tokio::test]
+    async fn read_committed_past_the_lso_is_empty_not_out_of_range() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs: Arc<dyn kaas_storage::Fs> = Arc::new(kaas_storage::RealFs::new());
+        let engine: Arc<dyn StorageEngine> = Arc::new(kaas_storage::DiskStorageEngine::new(
+            fs,
+            tmp.path().to_path_buf(),
+            kaas_storage::PartitionConfig::default(),
+        ));
+        let topics = Arc::new(TopicRegistry::new());
+        topics.insert(TopicMeta {
+            name: "t".to_owned(),
+            partition_count: 1,
+            topic_id: [0; 16],
+        });
+        engine.take_over("t", 0, 1).await.unwrap();
+        // Offsets: 0 stable, 1 the open transaction, 2 written after it.
+        const TRANSACTIONAL: i16 = 0x0010;
+        engine.append("t", 0, 1, -1, batch_of(0, -1)).await.unwrap();
+        engine
+            .append("t", 0, 1, -1, batch_of(TRANSACTIONAL, 42))
+            .await
+            .unwrap();
+        engine.append("t", 0, 1, -1, batch_of(0, -1)).await.unwrap();
+        assert_eq!(engine.high_watermark("t", 0).unwrap(), 3);
+        assert_eq!(engine.last_stable_offset("t", 0).unwrap(), 1);
+
+        let h = FetchHandler::new(Arc::new(Broker::new(engine, topics, "test", 0)));
+        let anon = Principal::anonymous();
+        for (read_committed, fetch_offset, code, has_data) in [
+            (true, 0, 0, true),
+            (true, 1, 0, false), // at the LSO
+            (true, 2, 0, false), // between the LSO and the HWM
+            (true, 3, 0, false), // at the HWM
+            (true, 4, 1, false),
+            (true, -1, 1, false),
+            (false, 2, 0, true),
+            (false, 3, 0, false),
+            (false, 4, 1, false),
+        ] {
+            let part = fetch::Partition {
+                partition_index: 0,
+                current_leader_epoch: -1,
+                fetch_offset,
+                last_fetched_epoch: -1,
+                log_start_offset: -1,
+                partition_max_bytes: 1 << 20,
+            };
+            let r = h.read_one(&anon, "t", &part, read_committed).await;
+            let ctx = format!("offset {fetch_offset}, read_committed {read_committed}");
+            assert_eq!(r.error_code, code, "{ctx}");
+            let records = r.records.as_ref().expect("never null");
+            assert_eq!(!records.is_empty(), has_data, "{ctx}");
+            if code == 0 {
+                assert_eq!(r.high_watermark, 3, "{ctx}");
+                assert_eq!(r.last_stable_offset, 1, "{ctx}");
+            }
+        }
+    }
 }
