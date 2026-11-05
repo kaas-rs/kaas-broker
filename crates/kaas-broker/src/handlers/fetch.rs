@@ -170,6 +170,16 @@ impl FetchHandler {
             .unwrap_or(hwm);
         let read_cap = if read_committed { lso } else { hwm };
 
+        // Apache's `LocalLog.read` / `checkLogStartOffset`: an offset below
+        // log start or past the log end (the HWM here, with no replicas) is
+        // OFFSET_OUT_OF_RANGE, which is what fires a consumer's
+        // `auto.offset.reset`. Answering 0 left a consumer past the end
+        // idling forever, and served one below the start from log start
+        // (gh #310).
+        if p.fetch_offset < log_start || p.fetch_offset > hwm {
+            return error_partition_bumped(topic, p.partition_index, ERR_OFFSET_OUT_OF_RANGE);
+        }
+
         // Reading from the high-watermark forward is the "I'm caught
         // up, give me nothing" case. Engine returns empty Bytes.
         let max_bytes = usize::try_from(p.partition_max_bytes.max(0)).unwrap_or(0);
@@ -246,7 +256,9 @@ impl FetchHandler {
             log_start_offset: log_start,
             aborted_transactions: aborted,
             preferred_read_replica: -1,
-            records: if bytes.is_empty() { None } else { Some(bytes) },
+            // Empty rather than null, as Apache sends it: librdkafka refuses
+            // a null `records` as a parse failure and spins (gh #310).
+            records: Some(bytes),
         }
     }
 }
@@ -298,7 +310,7 @@ fn error_partition(partition_index: i32, error_code: i16) -> fetch::PartitionRes
         log_start_offset: -1,
         aborted_transactions: Vec::new(),
         preferred_read_replica: -1,
-        records: None,
+        records: Some(Bytes::new()),
     }
 }
 
@@ -527,5 +539,53 @@ mod tests {
         engine.take_over("t", 0, 1).await.unwrap();
         let r = h.read_one(&anon, "t", &part, false).await;
         assert_eq!(r.error_code, 0);
+    }
+
+    /// gh #310: an offset below log start or past the HWM is Apache's
+    /// OFFSET_OUT_OF_RANGE (1), at both isolation levels. An offset at the
+    /// HWM is the caught-up case: no error, and empty records, not null.
+    #[tokio::test]
+    async fn offsets_outside_the_log_are_out_of_range() {
+        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let topics = Arc::new(TopicRegistry::new());
+        topics.insert(TopicMeta {
+            name: "t".to_owned(),
+            partition_count: 1,
+            topic_id: [0; 16],
+        });
+        for i in 0..5 {
+            let raw = Bytes::from(mk_v2_batch(i, 1));
+            engine.append("t", 0, 0, -1, raw).await.unwrap();
+        }
+        engine.delete_records("t", 0, 2).await.unwrap();
+        let h = FetchHandler::new(Arc::new(Broker::new(engine, topics, "test", 0)));
+        let anon = Principal::anonymous();
+        for read_committed in [false, true] {
+            for (fetch_offset, code, has_data) in [
+                (-5, 1, false),
+                (-1, 1, false),
+                (0, 1, false),
+                (1, 1, false),
+                (2, 0, true),
+                (4, 0, true),
+                (5, 0, false),
+                (6, 1, false),
+                (999_999, 1, false),
+            ] {
+                let part = fetch::Partition {
+                    partition_index: 0,
+                    current_leader_epoch: -1,
+                    fetch_offset,
+                    last_fetched_epoch: -1,
+                    log_start_offset: -1,
+                    partition_max_bytes: 1 << 20,
+                };
+                let r = h.read_one(&anon, "t", &part, read_committed).await;
+                let ctx = format!("offset {fetch_offset}, read_committed {read_committed}");
+                assert_eq!(r.error_code, code, "{ctx}");
+                let records = r.records.as_ref().expect("never null");
+                assert_eq!(!records.is_empty(), has_data, "{ctx}");
+            }
+        }
     }
 }

@@ -129,7 +129,9 @@ the partition's aborted-txn index with every aborted txn that *overlaps* the
 returned range (its ABORT marker at or after the fetch offset, its first
 offset before the cap — Apache's `collectAbortedTxns`), so the client can
 filter aborted records even when the fetch resumes mid-transaction (gh #277). A reader already at or past the cap gets an
-empty response. Out-of-range offsets map to `OFFSET_OUT_OF_RANGE` (1). The
+empty response. An offset below log start or past the high watermark is
+`OFFSET_OUT_OF_RANGE` (1), which is what fires a consumer's `auto.offset.reset`,
+and an empty partition sends empty records rather than null (gh #310). The
 fetch quota is checked once over the summed response bytes and feeds
 `throttle_time_ms`.
 
