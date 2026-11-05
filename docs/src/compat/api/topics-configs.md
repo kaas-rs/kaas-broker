@@ -50,7 +50,7 @@ factor is the assignment's.
 On v5+ a successful create's row carries the topic's configs (KIP-525, gh #315):
 what DescribeConfigs will report, with overrides from the request as
 `DYNAMIC_TOPIC_CONFIG` and the rest as `DEFAULT_CONFIG`, and the validate-only
-path answers the same. This needs `DescribeConfigs` on the topic. Without it the
+path answers the same. That's kaas's nine keys, against 31 on Apache 3.7.2. This needs `DescribeConfigs` on the topic. Without it the
 topic is still created, as in Apache: `TopicConfigErrorCode` is 29, the counts
 stay at -1 and the configs are empty, so `CreateTopicsResult.config()` fails with
 `TopicAuthorizationException`.
