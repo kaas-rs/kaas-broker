@@ -478,14 +478,17 @@ impl Manager {
                 _ => return NON_EMPTY_GROUP,
             }
         }
-        // Drop in-memory state, then disk. Errors past the in-memory
-        // wipe are swallowed (best-effort) — a stale file
-        // on the PVC is harmless and gets re-cleaned on next
-        // start-up sweep.
+        // Disk, then in-memory state. A delete that didn't land isn't acked
+        // (gh #318): the file would bring the offsets back after a restart, and
+        // answering 0 told the client they were gone. COORDINATOR_NOT_AVAILABLE
+        // is retriable, and the group is as it was for the retry.
+        if let Err(err) = self.offsets.delete(group_id) {
+            tracing::warn!(group = group_id, %err, "group delete failed");
+            return 15;
+        }
         if let Some((_, g)) = self.groups.remove(group_id) {
             g.shutdown();
         }
-        let _ = self.offsets.delete(group_id);
         0
     }
 
@@ -497,7 +500,17 @@ impl Manager {
         }
         match self.offsets.delete_partitions(group_id, keys) {
             Ok(removed) => (0, removed),
-            Err(_) => (0, HashMap::new()),
+            // gh #318: this used to read as "no such offset" (3) per partition.
+            Err(e)
+                if e.get_ref()
+                    .is_some_and(|inner| inner.is::<crate::offset_store::FencedOffsetWrite>()) =>
+            {
+                (16, HashMap::new())
+            }
+            Err(err) => {
+                tracing::warn!(group = group_id, %err, "offset delete failed");
+                (15, HashMap::new())
+            }
         }
     }
 
@@ -915,5 +928,32 @@ mod tests {
         let blocked = tempfile::tempdir().unwrap();
         std::fs::write(blocked.path().join("__consumer_offsets"), b"a file").unwrap();
         assert_eq!(commit(&manager(blocked.path()), "g"), 15);
+    }
+
+    /// gh #318: a delete that didn't land answers a retriable 15, leaves the
+    /// offsets where they were, and works on the retry. DeleteGroups used to
+    /// answer 0 with the file still there, and OffsetDelete 3 per partition.
+    #[test]
+    fn a_delete_that_fails_answers_15_and_the_retry_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let m = manager(tmp.path());
+        let key = offset_key("t", 0);
+        let commit = HashMap::from([(key.clone(), 7)]);
+        assert_eq!(m.offset_commit("g", commit, HashMap::new()), 0);
+
+        let dir = tmp.path().join("__consumer_offsets");
+        let aside = tmp.path().join("aside");
+        std::fs::rename(&dir, &aside).unwrap();
+        std::fs::write(&dir, b"x").unwrap();
+        assert_eq!(m.delete_group("g"), 15);
+        assert_eq!(m.delete_offsets("g", std::slice::from_ref(&key)).0, 15);
+        assert!(m.offsets.has_offsets("g"));
+        std::fs::remove_file(&dir).unwrap();
+        std::fs::rename(&aside, &dir).unwrap();
+
+        let (code, removed) = m.delete_offsets("g", std::slice::from_ref(&key));
+        assert_eq!((code, removed.get(&key)), (0, Some(&true)));
+        assert_eq!(m.delete_group("g"), 0);
+        assert_eq!(m.delete_group("g"), 69);
     }
 }

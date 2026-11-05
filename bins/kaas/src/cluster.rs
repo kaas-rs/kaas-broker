@@ -392,17 +392,21 @@ struct OffsetStoreHook {
 }
 
 impl TxnOffsetHook for OffsetStoreHook {
-    fn on_end_txn(&self, group_id: &str, producer_id: i64, commit: bool) {
-        if commit {
-            if let Err(err) = self.manager.offsets.commit_pending(group_id, producer_id) {
+    fn on_end_txn(&self, group_id: &str, producer_id: i64, commit: bool) -> std::io::Result<()> {
+        if !commit {
+            self.manager.offsets.discard_pending(group_id, producer_id);
+            return Ok(());
+        }
+        self.manager
+            .offsets
+            .commit_pending(group_id, producer_id)
+            .inspect_err(|err| {
                 warn!(
                     group_id, producer_id, %err,
-                    "txn offset hook: commit_pending failed; staged offsets remain pending"
+                    "txn offset hook: commit_pending failed; staged offsets remain \
+                     pending and the transaction stays prepared"
                 );
-            }
-        } else {
-            self.manager.offsets.discard_pending(group_id, producer_id);
-        }
+            })
     }
 }
 

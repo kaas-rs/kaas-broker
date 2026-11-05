@@ -254,13 +254,14 @@ partitions** get one queue file per target broker under
 durably written queue entry is the durability boundary for a peer
 partition, since the peer's `MarkerWatcher` (2 s poll) retries until
 the marker applies. Only once every marker is durable does
-`complete_end_txn` run: `Prepare* → Complete*`, lists cleared,
-`ongoingSinceMs` zeroed, and the offset hook fired per recorded group
-(commit materialises the offsets `TxnOffsetCommit` staged, abort
-discards them). Any dispatch failure answers the retriable
-`COORDINATOR_NOT_AVAILABLE` (15) and leaves the entry prepared — a
-producer retry or the 10 s marker reconcile re-derives the identical
-dispatch set and finishes the job.
+`complete_end_txn` run: the offset hook fires per recorded group (commit
+materialises the offsets `TxnOffsetCommit` staged, abort discards them), then
+`Prepare* → Complete*`, lists cleared, `ongoingSinceMs` zeroed. Any dispatch
+failure, or a commit's offset write failing (gh #318), answers the retriable
+`COORDINATOR_NOT_AVAILABLE` (15) and leaves the entry prepared. A producer retry
+or the 10 s marker reconcile re-derives the identical dispatch set and finishes
+the job. The reconcile also reaches a prepared transaction with no partitions,
+such as an offsets-only one whose producer has gone.
 
 A retried `EndTxn` in the matching `Complete*` state is answered
 idempotently (error 0, no second marker); a direction mismatch or

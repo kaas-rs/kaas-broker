@@ -248,7 +248,11 @@ pub struct EndTxnOutcome {
 /// coord live on the same broker it fires directly; cross-broker
 /// dispatch lands with gh #114.
 pub trait TxnOffsetHook: Send + Sync + 'static {
-    fn on_end_txn(&self, group_id: &str, producer_id: i64, commit: bool);
+    /// Fails when a commit's offsets didn't become durable. The transaction
+    /// then stays prepared, and this runs again for it (gh #318). So it must
+    /// be idempotent: on a retry after a later step failed, the offsets are
+    /// already committed.
+    fn on_end_txn(&self, group_id: &str, producer_id: i64, commit: bool) -> io::Result<()>;
 }
 
 /// Errors mappable to Kafka wire codes by the txn handlers. Keeping
@@ -757,6 +761,12 @@ impl TxnStateStore {
     /// [`Self::prepare_end_txn`] so staged `TxnOffsetCommit` offsets
     /// only become visible once the markers backing them are durable.
     ///
+    /// The hook fires before the entry changes (gh #318). It used to fire
+    /// after, and a failed offset write was only logged: EndTxn answered 0 for
+    /// offsets that were gone, with the groups already cleared, so nothing
+    /// could retry. Now the entry stays prepared and both the producer's retry
+    /// and the reconcile come back here.
+    ///
     /// Idempotent on `Complete*` with a matching `commit`.
     pub fn complete_end_txn(&self, txn_id: &str, pid: i64, epoch: i16, commit: bool) -> Result<()> {
         if txn_id.is_empty() {
@@ -790,18 +800,19 @@ impl TxnStateStore {
             return Err(TxnStateError::InvalidState);
         }
 
+        let hook = self.hook.read().clone();
+        if let Some(hook) = hook {
+            for g in &entry.groups {
+                hook.on_end_txn(g, pid, commit)?;
+            }
+        }
+
         entry.state = want_complete;
-        let groups = std::mem::take(&mut entry.groups);
+        entry.groups.clear();
         entry.partitions.clear();
         entry.ongoing_since_ms = 0;
         state.insert(txn_id.to_owned(), entry);
         self.persist_slot(slot, &state)?;
-        let hook = self.hook.read().clone();
-        if let Some(hook) = hook {
-            for g in &groups {
-                hook.on_end_txn(g, pid, commit);
-            }
-        }
         Ok(())
     }
 
@@ -844,9 +855,10 @@ impl TxnStateStore {
     /// Something has to drive those to completion, or their partitions
     /// keep a pinned LSO indefinitely.
     ///
-    /// Entries with an empty partition list are skipped: there is
-    /// nothing to dispatch, and the caller's `complete_end_txn` closes
-    /// them out on the next pass anyway.
+    /// An entry with an empty partition list is included: it has no markers
+    /// to place, but it still needs completing. An offsets-only transaction
+    /// whose offset write failed sits here, and with its producer gone nothing
+    /// else would finish it (gh #318).
     ///
     /// `owns_txn` gates the sweep exactly as
     /// [`Self::abort_overdue_owned`] does — a slot file has one legal
@@ -873,9 +885,6 @@ impl TxnStateStore {
                     TxnState::PrepareAbort => false,
                     _ => continue,
                 };
-                if entry.partitions.is_empty() {
-                    continue;
-                }
                 if let Some(owns) = owns_txn {
                     if !owns(&txn_id) {
                         continue;
@@ -1343,10 +1352,11 @@ mod tests {
     fn offset_hook_fires_on_complete_not_on_prepare() {
         struct CapturingHook(parking_lot::Mutex<Vec<(String, i64, bool)>>);
         impl TxnOffsetHook for CapturingHook {
-            fn on_end_txn(&self, group_id: &str, producer_id: i64, commit: bool) {
+            fn on_end_txn(&self, group_id: &str, producer_id: i64, commit: bool) -> io::Result<()> {
                 self.0
                     .lock()
                     .push((group_id.to_owned(), producer_id, commit));
+                Ok(())
             }
         }
         let (_t, s) = store();
@@ -1365,6 +1375,53 @@ mod tests {
         s.complete_end_txn("tx-1", pid, epoch, true).unwrap();
         assert_eq!(hook.0.lock().len(), 1);
         assert_eq!(hook.0.lock()[0], ("g1".to_owned(), pid, true));
+    }
+
+    /// gh #318: an offset write that fails keeps the transaction prepared with
+    /// its groups, so it can be retried, and the reconcile can reach it even
+    /// with no partitions (an offsets-only transaction whose producer is gone).
+    #[test]
+    fn a_failed_offset_hook_leaves_the_transaction_prepared() {
+        struct FailingHook {
+            fail: std::sync::atomic::AtomicBool,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl TxnOffsetHook for FailingHook {
+            fn on_end_txn(&self, _: &str, _: i64, _: bool) -> io::Result<()> {
+                self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(io::Error::other("disk full"));
+                }
+                Ok(())
+            }
+        }
+        let (_t, s) = store();
+        let hook = Arc::new(FailingHook {
+            fail: std::sync::atomic::AtomicBool::new(true),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        s.set_offset_hook(hook.clone());
+        let mut a = pid_alloc();
+        let (pid, epoch) = s.get_or_allocate("tx-1", || a()).unwrap();
+        s.add_offsets_to_txn("tx-1", pid, epoch, "g1", 100).unwrap();
+        s.prepare_end_txn("tx-1", pid, epoch, true).unwrap();
+
+        assert!(matches!(
+            s.complete_end_txn("tx-1", pid, epoch, true),
+            Err(TxnStateError::Io(_))
+        ));
+        let entry = s.snapshot()["tx-1"].clone();
+        assert_eq!(entry.state, TxnState::PrepareCommit);
+        assert_eq!(entry.groups.len(), 1, "the retry has to reach the group");
+        let pending = s.pending_marker_dispatches(None);
+        assert_eq!(pending.len(), 1, "the reconcile has to reach it");
+        assert!(pending[0].partitions.is_empty());
+
+        hook.fail.store(false, std::sync::atomic::Ordering::SeqCst);
+        s.complete_end_txn("tx-1", pid, epoch, true).unwrap();
+        assert_eq!(hook.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(s.snapshot()["tx-1"].state, TxnState::CompleteCommit);
+        assert!(s.pending_marker_dispatches(None).is_empty());
     }
 
     #[test]
@@ -1395,10 +1452,11 @@ mod tests {
     fn end_txn_happy_commit_clears_partitions_and_fires_hook() {
         struct CapturingHook(parking_lot::Mutex<Vec<(String, i64, bool)>>);
         impl TxnOffsetHook for CapturingHook {
-            fn on_end_txn(&self, group_id: &str, producer_id: i64, commit: bool) {
+            fn on_end_txn(&self, group_id: &str, producer_id: i64, commit: bool) -> io::Result<()> {
                 self.0
                     .lock()
                     .push((group_id.to_owned(), producer_id, commit));
+                Ok(())
             }
         }
         let (_t, s) = store();
@@ -1473,10 +1531,11 @@ mod tests {
     fn reaper_aborts_overdue_bumps_epoch_fires_hook() {
         struct CapturingHook(parking_lot::Mutex<Vec<(String, i64, bool)>>);
         impl TxnOffsetHook for CapturingHook {
-            fn on_end_txn(&self, group_id: &str, producer_id: i64, commit: bool) {
+            fn on_end_txn(&self, group_id: &str, producer_id: i64, commit: bool) -> io::Result<()> {
                 self.0
                     .lock()
                     .push((group_id.to_owned(), producer_id, commit));
+                Ok(())
             }
         }
         let (_t, s) = store();

@@ -39,7 +39,7 @@ use std::collections::HashMap;
 use std::io;
 use std::path::PathBuf;
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, MutexGuard, RwLock};
 use serde::{Deserialize, Serialize};
 
 use crate::atomic_write::atomic_write_json;
@@ -138,10 +138,11 @@ struct Inner {
     /// gh #27 in-flight transactional offset commits keyed on
     /// `(group_id, producer_id)`. Memory-only.
     pending: HashMap<PendingKey, HashMap<String, i64>>,
-    /// Groups whose cache may be ahead of disk (last write failed or
-    /// was fenced). The gh #167 skip-unchanged fast path must not
-    /// fire for these — an "unchanged" commit is only unchanged
-    /// relative to the cache, and here the cache isn't persisted.
+    /// Groups whose last write failed or was fenced. The cache still holds
+    /// what was last known to be on disk, but a write that failed after its
+    /// rename can have left the file ahead of it, so the gh #167
+    /// skip-unchanged fast path must not fire for these: "unchanged" is only
+    /// unchanged relative to the cache.
     dirty: std::collections::HashSet<String>,
 }
 
@@ -209,7 +210,16 @@ pub struct OffsetStore {
     /// group ownership), absent in dev/tests (zero stamp: fence
     /// effectively off, matching the single-writer reality there).
     fence_source: RwLock<Option<Box<dyn Fn() -> FenceStamp + Send + Sync>>>,
+    /// Serialises each group's writers, striped so it stays bounded. A writer
+    /// holds its stripe across read cache, write file, update cache. The cache
+    /// only moves after the write lands (gh #318), so without this two
+    /// concurrent commits would both merge from the same old cache, and the
+    /// second write would drop the first one's offsets.
+    write_locks: Vec<Mutex<()>>,
 }
+
+/// How many stripes [`OffsetStore::write_locks`] has.
+const WRITE_LOCK_STRIPES: u64 = 64;
 
 impl std::fmt::Debug for OffsetStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -227,7 +237,17 @@ impl OffsetStore {
             root: root.into(),
             state: RwLock::new(Inner::default()),
             fence_source: RwLock::new(None),
+            write_locks: (0..WRITE_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
         }
+    }
+
+    /// The write lock for `group_id`'s stripe.
+    fn write_lock(&self, group_id: &str) -> MutexGuard<'_, ()> {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        group_id.hash(&mut h);
+        let stripe = usize::try_from(h.finish() % WRITE_LOCK_STRIPES).unwrap_or(0);
+        self.write_locks[stripe].lock()
     }
 
     /// Install the gh #167 fence source. Every subsequent disk write
@@ -284,14 +304,15 @@ impl OffsetStore {
             group_id: group_id.to_owned(),
             producer_id,
         };
-        let pending = {
-            let mut s = self.state.write();
-            s.pending.remove(&key)
+        // They stay staged until the commit is durable, so a failed write can
+        // be retried (gh #318). Removing them first lost them, and the caller
+        // had no way to know.
+        let Some(offsets) = self.state.read().pending.get(&key).cloned() else {
+            return Ok(());
         };
-        match pending {
-            None => Ok(()),
-            Some(offsets) => self.commit(group_id, offsets),
-        }
+        self.commit(group_id, offsets)?;
+        self.state.write().pending.remove(&key);
+        Ok(())
     }
 
     /// Drop staged offsets for `(group, pid)` without materialising.
@@ -337,44 +358,61 @@ impl OffsetStore {
         if group_file_name(group_id).len() > MAX_GROUP_FILE_NAME {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, GroupIdTooLong));
         }
+        let _writer = self.write_lock(group_id);
         // The merge below rewrites the whole file from the cache entry,
         // so an entry that doesn't hold the file yet would erase every
         // offset this commit doesn't name.
         self.ensure_loaded(group_id)?;
         let (merged_offsets, merged_meta, changed) = {
-            let mut s = self.state.write();
+            let s = self.state.read();
+            let mut merged = s.cache.get(group_id).cloned().unwrap_or_default();
+            let mut merged_meta = s.metadata.get(group_id).cloned().unwrap_or_default();
             let mut changed = false;
-            let cached = s.cache.entry(group_id.to_owned()).or_default();
             for (k, v) in offsets {
-                if cached.insert(k, v) != Some(v) {
+                if merged.insert(k, v) != Some(v) {
                     changed = true;
                 }
             }
-            let cached_meta = s.metadata.entry(group_id.to_owned()).or_default();
             for (k, v) in metadata {
                 if v.is_empty() {
-                    changed |= cached_meta.remove(&k).is_some();
-                } else if cached_meta.insert(k, v.clone()) != Some(v) {
+                    changed |= merged_meta.remove(&k).is_some();
+                } else if merged_meta.insert(k, v.clone()) != Some(v) {
                     changed = true;
                 }
             }
-            let off = s.cache.get(group_id).cloned().unwrap_or_default();
-            let meta = s.metadata.get(group_id).cloned().unwrap_or_default();
-            (off, meta, changed || s.dirty.contains(group_id))
+            (merged, merged_meta, changed || s.dirty.contains(group_id))
         };
 
         // gh #167 (write amplification): an idle consumer re-commits
         // the same offsets every interval; when the merge moved
         // nothing the on-disk file is already right, so skip the
-        // rewrite entirely. Correct because the cache is write-through
-        // — everything in it was persisted by a previous successful
-        // write, and the dirty set (folded into `changed` above)
-        // excludes the groups where that's not true.
+        // rewrite entirely. Correct because the cache only holds what
+        // a successful write put on disk, and the dirty set (folded
+        // into `changed` above) excludes the groups where the file may
+        // have moved anyway.
         if !changed {
             return Ok(());
         }
 
-        self.write_group(group_id, merged_offsets, merged_meta)
+        self.write_and_cache(group_id, merged_offsets, merged_meta)
+    }
+
+    /// Write the group's file, and only then update the cache, so a failed
+    /// write leaves fetches answering what's on disk (gh #318). The cache
+    /// used to move first: after a failed commit a fetch answered the
+    /// unwritten value, and a restart answered the old one. The caller holds
+    /// [`Self::write_lock`].
+    fn write_and_cache(
+        &self,
+        group_id: &str,
+        offsets: HashMap<String, i64>,
+        metadata: HashMap<String, String>,
+    ) -> io::Result<()> {
+        self.write_group(group_id, offsets.clone(), metadata.clone())?;
+        let mut s = self.state.write();
+        s.cache.insert(group_id.to_owned(), offsets);
+        s.metadata.insert(group_id.to_owned(), metadata);
+        Ok(())
     }
 
     /// The single on-disk write path. Every writer goes through here so
@@ -494,18 +532,23 @@ impl OffsetStore {
     /// an unknown group is `Ok(())` so partial-delete retries from
     /// AdminClient don't surface spurious errors.
     pub fn delete(&self, group_id: &str) -> io::Result<()> {
-        {
-            let mut s = self.state.write();
-            s.cache.remove(group_id);
-            s.metadata.remove(group_id);
-            s.dirty.remove(group_id);
-        }
-        let path = self.dir().join(group_file_name(group_id));
-        match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
+        let _writer = self.write_lock(group_id);
+        let not_found_is_fine = |r: io::Result<()>| match r {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+        // Disk first, and the sync whether or not this attempt did the unlink:
+        // a retry of a failed sync finds nothing to unlink. On failure the
+        // group is as it was, and the answer says so (gh #318).
+        not_found_is_fine(std::fs::remove_file(
+            self.dir().join(group_file_name(group_id)),
+        ))?;
+        not_found_is_fine(crate::atomic_write::fsync_dir(&self.dir()))?;
+        let mut s = self.state.write();
+        s.cache.remove(group_id);
+        s.metadata.remove(group_id);
+        s.dirty.remove(group_id);
+        Ok(())
     }
 
     /// Remove specific `(topic, partition)` offset entries from a
@@ -518,33 +561,31 @@ impl OffsetStore {
         group_id: &str,
         keys: &[String],
     ) -> io::Result<HashMap<String, bool>> {
-        let mut removed = HashMap::new();
+        let _writer = self.write_lock(group_id);
         self.ensure_loaded(group_id)?;
-        let (snap_offsets, snap_meta) = {
-            let mut s = self.state.write();
-            let group = match s.cache.get_mut(group_id) {
-                None => return Ok(removed),
-                Some(g) => g,
+        let (offsets, metadata, removed, dirty) = {
+            let s = self.state.read();
+            let Some(cached) = s.cache.get(group_id) else {
+                return Ok(HashMap::new());
             };
-            for k in keys {
-                if group.remove(k).is_some() {
-                    removed.insert(k.clone(), true);
-                }
-            }
-            let offsets = group.clone();
+            let mut offsets = cached.clone();
             // The metadata map mirrors the offset map; a key dropped
             // from one must go from the other or the next commit
             // rewrites orphan metadata for an offset that no longer
             // exists.
-            if let Some(m) = s.metadata.get_mut(group_id) {
-                for k in removed.keys() {
-                    m.remove(k);
+            let mut metadata = s.metadata.get(group_id).cloned().unwrap_or_default();
+            let mut removed = HashMap::new();
+            for k in keys {
+                if offsets.remove(k).is_some() {
+                    metadata.remove(k);
+                    removed.insert(k.clone(), true);
                 }
             }
-            let meta = s.metadata.get(group_id).cloned().unwrap_or_default();
-            (offsets, meta)
+            (offsets, metadata, removed, s.dirty.contains(group_id))
         };
-        self.write_group(group_id, snap_offsets, snap_meta)?;
+        if !removed.is_empty() || dirty {
+            self.write_and_cache(group_id, offsets, metadata)?;
+        }
         Ok(removed)
     }
 
@@ -580,37 +621,31 @@ impl OffsetStore {
     /// consumer in the group parks past its end and idles forever, with
     /// no error raised on either side.
     pub fn purge_topic(&self, group_id: &str, topic: &str) -> io::Result<usize> {
-        // Cached path. The cache is write-through on every commit, so
-        // for a group this broker coordinates it is the authority.
+        let _writer = self.write_lock(group_id);
+        // Cached path. The cache only holds what reached the disk, so for a
+        // group this broker coordinates it is the authority.
         let cached = {
-            let mut s = self.state.write();
-            match s.cache.get_mut(group_id) {
-                None => None,
-                Some(g) => {
-                    let doomed: Vec<String> = g
-                        .keys()
-                        .filter(|k| key_has_topic(k, topic))
-                        .cloned()
-                        .collect();
-                    for k in &doomed {
-                        g.remove(k);
-                    }
-                    let offsets = g.clone();
-                    if let Some(m) = s.metadata.get_mut(group_id) {
-                        for k in &doomed {
-                            m.remove(k);
-                        }
-                    }
-                    let meta = s.metadata.get(group_id).cloned().unwrap_or_default();
-                    Some((doomed.len(), offsets, meta))
+            let s = self.state.read();
+            s.cache.get(group_id).map(|g| {
+                let mut offsets = g.clone();
+                let mut metadata = s.metadata.get(group_id).cloned().unwrap_or_default();
+                let doomed: Vec<String> = g
+                    .keys()
+                    .filter(|k| key_has_topic(k, topic))
+                    .cloned()
+                    .collect();
+                for k in &doomed {
+                    offsets.remove(k);
+                    metadata.remove(k);
                 }
-            }
+                (doomed.len(), offsets, metadata)
+            })
         };
         if let Some((n, offsets, metadata)) = cached {
             if n == 0 {
                 return Ok(0);
             }
-            self.write_group(group_id, offsets, metadata)?;
+            self.write_and_cache(group_id, offsets, metadata)?;
             return Ok(n);
         }
         // Not in memory: rewrite the file in place. Deliberately does
@@ -1252,6 +1287,148 @@ mod tests {
             }],
         );
         assert_eq!(got.get("t1/0"), Some(&42), "dirty group skipped its retry");
+    }
+
+    /// Make the offsets directory unusable by moving it aside and occupying
+    /// its path with a file. Writes and unlinks both fail, as for root too,
+    /// which a permission bit wouldn't manage. Returns a closure that heals it.
+    fn break_offsets_dir(root: &std::path::Path) -> impl FnOnce() + '_ {
+        let dir = root.join("__consumer_offsets");
+        let aside = root.join("aside");
+        std::fs::rename(&dir, &aside).unwrap();
+        std::fs::write(&dir, b"x").unwrap();
+        move || {
+            std::fs::remove_file(&dir).unwrap();
+            std::fs::rename(&aside, &dir).unwrap();
+        }
+    }
+
+    fn fetch_one(s: &OffsetStore, group: &str) -> Option<i64> {
+        let spec = FetchSpec {
+            topic: "t1".to_owned(),
+            partitions: vec![0],
+        };
+        s.fetch(group, std::slice::from_ref(&spec))
+            .get("t1/0")
+            .copied()
+            .filter(|o| *o >= 0)
+    }
+
+    /// gh #318: after a failed commit a fetch answers what's on disk, not the
+    /// value the client was told failed. It used to answer the unwritten
+    /// value, and the old one after a restart.
+    #[test]
+    fn a_failed_commit_leaves_fetches_on_what_is_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.commit("g", one("t1", 0, 100)).unwrap();
+
+        let heal = break_offsets_dir(tmp.path());
+        s.commit("g", one("t1", 0, 200)).unwrap_err();
+        assert_eq!(fetch_one(&s, "g"), Some(100));
+
+        // A retry of the same value writes it: the group is dirty, and the
+        // cache hasn't got it anyway.
+        heal();
+        s.commit("g", one("t1", 0, 200)).unwrap();
+        assert_eq!(fetch_one(&s, "g"), Some(200));
+        let fresh = store(tmp.path());
+        assert_eq!(fetch_one(&fresh, "g"), Some(200));
+    }
+
+    /// gh #318: a write that failed after its rename can leave the file ahead
+    /// of the cache. A later commit of what the cache holds must still write,
+    /// or the file would keep the value the cache doesn't have.
+    #[test]
+    fn a_failed_write_disables_the_skip_even_for_what_the_cache_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.commit("g", one("t1", 0, 100)).unwrap();
+        let heal = break_offsets_dir(tmp.path());
+        s.commit("g", one("t1", 0, 200)).unwrap_err();
+        heal();
+        // What a rename that landed before its failed sync would leave.
+        OffsetStore::new(tmp.path())
+            .commit("g", one("t1", 0, 200))
+            .unwrap();
+
+        s.commit("g", one("t1", 0, 100)).unwrap();
+        assert_eq!(fetch_one(&store(tmp.path()), "g"), Some(100));
+    }
+
+    /// gh #318: staged offsets stay staged until their commit is durable, so
+    /// the retry has something to commit.
+    #[test]
+    fn a_failed_commit_pending_keeps_the_offsets_staged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.commit("g", one("t1", 0, 100)).unwrap();
+        s.store_pending("g", 7, one("t1", 0, 555));
+
+        let heal = break_offsets_dir(tmp.path());
+        s.commit_pending("g", 7).unwrap_err();
+        assert_eq!(fetch_one(&s, "g"), Some(100));
+        assert!(s.pending_for("g", 7).is_some(), "staged offsets were lost");
+
+        heal();
+        s.commit_pending("g", 7).unwrap();
+        assert!(s.pending_for("g", 7).is_none());
+        assert_eq!(fetch_one(&store(tmp.path()), "g"), Some(555));
+    }
+
+    /// gh #318: a failed delete changes nothing, so the answer can be honest
+    /// and the retry finds the group as it was. Both kinds of delete.
+    #[test]
+    fn a_failed_delete_leaves_the_group_as_it_was() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        s.commit("g", one("t1", 0, 100)).unwrap();
+
+        let heal = break_offsets_dir(tmp.path());
+        s.delete("g").unwrap_err();
+        assert_eq!(fetch_one(&s, "g"), Some(100));
+        assert!(s.has_offsets("g"));
+        let keys = [offset_key("t1", 0)];
+        s.delete_partitions("g", &keys).unwrap_err();
+        assert_eq!(fetch_one(&s, "g"), Some(100));
+        s.purge_topic("g", "t1").unwrap_err();
+        assert_eq!(fetch_one(&s, "g"), Some(100));
+        heal();
+
+        // And it all reaches the file once it can.
+        let removed = s.delete_partitions("g", &keys).unwrap();
+        assert_eq!(removed.get(&keys[0]), Some(&true));
+        assert_eq!(fetch_one(&store(tmp.path()), "g"), None);
+        s.commit("g", one("t1", 0, 100)).unwrap();
+        s.delete("g").unwrap();
+        assert!(!s.has_offsets("g"));
+        assert_eq!(fetch_one(&store(tmp.path()), "g"), None);
+    }
+
+    /// gh #318: the cache now moves after the write, so a group's writers are
+    /// serialised. Otherwise each merges from the same old cache and the last
+    /// write drops the others' offsets. Each thread commits its own partition,
+    /// so all of them must survive.
+    #[test]
+    fn concurrent_commits_to_a_group_keep_each_others_offsets() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = std::sync::Arc::new(store(tmp.path()));
+        let threads: Vec<_> = (0..8)
+            .map(|p| {
+                let s = s.clone();
+                std::thread::spawn(move || s.commit("g", one("t1", p, 1)).unwrap())
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let fresh = store(tmp.path());
+        let spec = FetchSpec {
+            topic: "t1".to_owned(),
+            partitions: (0..8).collect(),
+        };
+        let got = fresh.fetch("g", std::slice::from_ref(&spec));
+        assert_eq!(got.values().filter(|o| **o == 1).count(), 8, "{got:?}");
     }
 
     /// gh #314: a group id is any string, and it becomes a file name. A

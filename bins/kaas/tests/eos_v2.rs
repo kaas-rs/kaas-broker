@@ -101,12 +101,12 @@ struct OffsetHook {
     manager: Arc<Manager>,
 }
 impl TxnOffsetHook for OffsetHook {
-    fn on_end_txn(&self, group_id: &str, producer_id: i64, commit: bool) {
-        if commit {
-            let _ = self.manager.offsets.commit_pending(group_id, producer_id);
-        } else {
+    fn on_end_txn(&self, group_id: &str, producer_id: i64, commit: bool) -> std::io::Result<()> {
+        if !commit {
             self.manager.offsets.discard_pending(group_id, producer_id);
+            return Ok(());
         }
+        self.manager.offsets.commit_pending(group_id, producer_id)
     }
 }
 

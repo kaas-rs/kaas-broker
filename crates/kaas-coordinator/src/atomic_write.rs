@@ -8,7 +8,7 @@ use std::path::Path;
 
 use kaas_storage::fs::RealFs;
 
-pub use kaas_storage::fs::create_dir_all_durable;
+pub use kaas_storage::fs::{create_dir_all_durable, fsync_dir};
 
 /// Atomically write the JSON-serialised payload to `dir/name`.
 pub fn atomic_write_json<T: serde::Serialize>(

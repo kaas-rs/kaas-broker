@@ -244,6 +244,45 @@ mod tests {
         w.freeze()
     }
 
+    /// gh #318, through the handler: an offsets-only commit whose offset write
+    /// fails answers a retriable 15 rather than 0, and the retry completes it.
+    #[tokio::test]
+    async fn a_commit_whose_offsets_cant_be_written_answers_15_and_the_retry_completes() {
+        struct Hook(std::sync::atomic::AtomicBool);
+        impl kaas_coordinator::TxnOffsetHook for Hook {
+            fn on_end_txn(&self, _: &str, _: i64, _: bool) -> std::io::Result<()> {
+                if self.0.load(std::sync::atomic::Ordering::SeqCst) {
+                    return Err(std::io::Error::other("disk full"));
+                }
+                Ok(())
+            }
+        }
+        let (_tmp, b) = broker_with_txn();
+        let store = b.txn_state().unwrap();
+        let hook = Arc::new(Hook(std::sync::atomic::AtomicBool::new(true)));
+        store.set_offset_hook(hook.clone());
+        let (pid, epoch) = store.get_or_allocate("tx-1", || 1).unwrap();
+        store
+            .add_offsets_to_txn("tx-1", pid, epoch, "g", 100)
+            .unwrap();
+        let h = EndTxnHandler::new(b.clone());
+        let req = end_txn::Request {
+            transactional_id: "tx-1".into(),
+            producer_id: pid,
+            producer_epoch: epoch,
+            committed: true,
+        };
+
+        assert_eq!(call(&h, &req).await.error_code, 15);
+        let state = store.snapshot()["tx-1"].state;
+        assert_eq!(state, kaas_coordinator::TxnState::PrepareCommit);
+
+        hook.0.store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(call(&h, &req).await.error_code, 0);
+        let state = store.snapshot()["tx-1"].state;
+        assert_eq!(state, kaas_coordinator::TxnState::CompleteCommit);
+    }
+
     async fn call(h: &EndTxnHandler, req: &end_txn::Request) -> end_txn::Response {
         let body = encode_request(req, 3);
         let out = h.handle(&conn(), 3, body).await.unwrap();

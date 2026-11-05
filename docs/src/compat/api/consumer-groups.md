@@ -62,7 +62,9 @@ in Apache, so the path-unsafe bytes (`/`, NUL and `%`) are percent-encoded in
 the file name, and a group can't reach outside the offsets directory (gh #314).
 An id too long for a file name (247 bytes after encoding) answers
 `INVALID_GROUP_ID` (24), a deviation: Apache has no such limit. A commit whose
-write fails answers `COORDINATOR_NOT_AVAILABLE` (15) rather than acking it.
+write fails answers `COORDINATOR_NOT_AVAILABLE` (15) rather than acking it, and
+OffsetFetch keeps answering what's on disk: the in-memory copy only moves after
+the write lands (gh #318).
 
 **Versions**: v2–v8 (flexible from v8)
 
@@ -420,10 +422,11 @@ Drops a group's coordinator state and committed offsets. Key 42.
 **Handling**: per group, in order: not this broker's group →
 `NOT_COORDINATOR` (16); no in-memory state *and* no offsets file →
 `GROUP_ID_NOT_FOUND` (69); live state that isn't `Empty`/`Dead` →
-`NON_EMPTY_GROUP` (67); otherwise the in-memory group is shut down and the
-`__consumer_offsets/<groupID>.json` file deleted. A disk-delete failure after
-the in-memory wipe is swallowed — the stale file is harmless and the
-operator's startup sweep re-cleans it. A group whose only trace is the
+`NON_EMPTY_GROUP` (67); otherwise the `__consumer_offsets/<groupID>.json` file
+is deleted and the directory synced, and then the in-memory group is shut down.
+If the disk delete fails, the answer is the retriable `COORDINATOR_NOT_AVAILABLE`
+(15) and the group is left as it was (gh #318). It used to answer 0 with the file
+still there, so the offsets came back after a restart. A group whose only trace is the
 offsets file (all members long gone) counts as existing and is deletable,
 matching Apache.
 
@@ -449,8 +452,10 @@ group. Key 47. Drives
 **Versions**: v0 only (not flexible)
 
 **Handling**: the handler builds the canonical `topic/partition` key list and
-calls `Manager::delete_offsets`, which removes the entries from the group's
-cache and rewrites the offsets file. Per-partition results: removed → 0;
+calls `Manager::delete_offsets`, which rewrites the offsets file without the
+entries and then updates the group's cache. If the write fails, the group-level
+error is `COORDINATOR_NOT_AVAILABLE` (15) and nothing changes (gh #318); a stale
+coordinator's fenced write is `NOT_COORDINATOR` (16). Per-partition results: removed → 0;
 no committed entry under that key → `UNKNOWN_TOPIC_OR_PARTITION` (3).
 Per-partition errors are suppressed (0) whenever the group-level error is
 non-zero. Wire-shape quirk faithfully reproduced: the group-level
@@ -459,8 +464,7 @@ DeleteGroups.
 
 **Deviations from Apache 3.7**:
 
-- The only group-level errors kaas produces are `NOT_COORDINATOR` (16) and
-  success. An unknown group returns group-level 0 with every partition marked
+- An unknown group returns group-level 0 with every partition marked
   `UNKNOWN_TOPIC_OR_PARTITION`, where Apache returns
   `GROUP_ID_NOT_FOUND` (69).
 - No subscription guard: Apache refuses to delete offsets for topics a
