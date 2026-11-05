@@ -896,9 +896,10 @@ impl ActiveSegment {
     /// via `tokio::task::spawn_blocking` so the hot path doesn't pay
     /// the index-sync stall.
     ///
-    /// On failure the old segment comes back intact with the error, so
-    /// the caller can keep appending to it (gh #289). Both failure points
-    /// come before its handles are moved.
+    /// The caller syncs the log first ([`Self::sync_log`]), because a
+    /// failed sync means something different to the partition than a
+    /// failed create (gh #289). On failure the old segment comes back
+    /// intact with the error, so the caller can keep appending to it.
     pub fn roll_fast(
         mut self,
         fs: &dyn Fs,
@@ -906,11 +907,6 @@ impl ActiveSegment {
         new_base_offset: i64,
         epoch: i64,
     ) -> Result<(ActiveSegment, RolledTail), Box<(io::Error, ActiveSegment)>> {
-        if let Some(log) = self.log.as_deref_mut() {
-            if let Err(e) = log.sync_all() {
-                return Err(Box::new((e, self)));
-            }
-        }
         let new_active = match ActiveSegment::create(fs, dir, new_base_offset, epoch) {
             Ok(a) => a,
             Err(e) => return Err(Box::new((e, self))),
@@ -968,8 +964,8 @@ pub struct RolledTail {
     pub closed_meta: SegmentMeta,
     /// Closure that fsyncs the index and drops the old log + index
     /// handles. Returns `io::Result<()>` so caller can log a stall;
-    /// failure does NOT impair correctness (the log fsync already
-    /// ran inside `roll_fast`).
+    /// failure does NOT impair correctness (the caller synced the log
+    /// before `roll_fast`).
     pub finalize: Box<dyn FnOnce() -> io::Result<()> + Send>,
 }
 
@@ -1808,6 +1804,22 @@ mod tests {
             "{ops:?}"
         );
         assert_eq!(ops[2], "fsync_dir 0");
+    }
+
+    /// gh #289: a directory `create` has to make is synced into its parent
+    /// before the files go in.
+    #[test]
+    fn create_syncs_a_new_directory_into_its_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = crate::fs::JournalFs::default();
+        let _seg = ActiveSegment::create(&fs, &tmp.path().join("0"), 0, 1).unwrap();
+        let ops = fs.ops.lock();
+        let root = tmp.path().file_name().unwrap().to_string_lossy();
+        assert_eq!(
+            ops[..2],
+            ["mkdir 0".to_owned(), format!("fsync_dir {root}")]
+        );
+        assert!(ops[2].starts_with("create "), "{ops:?}");
     }
 
     /// gh #289: when the directory sync fails, `create` takes both new

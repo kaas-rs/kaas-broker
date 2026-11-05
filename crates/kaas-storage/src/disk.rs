@@ -666,7 +666,8 @@ impl StorageEngine for DiskStorageEngine {
             }
             let src = src_dir.clone();
             let dst = dst_dir.clone();
-            tokio::task::spawn_blocking(move || copy_dir_fresh(&src, &dst))
+            let fs = self.fs.clone();
+            tokio::task::spawn_blocking(move || copy_dir_fresh(fs.as_ref(), &src, &dst))
                 .await
                 .map_err(|e| StorageError::Io(std::io::Error::other(e)))??;
             Ok(())
@@ -729,36 +730,34 @@ impl StorageEngine for DiskStorageEngine {
 /// then deletes the source, so a copy still in the page cache — ext4's
 /// delayed allocation writes a fresh file's blocks seconds later — would
 /// let a crash in that window lose the partition on both roots.
-fn copy_dir_fresh(src: &Path, dst: &Path) -> Result<(), StorageError> {
+fn copy_dir_fresh(fs: &dyn Fs, src: &Path, dst: &Path) -> Result<(), StorageError> {
     if dst.exists() {
         std::fs::remove_dir_all(dst)?;
     }
-    if !src.exists() {
-        // Empty partition (never opened): nothing to copy; the target
-        // dir is created so the opener finds a valid home.
-        crate::fs::create_dir_all_durable(dst)?;
-        return Ok(());
+    fs.mkdir_all_durable(dst)?;
+    // An empty partition (never opened) has nothing to copy; the target
+    // dir is still created so the opener finds a valid home.
+    if src.exists() {
+        copy_dir_recursive(fs, src, dst)?;
     }
-    crate::fs::create_dir_all_durable(dst)?;
-    copy_dir_recursive(src, dst)?;
     Ok(())
 }
 
 /// Copy `src` into the existing directory `dst`, fsyncing every file and,
 /// once its entries are written, `dst` itself.
-fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+fn copy_dir_recursive(fs: &dyn Fs, src: &Path, dst: &Path) -> std::io::Result<()> {
     for entry in std::fs::read_dir(src)?.flatten() {
         let ty = entry.file_type()?;
         let to = dst.join(entry.file_name());
         if ty.is_dir() {
             std::fs::create_dir(&to)?;
-            copy_dir_recursive(&entry.path(), &to)?;
+            copy_dir_recursive(fs, &entry.path(), &to)?;
         } else if ty.is_file() {
             std::fs::copy(entry.path(), &to)?;
             crate::fs::fsync_path(&to)?;
         }
     }
-    crate::fs::fsync_dir(dst)
+    fs.fsync_dir(dst)
 }
 
 #[cfg(test)]
@@ -787,10 +786,37 @@ mod tests {
         std::fs::write(src.join("manifest.json"), b"{}").unwrap();
         std::fs::write(src.join("sub/x.log"), b"abc").unwrap();
         let dst = tmp.path().join("fast/t/0");
-        copy_dir_fresh(&src, &dst).unwrap();
+        copy_dir_fresh(&RealFs::new(), &src, &dst).unwrap();
         assert_eq!(std::fs::read(dst.join("manifest.json")).unwrap(), b"{}");
         assert_eq!(std::fs::read(dst.join("sub/x.log")).unwrap(), b"abc");
         assert!(src.join("sub/x.log").exists());
+    }
+
+    /// gh #289: new ancestors are synced into their parents, and each
+    /// directory is synced only after its entries are written, inner ones
+    /// first. The caller deletes the source once this returns.
+    #[test]
+    fn copy_dir_fresh_syncs_each_directory_after_its_entries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("default/t/0");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/x.log"), b"abc").unwrap();
+        let dst = tmp.path().join("fast/t/0");
+
+        let journal = crate::fs::JournalFs::default();
+        copy_dir_fresh(&journal, &src, &dst).unwrap();
+        let root = tmp.path().file_name().unwrap().to_string_lossy();
+        assert_eq!(
+            *journal.ops.lock(),
+            [
+                "mkdir 0".to_owned(),
+                "fsync_dir t".to_owned(),
+                "fsync_dir fast".to_owned(),
+                format!("fsync_dir {root}"),
+                "fsync_dir sub".to_owned(),
+                "fsync_dir 0".to_owned(),
+            ]
+        );
     }
 
     /// Build a v2 batch carrying (num_records). Producer ID = -1

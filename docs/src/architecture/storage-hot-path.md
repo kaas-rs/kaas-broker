@@ -128,7 +128,7 @@ flowchart TB
     readers["lock-free readers: high_water() / log_start()<br/>load the ArcSwap snapshot — never touch the mutex"] -.-> snap
 ```
 
-Three properties that make this work:
+Four properties that make this work:
 
 1. **Group commit**: N concurrent appenders share one fsync cycle — the
    capacity-1 flush channel coalesces requests, and every waiter with
@@ -139,6 +139,12 @@ Three properties that make this work:
 3. **Fsync watchdog**: a hung NFS server trips the 30 s timeout, sets a
    sticky `Stalled` error, and the partition fails fast instead of
    hanging appenders forever.
+4. **A failed fsync stalls too, wherever it happens** (gh #289): the two
+   segment rolls sync the descriptor the committer syncs, and Linux reports
+   a writeback error once per descriptor, so the next fsync succeeds without
+   the failed bytes having reached the disk. An appender waiting on a flush
+   a failed sync covered gets `Stalled`, never an ack, even if it wakes after
+   the partition has re-armed.
 
 Note the committer holds the partition mutex for the fsync window
 (readers are unaffected via the ArcSwap; concurrent appenders queue on

@@ -483,37 +483,12 @@ fn build_broker_entries(
 /// Takes the cluster-state dir itself — callers resolve the legacy
 /// `<data_dir>/__cluster` join (gh #221 phase 1).
 fn atomic_write<T: Serialize>(cluster_dir: &std::path::Path, payload: &T) -> io::Result<()> {
-    let dir = cluster_dir.to_path_buf();
-    // gh #289: a cluster dir created here is synced into its parent.
-    kaas_storage::fs::create_dir_all_durable(&dir)?;
-    let final_path = dir.join(Assignment::FILE_NAME);
-    let mut tmp_name = String::from(Assignment::FILE_NAME);
-    tmp_name.push_str(".tmp");
-    let tmp_path = dir.join(&tmp_name);
-    let data = serde_json::to_vec(payload).map_err(io::Error::other)?;
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(&tmp_path)?;
-        use std::io::Write;
-        if let Err(e) = f.write_all(&data) {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e);
-        }
-        if let Err(e) = f.sync_all() {
-            let _ = std::fs::remove_file(&tmp_path);
-            return Err(e);
-        }
-    }
-    if let Err(e) = std::fs::rename(&tmp_path, &final_path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e);
-    }
-    // gh #231: on a local filesystem the rename isn't durable until the
-    // directory is synced.
-    kaas_storage::fs::fsync_dir(&dir)
+    kaas_storage::atomic_write::atomic_write_json(
+        &kaas_storage::fs::RealFs::new(),
+        cluster_dir,
+        Assignment::FILE_NAME,
+        payload,
+    )
 }
 
 #[cfg(test)]

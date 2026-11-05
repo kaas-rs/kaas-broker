@@ -270,8 +270,18 @@ fn open_blocking_retrying(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedSt
 }
 
 fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, StorageError> {
-    // gh #289: a partition dir created here is synced into its parent.
-    fs.mkdir_all_durable(dir)?;
+    // gh #289: sync the path to this partition on every open, not only on
+    // the one that created it. A directory that already exists can't say
+    // whether its entry ever reached the disk: an earlier open may have
+    // failed or died between the mkdir and the sync, and the operator
+    // creates partition dirs too. `<root>/<topic>/<partition>` is the
+    // layout, so two levels cover it.
+    fs.mkdir_all(dir)?;
+    for ancestor in dir.ancestors().skip(1).take(2) {
+        if !ancestor.as_os_str().is_empty() {
+            fs.fsync_dir(ancestor)?;
+        }
+    }
 
     // Manifest is the source of truth for (epoch, hwm, log_start)
     // when present; segment scan is the fallback.
@@ -509,6 +519,12 @@ struct PartitionInner {
     /// Sticky on first error. Subsequent appends return immediately
     /// with this error; the broker is expected to drop the partition.
     flush_err: Option<StorageError>,
+    /// The highest flush seq a failed log fsync may have covered. Nothing
+    /// at or below it is ever acked, whatever later syncs report (gh #289):
+    /// Linux reports a writeback error once per file descriptor, so the
+    /// next fsync on the same one succeeds without the failed bytes having
+    /// reached the disk.
+    failed_flush_seq: u64,
 
     /// Per-PID idempotence window (gh #12). Held directly here (not
     /// behind [`crate::idempotence::ProducerStates`]) so the
@@ -527,6 +543,37 @@ struct PartitionInner {
     aborted_txns: AbortedTxnIndex,
 }
 
+impl PartitionInner {
+    /// Record a failed fsync of the active log. Every path that syncs the
+    /// log while the partition is serving comes through here on failure.
+    fn mark_flush_failed(&mut self, err: StorageError) {
+        if self.flush_err.is_none() {
+            self.flush_err = Some(err);
+        }
+        self.failed_flush_seq = self.requested_flush_seq;
+    }
+}
+
+/// A roll's fsync of the outgoing log failed (gh #289). It is the same file
+/// descriptor the committer syncs, so this has to stall the partition just
+/// as the committer's own failure does. Wakes parked appenders and the
+/// committer, which runs the re-arm probe. Returns the error for the caller.
+fn stall_on_roll_sync_failure(
+    guard: &mut PartitionInner,
+    flush: &FlushCoord,
+    err: std::io::Error,
+) -> StorageError {
+    tracing::warn!(
+        dir = %guard.dir.display(),
+        error = %err,
+        "fsync of the outgoing log failed at segment roll; stalling the partition"
+    );
+    guard.mark_flush_failed(StorageError::Io(err));
+    flush.cond.notify_waiters();
+    let _ = flush.req_tx.try_send(());
+    StorageError::Stalled
+}
+
 /// Snapshot the guarded state for publication on the lock-free read
 /// channel. Called under the inner lock everywhere the write path moves
 /// the high watermark, the log start, the epoch, or the segment set.
@@ -540,6 +587,7 @@ fn snapshot_of(guard: &PartitionInner) -> ReadSnapshot {
     }
 }
 
+#[derive(Clone)]
 struct FlushCoord {
     req_tx: mpsc::Sender<()>,
     /// Appenders waiting on `acks=-1` park here; the committer
@@ -619,6 +667,7 @@ impl Partition {
             requested_flush_seq: 0,
             completed_flush_seq: 0,
             flush_err: None,
+            failed_flush_seq: 0,
             producer_states,
             open_txns,
             aborted_txns,
@@ -688,6 +737,7 @@ impl Partition {
     pub async fn take_over(&self, epoch: u32) -> Result<i64, StorageError> {
         let inner = self.inner.clone();
         let fs = self.fs.clone();
+        let flush = self.flush.clone();
         let new_epoch = i64::from(epoch);
         // Same reasoning as the gh #210 open prologue: the roll fsyncs
         // the outgoing log and the persist writes two files, all
@@ -704,7 +754,7 @@ impl Partition {
                 // raised without a segment stamped to match would leave
                 // the fence rejecting writes to a log the previous
                 // leader still owns.
-                roll_for_epoch_locked(fs.as_ref(), &mut guard, new_epoch)?;
+                roll_for_epoch_locked(fs.as_ref(), &mut guard, &flush, new_epoch)?;
                 // Raise the epoch only once it is durable. The takeover
                 // reconcile decides whether to re-drive by comparing this
                 // epoch against the assignment's, so an epoch raised over
@@ -919,6 +969,13 @@ impl Partition {
                 let new_base = guard.high_water;
                 let new_epoch = guard.epoch;
                 let dir = guard.dir.clone();
+                // Flush the outgoing log first. This has to be here rather
+                // than in `roll_fast`: an appender parked on the committer
+                // may be waiting on these same bytes, and only a failure
+                // of this sync, not of the create below, puts it at risk.
+                if let Err(e) = guard.active.sync_log() {
+                    return Err(stall_on_roll_sync_failure(&mut guard, &self.flush, e));
+                }
                 // Move the old active out so roll_fast can consume it.
                 let old_active = std::mem::replace(
                     &mut guard.active,
@@ -1081,7 +1138,7 @@ impl Partition {
             // satisfied target_seq before our subscribe.
             {
                 let guard = self.inner.lock();
-                if guard.flush_err.is_some() {
+                if guard.flush_err.is_some() || target_seq <= guard.failed_flush_seq {
                     return Err(StorageError::Stalled);
                 }
                 if guard.completed_flush_seq >= target_seq {
@@ -1427,6 +1484,7 @@ impl Partition {
 fn roll_for_epoch_locked(
     fs: &dyn Fs,
     guard: &mut PartitionInner,
+    flush: &FlushCoord,
     new_epoch: i64,
 ) -> Result<(), StorageError> {
     let dir = guard.dir.clone();
@@ -1445,15 +1503,16 @@ fn roll_for_epoch_locked(
 
     // Every fallible step happens before the first mutation, so a
     // failure leaves the partition exactly as it was and the caller can
-    // re-drive `take_over`. The append path's `roll_fast` can't offer
-    // that — it consumes the outgoing segment — and a partition left
-    // half-rolled would be serving from a segment set no epoch fully
-    // describes, which no later re-drive can reason about.
+    // re-drive `take_over`. A partition left half-rolled would be serving
+    // from a segment set no epoch fully describes, which no later re-drive
+    // can reason about.
     if outgoing_size > 0 {
         // Flush the outgoing log before we stop writing to it. The
         // index is deliberately not flushed: it is rebuilt on open, and
         // the whole point of this path is that a fresh leader recovers.
-        guard.active.sync_log().map_err(StorageError::Io)?;
+        if let Err(e) = guard.active.sync_log() {
+            return Err(stall_on_roll_sync_failure(guard, flush, e));
+        }
     }
     let new_active =
         ActiveSegment::create(fs, &dir, new_base, new_epoch).map_err(StorageError::Io)?;
@@ -1660,6 +1719,14 @@ fn spawn_committer(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while req_rx.recv().await.is_some() {
+            // A segment roll's fsync failed and woke us (gh #289). Nothing
+            // is flushed until the probe says the log is good again; the
+            // re-arm covers every seq requested so far.
+            if inner.lock().flush_err.is_some() {
+                probe_and_rearm(&inner, &cond, &fs).await;
+                continue;
+            }
+
             // Capture the seq we want to satisfy.
             let target_seq = inner.lock().requested_flush_seq;
             if target_seq == inner.lock().completed_flush_seq {
@@ -1726,23 +1793,13 @@ fn spawn_committer(
                     cond.notify_waiters();
                 }
                 Ok(Ok(Err(io_err))) => {
-                    {
-                        let mut guard = inner.lock();
-                        if guard.flush_err.is_none() {
-                            guard.flush_err = Some(StorageError::Io(io_err));
-                        }
-                    }
+                    inner.lock().mark_flush_failed(StorageError::Io(io_err));
                     cond.notify_waiters();
                     probe_and_rearm(&inner, &cond, &fs).await;
                 }
                 Ok(Err(_join_err)) => {
                     // spawn_blocking panicked — treat as Stalled.
-                    {
-                        let mut guard = inner.lock();
-                        if guard.flush_err.is_none() {
-                            guard.flush_err = Some(StorageError::Stalled);
-                        }
-                    }
+                    inner.lock().mark_flush_failed(StorageError::Stalled);
                     cond.notify_waiters();
                     probe_and_rearm(&inner, &cond, &fs).await;
                 }
@@ -1751,12 +1808,7 @@ fn spawn_committer(
                     // task is still running; that's fine — it drains
                     // when the kernel eventually returns. We set
                     // sticky Stalled and move on.
-                    {
-                        let mut guard = inner.lock();
-                        if guard.flush_err.is_none() {
-                            guard.flush_err = Some(StorageError::Stalled);
-                        }
-                    }
+                    inner.lock().mark_flush_failed(StorageError::Stalled);
                     cond.notify_waiters();
                     // gh #168: park in the probe loop until the
                     // substrate recovers, then clear the poison. New
@@ -4095,6 +4147,195 @@ mod tests {
             *journal.fail_create_suffix.lock() = None;
             assert_eq!(p.append(0, -1, build_batch(1, 1_000)).await.unwrap(), 1);
             assert_eq!(p.high_watermark(), 2);
+            p.close().await.unwrap();
+        });
+    }
+
+    /// Poll until the committer's re-arm probe has cleared the stall. Takes
+    /// the lock rather than asking `is_stalled`, which answers "no" whenever
+    /// the lock is busy, as it is during an fsync.
+    async fn wait_until_rearmed(p: &Partition) {
+        for _ in 0..200 {
+            if p.inner.lock().flush_err.is_none() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            p.inner.lock().flush_err.is_none(),
+            "the partition never re-armed"
+        );
+    }
+
+    /// gh #289: a failed fsync at a segment roll is the same file descriptor
+    /// the committer syncs. Linux reports the error once, so the committer's
+    /// next sync succeeds, and an appender parked on it must not take that
+    /// as its ack. Takes ~5 s (one real probe interval).
+    #[test]
+    fn a_failed_roll_fsync_fails_the_parked_ack_and_then_rearms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let journal = Arc::new(crate::fs::JournalFs::default());
+            let fs: Arc<dyn Fs> = journal.clone();
+            let one_len = u64::try_from(build_batch(1, 1_000).len()).unwrap();
+            let p = Arc::new(
+                Partition::open(
+                    fs,
+                    "t".into(),
+                    0,
+                    tmp.path().to_path_buf(),
+                    PartitionConfig {
+                        segment_bytes: one_len,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap(),
+            );
+            journal
+                .fail_next_file_sync
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+
+            // A parks on the committer; B's roll takes the fsync error.
+            let parked = p.clone();
+            let a = tokio::spawn(async move { parked.append(0, -1, build_batch(1, 1_000)).await });
+            let rolling = p.clone();
+            let b = tokio::spawn(async move { rolling.append(0, -1, build_batch(1, 1_000)).await });
+            let (ra, rb) = (a.await.unwrap(), b.await.unwrap());
+            assert!(matches!(ra, Err(StorageError::Stalled)), "{ra:?}");
+            assert!(matches!(rb, Err(StorageError::Stalled)), "{rb:?}");
+
+            // Nobody else wakes the committer: appends fail fast while
+            // stalled, so the roll has to have started the probe itself.
+            wait_until_rearmed(&p).await;
+            p.append(0, -1, build_batch(1, 1_000)).await.unwrap();
+            p.close().await.unwrap();
+        });
+    }
+
+    /// gh #289: the take-over roll syncs the same file descriptor, so its
+    /// failure has the same effect. Takes ~5 s (one real probe interval).
+    #[test]
+    fn a_failed_take_over_fsync_stalls_the_partition_and_then_rearms() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let journal = Arc::new(crate::fs::JournalFs::default());
+            let fs: Arc<dyn Fs> = journal.clone();
+            let p = Partition::open(
+                fs,
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            p.append(0, -1, build_batch(1, 1_000)).await.unwrap();
+
+            // A flush the committer hasn't run yet, as for a parked appender.
+            let parked = {
+                let mut guard = p.inner.lock();
+                guard.requested_flush_seq += 1;
+                guard.requested_flush_seq
+            };
+            journal
+                .fail_next_file_sync
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(matches!(p.take_over(1).await, Err(StorageError::Stalled)));
+            assert!(matches!(
+                p.await_flush(parked).await,
+                Err(StorageError::Stalled)
+            ));
+
+            wait_until_rearmed(&p).await;
+            assert!(matches!(
+                p.await_flush(parked).await,
+                Err(StorageError::Stalled)
+            ));
+            p.take_over(1).await.unwrap();
+            p.close().await.unwrap();
+        });
+    }
+
+    /// gh #289: an appender that wakes only after the re-arm has cleared
+    /// the stall still isn't acked for a seq a failed sync covered, though
+    /// the re-arm's own sync moved `completed_flush_seq` past it.
+    #[test]
+    fn a_seq_a_failed_sync_covered_is_never_acked() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Partition::open(
+                fs,
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            {
+                let mut guard = p.inner.lock();
+                guard.requested_flush_seq = 5;
+                guard.mark_flush_failed(StorageError::Stalled);
+                assert_eq!(guard.failed_flush_seq, 5);
+                // What the re-arm leaves behind.
+                guard.flush_err = None;
+                guard.requested_flush_seq = 6;
+                guard.completed_flush_seq = 6;
+            }
+            assert!(matches!(p.await_flush(5).await, Err(StorageError::Stalled)));
+            assert!(p.await_flush(6).await.is_ok());
+            p.close().await.unwrap();
+        });
+    }
+
+    /// gh #289: an open syncs the path to the partition whether or not it
+    /// created it, so an open that failed between the mkdir and the sync,
+    /// or died there, is repaired by the next one.
+    #[test]
+    fn a_retried_open_repairs_the_sync_a_failed_open_missed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("t/0");
+        let root = tmp
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        rt().block_on(async {
+            let journal = Arc::new(crate::fs::JournalFs::default());
+            journal
+                .fail_fsync_dir
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let fs: Arc<dyn Fs> = journal.clone();
+            let failed = Partition::open(
+                fs.clone(),
+                "t".into(),
+                0,
+                dir.clone(),
+                PartitionConfig::default(),
+            )
+            .await;
+            assert!(failed.is_err());
+            assert!(dir.is_dir());
+
+            journal
+                .fail_fsync_dir
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            journal.ops.lock().clear();
+            let p = Partition::open(fs, "t".into(), 0, dir.clone(), PartitionConfig::default())
+                .await
+                .unwrap();
+            let ops = journal.ops.lock().clone();
+            assert_eq!(
+                ops[..2],
+                ["fsync_dir t".to_owned(), format!("fsync_dir {root}")]
+            );
             p.close().await.unwrap();
         });
     }

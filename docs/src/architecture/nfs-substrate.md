@@ -146,17 +146,21 @@ free, because a returning `rename()` has already reached the server. It
 is there for the chart's single-broker local-path mode: on ext4 or xfs a
 directory entry is not durable until its directory is synced, so without
 it a crash could bring a partition back with the previous manifest, or
-lose a just-rolled segment that already held acked records. The three
-writers are `kaas-storage`'s `atomic_write` (through `Fs::fsync_dir`),
-`kaas-coordinator`'s twin, and the controller's `assignment.json`
-writer.
+lose a just-rolled segment that already held acked records. There is one
+writer, `kaas-storage`'s `atomic_write` (through `Fs::fsync_dir`); the
+coordinator and the controller's `assignment.json` write both call it
+(gh #289), so its ordering tests cover them.
 
 The same goes one level up (gh #289). A *new directory* is an entry in its
 parent, so every directory kaas creates is synced into its parent as it is
 made: `Fs::mkdir_all_durable`, or `create_dir_all_durable` for the writers
 that use `std::fs` directly. That covers topic and partition dirs (operator
 and broker), the cluster-state dirs, `txn_state/`, the fence log and the
-marker-queue inboxes. A directory that already exists costs nothing.
+marker-queue inboxes. A directory that already exists costs nothing, which
+also means a retry can't repeat a sync that failed or never ran, because the
+directory now exists. So `Partition::open` syncs `<topic>` and the volume root
+on every open, whoever created the directory. The control-plane directories
+are made once at first boot and accept that gap.
 
 Three more cases:
 - An identical manifest that `write_unless_superseded` skips still has

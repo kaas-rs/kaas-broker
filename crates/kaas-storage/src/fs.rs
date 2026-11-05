@@ -106,8 +106,13 @@ pub trait Fs: Send + Sync + 'static {
     /// its parent (gh #289). Without the parent sync a new `<topic>` or
     /// partition directory can vanish on crash on a local filesystem, and
     /// every file in it with it, though each file was fsynced. When the
-    /// directory already exists nothing is synced, so an open of an
-    /// existing partition pays nothing.
+    /// directory already exists nothing is synced, so a writer that calls
+    /// this on every write pays nothing.
+    ///
+    /// That also means a retry doesn't repeat a sync that failed: the
+    /// directory now exists. `Partition::open` syncs its ancestors itself
+    /// for that reason. The control-plane directories are created once,
+    /// at first boot, and accept the gap.
     fn mkdir_all_durable(&self, p: &Path) -> io::Result<()> {
         let mut missing = Vec::new();
         let mut cur = Some(p);
@@ -314,8 +319,10 @@ pub fn create_dir_all_durable(dir: &Path) -> io::Result<()> {
 /// durability depends on (`mkdir`, `create`, `rename`, `remove`,
 /// `fsync_dir`, each with the entry's name; gh #231, gh #289). It can
 /// also inject failures: a `create` of a name ending in
-/// `fail_create_suffix`, and every `fsync_dir` while `fail_fsync_dir` is
-/// set.
+/// `fail_create_suffix`, every `fsync_dir` while `fail_fsync_dir` is set,
+/// and the next `sync_all` on any file it opened once `fail_next_file_sync`
+/// is set. That one fails once, as Linux does: it reports a writeback error
+/// once per file descriptor, and the next fsync succeeds.
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct JournalFs {
@@ -323,10 +330,58 @@ pub(crate) struct JournalFs {
     pub(crate) ops: parking_lot::Mutex<Vec<String>>,
     pub(crate) fail_create_suffix: parking_lot::Mutex<Option<&'static str>>,
     pub(crate) fail_fsync_dir: std::sync::atomic::AtomicBool,
+    pub(crate) fail_next_file_sync: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// A file from [`JournalFs`], for `fail_next_file_sync`.
+#[cfg(test)]
+struct JournalFile {
+    inner: Box<dyn FileWrite>,
+    fail_next_sync: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(test)]
+impl Write for JournalFile {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        self.inner.write(b)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[cfg(test)]
+impl Seek for JournalFile {
+    fn seek(&mut self, p: io::SeekFrom) -> io::Result<u64> {
+        self.inner.seek(p)
+    }
+}
+
+#[cfg(test)]
+impl FileWrite for JournalFile {
+    fn write_at(&mut self, b: &[u8], offset: u64) -> io::Result<()> {
+        self.inner.write_at(b, offset)
+    }
+    fn sync_all(&mut self) -> io::Result<()> {
+        if self
+            .fail_next_sync
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(io::Error::from_raw_os_error(5));
+        }
+        self.inner.sync_all()
+    }
 }
 
 #[cfg(test)]
 impl JournalFs {
+    fn journal_file(&self, inner: Box<dyn FileWrite>) -> Box<dyn FileWrite> {
+        Box::new(JournalFile {
+            inner,
+            fail_next_sync: self.fail_next_file_sync.clone(),
+        })
+    }
+
     fn log(&self, op: &str, p: &Path) {
         let name = p.file_name().map_or_else(
             || p.display().to_string(),
@@ -342,7 +397,7 @@ impl Fs for JournalFs {
         self.inner.open_read(p)
     }
     fn open_write(&self, p: &Path, append: bool) -> io::Result<Box<dyn FileWrite>> {
-        self.inner.open_write(p, append)
+        Ok(self.journal_file(self.inner.open_write(p, append)?))
     }
     fn create(&self, p: &Path) -> io::Result<Box<dyn FileWrite>> {
         self.log("create", p);
@@ -351,7 +406,7 @@ impl Fs for JournalFs {
                 return Err(io::Error::other("injected create failure"));
             }
         }
-        self.inner.create(p)
+        Ok(self.journal_file(self.inner.create(p)?))
     }
     fn fsync(&self, f: &mut dyn FileWrite) -> io::Result<()> {
         self.inner.fsync(f)
