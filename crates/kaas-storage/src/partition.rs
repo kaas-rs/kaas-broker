@@ -4046,9 +4046,13 @@ mod tests {
             let p = Partition::open(fs.clone(), "t".into(), 0, dir.clone(), cfg())
                 .await
                 .unwrap();
-            p.append(0, -1, build_batch(1, 1_000)).await.unwrap();
+            // Two records first, so the far segment starts more than 2^31
+            // past offset 0. At exactly 2^31 the distance still fits an i32,
+            // and the index search's overflow branch (gh #312) isn't reached.
+            p.append(0, -1, build_batch(2, 1_000)).await.unwrap();
             p.append(0, -1, build_batch(i32::MAX, 1_000)).await.unwrap();
-            let far = 1 + i64::from(i32::MAX);
+            let far = 2 + i64::from(i32::MAX);
+            assert!(far > 1i64 << 31);
             assert_eq!(p.high_watermark(), far);
             for i in 0..5 {
                 let base = p.append(0, -1, build_batch(1, 1_000)).await.unwrap();

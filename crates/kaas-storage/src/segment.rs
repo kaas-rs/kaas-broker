@@ -1188,6 +1188,27 @@ mod tests {
         assert_eq!(count_records(&[]), 0);
     }
 
+    /// gh #312: after a restart the last indexed position is estimated from
+    /// the entry count, and repeated failed log writes leave duplicate entries,
+    /// so the estimate can pass the log's size. An append subtracts the two,
+    /// which underflowed and panicked in a debug build.
+    #[test]
+    fn an_index_longer_than_the_log_doesnt_break_an_append_after_a_restart() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = RealFs::new();
+        let mut seg = ActiveSegment::create(&fs, tmp.path(), 0, 1).unwrap();
+        seg.append_batch(&build_batch(0, 0, 1, 0), 4096).unwrap();
+        let index_path = seg.meta.index_path.clone();
+        drop(seg);
+        // Ten entries, so the estimate is 40,960 bytes over a log of one batch.
+        std::fs::write(&index_path, vec![0u8; 80]).unwrap();
+
+        let meta = list_segments(&fs, tmp.path()).unwrap().pop().unwrap();
+        let mut seg = ActiveSegment::open_meta_only(meta);
+        seg.open_handles(&fs).unwrap();
+        seg.append_batch(&build_batch(1, 0, 1, 0), 4096).unwrap();
+    }
+
     /// A target far below the segment starts at the beginning, not the last
     /// entry. More than 2^31 below used to overflow the i32 conversion and
     /// read as "far above", dropping the segment's earlier batches.
