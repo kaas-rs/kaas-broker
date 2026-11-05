@@ -111,8 +111,8 @@ pub trait Fs: Send + Sync + 'static {
     ///
     /// That also means a retry doesn't repeat a sync that failed: the
     /// directory now exists. `Partition::open` syncs its ancestors itself
-    /// for that reason. The control-plane directories are created once,
-    /// at first boot, and accept the gap.
+    /// for that reason. The control-plane directories accept the gap (see
+    /// `docs/src/architecture/nfs-substrate.md`).
     fn mkdir_all_durable(&self, p: &Path) -> io::Result<()> {
         let mut missing = Vec::new();
         let mut cur = Some(p);

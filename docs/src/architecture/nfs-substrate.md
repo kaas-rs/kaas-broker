@@ -160,7 +160,11 @@ marker-queue inboxes. A directory that already exists costs nothing, which
 also means a retry can't repeat a sync that failed or never ran, because the
 directory now exists. So `Partition::open` syncs `<topic>` and the volume root
 on every open, whoever created the directory. The control-plane directories
-are made once at first boot and accept that gap.
+accept that gap. Most are made once at first boot; `marker_queue/to-<n>` and
+`__consumer_offsets` are made on first use. `to-<n>` only exists with peer
+brokers, which means NFS, where a directory sync is a no-op, and
+`__consumer_offsets` sits in `__cluster`, which every `assignment.json` write
+syncs.
 
 Three more cases:
 - An identical manifest that `write_unless_superseded` skips still has
