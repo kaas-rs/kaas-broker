@@ -134,7 +134,8 @@ Reports log directories and per-partition sizes — `kafka-log-dirs.sh
 default data dir plus every `storage.pool[]` volume (the
 [volume pool](../../architecture/volume-pool.md); single-volume
 deployments report exactly one dir, as before).
-Partitions group under the dir the placement record assigns them to. A
+Partitions group under the dir that actually holds their data, as in Apache,
+whatever the placement record says (gh #309). A
 null topics filter expands to every topic in the broker's registry with
 all partitions; a named topic contributes exactly its listed partitions, so
 an empty list contributes nothing (gh #298); unknown topics are silently dropped (matching
@@ -192,10 +193,11 @@ Error codes: unknown path → `LOG_DIR_NOT_FOUND` (57); cordoned member
 (KIP-1066: no new placements) → `INVALID_REQUEST` (42); not this
 broker's partition → `REPLICA_NOT_AVAILABLE` (9); failed copy or
 record flip → `KAFKA_STORAGE_ERROR` (56), with the copy rolled back so
-data location and placement record never diverge. A move to the log dir the
+data location and placement record never diverge. A partition past the topic's
+count is `UNKNOWN_TOPIC_OR_PARTITION` (3, gh #309). A move to the log dir the
 partition's data is already in is Apache's no-op and answers 0: no files are
-touched, and only a lagging placement record is brought in line (gh #297;
-until then it deleted the live partition).
+touched, and a lagging placement record is corrected, on a best-effort basis
+(gh #297, gh #309; until then it deleted the live partition).
 
 **Authorization** (gh #293): `Alter` on the cluster resource, as in
 Apache, checked before anything else — without it every requested

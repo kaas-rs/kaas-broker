@@ -41,8 +41,8 @@ pub use cleaner::{
 };
 pub use disk::DiskStorageEngine;
 pub use engine::{
-    fs_capacity, parse_log_dirs_json, LogDirInfo, PlacementResolver, StorageEngine,
-    TopicIdentityResolver, TopicIncarnation, DEFAULT_LOG_DIR_NAME,
+    check_distinct_log_dirs, fs_capacity, parse_log_dirs_json, LogDirInfo, PlacementResolver,
+    StorageEngine, TopicIdentityResolver, TopicIncarnation, DEFAULT_LOG_DIR_NAME,
 };
 pub use errors::StorageError;
 pub use fs::{Fs, RealFs};

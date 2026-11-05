@@ -392,10 +392,13 @@ async fn main() -> Result<()> {
                             let in_flight = migrations_in_flight.clone();
                             tokio::spawn(async move {
                                 for p in 0..partitions {
-                                    let placed = registry
-                                        .volume_assignment(&name, p)
-                                        .unwrap_or_else(|| "default".to_string());
-                                    if placed == target {
+                                    let actual = broker.engine.partition_log_dir(&name, p);
+                                    let record = registry.volume_assignment(&name, p);
+                                    if !kaas_broker::migration_needed(
+                                        &actual,
+                                        record.as_deref(),
+                                        &target,
+                                    ) {
                                         continue;
                                     }
                                     let code =
@@ -1053,6 +1056,9 @@ fn build_engine(
                 std::fs::create_dir_all(&d.path)
                     .with_context(|| format!("creating log dir {}", d.path.display()))?;
             }
+            std::fs::create_dir_all(&dir)
+                .with_context(|| format!("creating data dir {}", dir.display()))?;
+            kaas_storage::check_distinct_log_dirs(&dir, &log_dirs).map_err(anyhow::Error::msg)?;
             let engine =
                 DiskStorageEngine::new(Arc::new(RealFs), dir, cfg).with_extra_log_dirs(log_dirs);
             engine.set_placement_resolver(placement.clone());

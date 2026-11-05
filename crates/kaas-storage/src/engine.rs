@@ -83,6 +83,36 @@ pub fn parse_log_dirs_json(json: &str) -> Result<Vec<LogDirInfo>, String> {
     Ok(dirs)
 }
 
+/// Refuse log dirs that are the same directory, or that share a name, as
+/// Apache's `LogManager` does at startup ("Duplicate log directory found",
+/// gh #309). The dirs must exist. A log-dir move compares paths, so a pool
+/// entry aliasing another (a symlink, a second mount of one export) would
+/// read as a real move, and its reclaim would delete the partition.
+pub fn check_distinct_log_dirs(default_dir: &Path, extra: &[LogDirInfo]) -> Result<(), String> {
+    use std::os::unix::fs::MetadataExt;
+    let mut seen: Vec<(u64, u64, &Path)> = Vec::new();
+    for dir in std::iter::once(default_dir).chain(extra.iter().map(|d| d.path.as_path())) {
+        let md = std::fs::metadata(dir).map_err(|e| format!("log dir {}: {e}", dir.display()))?;
+        if let Some((_, _, other)) = seen
+            .iter()
+            .find(|(dev, ino, _)| *dev == md.dev() && *ino == md.ino())
+        {
+            return Err(format!(
+                "duplicate log directory: {} and {} are the same directory",
+                other.display(),
+                dir.display()
+            ));
+        }
+        seen.push((md.dev(), md.ino(), dir));
+    }
+    for (i, d) in extra.iter().enumerate() {
+        if extra[..i].iter().any(|o| o.name == d.name) {
+            return Err(format!("duplicate log dir name '{}'", d.name));
+        }
+    }
+    Ok(())
+}
+
 /// KIP-827 capacity probe: `(total_bytes, usable_bytes)` of the
 /// filesystem hosting `path`, or `(-1, -1)` — the wire sentinel —
 /// when the statvfs fails (e.g. the sentinel `memory://` dir).
@@ -238,8 +268,8 @@ pub trait StorageEngine: Send + Sync + 'static {
         }]
     }
 
-    /// Name of the log dir hosting `(topic, partition)` under the
-    /// current placement. Feeds `DescribeLogDirs` grouping.
+    /// Name of the log dir holding `(topic, partition)`'s data. Feeds
+    /// `DescribeLogDirs` grouping and the `migrate-to-volume` driver.
     fn partition_log_dir(&self, _topic: &str, _partition: i32) -> String {
         DEFAULT_LOG_DIR_NAME.to_owned()
     }
@@ -399,5 +429,44 @@ pub trait StorageEngine: Send + Sync + 'static {
         _end_offset: i64,
     ) -> Vec<crate::txn_index::AbortedTxn> {
         Vec::new()
+    }
+}
+
+#[cfg(test)]
+mod distinct_log_dir_tests {
+    use super::*;
+
+    fn dir(name: &str, path: &Path) -> LogDirInfo {
+        LogDirInfo {
+            name: name.to_owned(),
+            path: path.to_path_buf(),
+            default_eligible: true,
+            cordoned: false,
+            labels: Default::default(),
+        }
+    }
+
+    /// gh #309: Apache refuses duplicate log dirs at startup. A symlink to
+    /// another log dir is the same directory, so a move onto it would read
+    /// as real and its reclaim would delete the partition.
+    #[test]
+    fn aliased_or_same_named_log_dirs_are_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let fast = tmp.path().join("fast");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::create_dir(&fast).unwrap();
+        let alias = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&data, &alias).unwrap();
+
+        assert!(check_distinct_log_dirs(&data, &[dir("fast", &fast)]).is_ok());
+        let err = check_distinct_log_dirs(&data, &[dir("alias", &alias)]).unwrap_err();
+        assert!(err.contains("same directory"), "{err}");
+        let err = check_distinct_log_dirs(&data, &[dir("a", &fast), dir("a", &alias)]);
+        assert!(err.is_err());
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let err = check_distinct_log_dirs(&data, &[dir("a", &fast), dir("a", &other)]).unwrap_err();
+        assert!(err.contains("name"), "{err}");
     }
 }

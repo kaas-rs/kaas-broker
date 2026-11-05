@@ -591,13 +591,19 @@ impl StorageEngine for DiskStorageEngine {
         dirs
     }
 
+    /// Where the data is, as Apache reports the real dir; the placement
+    /// record only decides for a partition with no data yet (gh #309). A
+    /// record that lags the data used to report the partition under a dir
+    /// that didn't hold it, and read as finished to a volume drain.
     fn partition_log_dir(&self, topic: &str, partition: i32) -> String {
-        match self.placement_of(topic, partition) {
-            // An unknown name resolves to the default root (see
-            // `log_dir_root`), so report it as such.
-            Some(n) if self.extra_log_dirs.iter().any(|d| d.name == n) => n,
-            _ => crate::engine::DEFAULT_LOG_DIR_NAME.to_owned(),
-        }
+        let root = self.locate(topic, partition).root;
+        self.extra_log_dirs
+            .iter()
+            .find(|d| d.path == root)
+            .map_or_else(
+                || crate::engine::DEFAULT_LOG_DIR_NAME.to_owned(),
+                |d| d.name.clone(),
+            )
     }
 
     async fn take_over(
@@ -1207,9 +1213,10 @@ mod tests {
                 !bulk_root.join("t/0").exists(),
                 "no empty shell may be created on the assigned root"
             );
-            // Reported log dir keeps naming the assignment (that is the
-            // record's job); the data path is what must not move.
-            assert_eq!(e.partition_log_dir("t", 0), "bulk");
+            // The report names where the data is, as Apache's does
+            // (gh #309); the record lags it here. `locate` below still
+            // knows the two disagree.
+            assert_eq!(e.partition_log_dir("t", 0), "default");
             // A known record that names another root: the one case the
             // warning is for.
             assert_eq!(e.locate("t", 0).placed_elsewhere, Some(bulk_root.clone()));
@@ -1332,6 +1339,15 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, StorageError::Unsupported(_)));
+
+            // Reported where the data is, with no placement record saying
+            // so (gh #309).
+            assert_eq!(e.partition_log_dir("t", 0), "default");
+            std::fs::remove_dir_all(&src).unwrap();
+            assert_eq!(e.partition_log_dir("t", 0), "fast");
+            std::fs::create_dir_all(&src).unwrap();
+            std::fs::write(src.join("sentinel"), b"x").unwrap();
+            std::fs::write(src.join("manifest.json"), b"{}").unwrap();
 
             // Same-dir move is a no-op that names nothing to reclaim
             // (gh #297).

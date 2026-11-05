@@ -73,7 +73,13 @@ pub async fn migrate_partition(
     partition: i32,
     log_dir_name: &str,
 ) -> i16 {
-    if broker.topics.get(topic).is_none() {
+    // A missing topic, or a partition past its count: Apache's
+    // UNKNOWN_TOPIC_OR_PARTITION (gh #309).
+    if !broker
+        .topics
+        .get(topic)
+        .is_some_and(|m| (0..m.partition_count).contains(&partition))
+    {
         return ERR_UNKNOWN_TOPIC_OR_PARTITION;
     }
     // Only the current leader holds the partition's files. Dev /
@@ -151,8 +157,23 @@ pub async fn migrate_partition(
     ERR_NONE
 }
 
+/// Does the `migrate-to-volume` driver have work to do for a partition
+/// whose data is in `actual` and whose placement record says `record`?
+/// Done only when both are at `target`. A record at the target with the data
+/// elsewhere still needs the move: going by the record alone read as a
+/// finished drain with the data left behind. Data at the target with a
+/// lagging record needs its record corrected, which the same-dir path does
+/// (gh #309).
+#[must_use]
+pub fn migration_needed(actual: &str, record: Option<&str>, target: &str) -> bool {
+    actual != target || record.unwrap_or(kaas_storage::DEFAULT_LOG_DIR_NAME) != target
+}
+
 /// The partition already lives in `log_dir_name`: make the placement
-/// record say so, touching no files.
+/// record say so, touching no files. Answers 0 either way, as Apache does
+/// for this case (gh #309). The move has nothing left to do, and
+/// `partition_dir` serves from where the data is, so a record still lagging
+/// after a failed patch costs nothing; the next attempt corrects it.
 async fn confirm_placement(
     broker: &Broker,
     topic: &str,
@@ -169,7 +190,7 @@ async fn confirm_placement(
         {
             warn!(topic, partition, %err,
                 "AlterReplicaLogDirs: placement-record update failed; data is already in place");
-            return ERR_KAFKA_STORAGE_ERROR;
+            return ERR_NONE;
         }
     }
     broker
@@ -389,5 +410,121 @@ mod tests {
             p.broker.topics.volume_assignment("t", 0).as_deref(),
             Some("fast")
         );
+    }
+
+    /// gh #309: a record lagging the data, with the registry wired as the
+    /// placement resolver as in production. The same-dir path answers 0,
+    /// keeps the files and corrects the record, and a CR patch that fails
+    /// still answers 0 and touches no files (Apache's no-op answers NONE).
+    #[tokio::test]
+    async fn a_lagging_record_is_corrected_without_touching_files() {
+        use crate::topic_cr_writer::{ConfigOpWithValue, TopicCRWriter, TopicWriteError};
+
+        #[derive(Debug)]
+        struct Writer {
+            fail: bool,
+        }
+        #[async_trait]
+        impl TopicCRWriter for Writer {
+            async fn create_topic(
+                &self,
+                _: &str,
+                _: i32,
+                _: &[(String, String)],
+            ) -> Result<(), TopicWriteError> {
+                unreachable!()
+            }
+            async fn expand_topic(&self, _: &str, _: i32) -> Result<(), TopicWriteError> {
+                unreachable!()
+            }
+            async fn update_topic_config(
+                &self,
+                _: &str,
+                _: &[ConfigOpWithValue],
+            ) -> Result<(), TopicWriteError> {
+                unreachable!()
+            }
+            async fn delete_topic(&self, _: &str) -> Result<(), TopicWriteError> {
+                unreachable!()
+            }
+            async fn set_partition_log_dir(
+                &self,
+                _: &str,
+                _: i32,
+                _: &str,
+            ) -> Result<(), TopicWriteError> {
+                if self.fail {
+                    Err(TopicWriteError::Forbidden("no".to_owned()))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        for fail in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let default_root = tmp.path().join("data");
+            let fast_root = tmp.path().join("fast");
+            let topics = Arc::new(TopicRegistry::new());
+            topics.insert(TopicMeta {
+                name: "t".to_owned(),
+                partition_count: 1,
+                topic_id: [0; 16],
+            });
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let engine = DiskStorageEngine::new(fs, default_root, PartitionConfig::default())
+                .with_extra_log_dirs(vec![LogDirInfo {
+                    name: "fast".to_owned(),
+                    path: fast_root.clone(),
+                    default_eligible: true,
+                    cordoned: false,
+                    labels: Default::default(),
+                }]);
+            engine.set_placement_resolver(topics.clone());
+            // The data is on `fast`, the record says `default`.
+            topics.set_volume_assignment("t", 0, "fast");
+            engine.create_partition("t", 0).await.unwrap();
+            let moved = fast_root.join("t/0/sentinel");
+            std::fs::write(&moved, b"x").unwrap();
+            topics.set_volume_assignment("t", 0, "default");
+            let engine: Arc<dyn StorageEngine> = Arc::new(engine);
+            let broker = Arc::new(Broker::new(engine, topics, "test", 0));
+            broker.install_cr_writer(Arc::new(Writer { fail }));
+
+            assert_eq!(
+                migrate_partition(&broker, "t", 0, "fast").await,
+                0,
+                "fail={fail}"
+            );
+            assert!(moved.is_file(), "fail={fail}: the partition was touched");
+            let record = broker.topics.volume_assignment("t", 0);
+            let want = if fail { "default" } else { "fast" };
+            assert_eq!(record.as_deref(), Some(want), "fail={fail}");
+        }
+    }
+
+    /// gh #309: a partition past the topic's count is Apache's 3, not 9.
+    #[tokio::test]
+    async fn an_out_of_range_partition_is_3() {
+        let p = pool(Arc::new(DenyOpAuthorizer(Operation::Describe))).await;
+        assert_eq!(migrate_partition(&p.broker, "t", 99, "fast").await, 3);
+        assert_eq!(migrate_partition(&p.broker, "missing", 0, "fast").await, 3);
+    }
+
+    /// gh #309: the drain is done only when the data and the record are
+    /// both at the target.
+    #[test]
+    fn a_drain_is_finished_only_when_data_and_record_agree() {
+        assert!(!migration_needed("fast", Some("fast"), "fast"));
+        assert!(
+            migration_needed("default", Some("fast"), "fast"),
+            "data left behind"
+        );
+        assert!(
+            migration_needed("fast", Some("default"), "fast"),
+            "record lags"
+        );
+        assert!(migration_needed("fast", None, "fast"), "no record yet");
+        assert!(!migration_needed("default", None, "default"));
     }
 }

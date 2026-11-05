@@ -51,15 +51,15 @@ pub use group_hash::{
 };
 pub use group_takeover::GroupTakeoverDriver;
 pub use handlers::{
-    migrate_partition, AddOffsetsToTxnHandler, AddPartitionsToTxnHandler, AlterClientQuotasHandler,
-    AlterReplicaLogDirsHandler, AlterUserScramCredentialsHandler, ApiVersionsHandler,
-    CreateAclsHandler, CreatePartitionsHandler, CreateTopicsHandler, DeleteAclsHandler,
-    DeleteGroupsHandler, DeleteRecordsHandler, DeleteTopicsHandler, DescribeAclsHandler,
-    DescribeClientQuotasHandler, DescribeClusterHandler, DescribeConfigsHandler,
-    DescribeGroupsHandler, DescribeLogDirsHandler, DescribeUserScramCredentialsHandler,
-    EndTxnHandler, FetchHandler, FindCoordinatorHandler, HeartbeatHandler,
-    IncrementalAlterConfigsHandler, InitProducerIdHandler, JoinGroupHandler, LeaveGroupHandler,
-    ListGroupsHandler, ListOffsetsHandler, MetadataHandler, OffsetCommitHandler,
+    migrate_partition, migration_needed, AddOffsetsToTxnHandler, AddPartitionsToTxnHandler,
+    AlterClientQuotasHandler, AlterReplicaLogDirsHandler, AlterUserScramCredentialsHandler,
+    ApiVersionsHandler, CreateAclsHandler, CreatePartitionsHandler, CreateTopicsHandler,
+    DeleteAclsHandler, DeleteGroupsHandler, DeleteRecordsHandler, DeleteTopicsHandler,
+    DescribeAclsHandler, DescribeClientQuotasHandler, DescribeClusterHandler,
+    DescribeConfigsHandler, DescribeGroupsHandler, DescribeLogDirsHandler,
+    DescribeUserScramCredentialsHandler, EndTxnHandler, FetchHandler, FindCoordinatorHandler,
+    HeartbeatHandler, IncrementalAlterConfigsHandler, InitProducerIdHandler, JoinGroupHandler,
+    LeaveGroupHandler, ListGroupsHandler, ListOffsetsHandler, MetadataHandler, OffsetCommitHandler,
     OffsetDeleteHandler, OffsetFetchHandler, ProduceHandler, SaslAuthenticateHandler,
     SaslHandshakeHandler, SyncGroupHandler, TxnOffsetCommitHandler, WriteTxnMarkersHandler,
 };

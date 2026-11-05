@@ -13,6 +13,7 @@
 //!
 //! [`StorageEngine::partition_size`]: kaas_storage::StorageEngine::partition_size
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -91,6 +92,13 @@ impl Handler for DescribeLogDirsHandler {
         // reports all configured log.dirs. Partitions group under
         // the dir the placement resolver assigns them to.
         let wanted = self.wanted(&req);
+        // Resolved once per partition: finding where the data is stats the
+        // volumes, and every dir below asks.
+        let located: HashMap<(&str, i32), String> = wanted
+            .iter()
+            .flat_map(|(name, parts)| parts.iter().map(move |p| (name.as_str(), *p)))
+            .map(|(name, p)| ((name, p), self.broker.engine.partition_log_dir(name, p)))
+            .collect();
         let results = self
             .broker
             .engine
@@ -106,7 +114,7 @@ impl Handler for DescribeLogDirsHandler {
                     .filter_map(|(name, parts)| {
                         let partitions: Vec<_> = parts
                             .iter()
-                            .filter(|p| self.broker.engine.partition_log_dir(name, **p) == dir.name)
+                            .filter(|p| located.get(&(name.as_str(), **p)) == Some(&dir.name))
                             .map(|p| describe_log_dirs::ResponsePartition {
                                 partition_index: *p,
                                 partition_size: self.broker.engine.partition_size(name, *p),
