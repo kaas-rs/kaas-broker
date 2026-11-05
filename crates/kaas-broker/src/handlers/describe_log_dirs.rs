@@ -38,9 +38,10 @@ impl DescribeLogDirsHandler {
     }
 
     /// Resolve the request's topic/partition filter against the
-    /// registry: null topics → every known topic, every partition;
-    /// a named topic with an empty partition list → every partition
-    /// of that topic; unknown topics are dropped.
+    /// registry: null topics → every known topic, every partition; a
+    /// named topic → exactly its listed partitions, so an empty list
+    /// contributes nothing (Apache builds the set from the listed
+    /// indexes, gh #298); unknown topics are dropped.
     fn wanted(&self, req: &describe_log_dirs::Request) -> Vec<(String, Vec<i32>)> {
         match req.topics.as_ref() {
             None => self
@@ -52,15 +53,8 @@ impl DescribeLogDirsHandler {
                 .collect(),
             Some(topics) => topics
                 .iter()
-                .filter_map(|t| {
-                    let known = self.broker.topics.get(&t.name)?;
-                    let parts = if t.partitions.is_empty() {
-                        (0..known.partition_count).collect()
-                    } else {
-                        t.partitions.clone()
-                    };
-                    Some((t.name.clone(), parts))
-                })
+                .filter(|t| self.broker.topics.get(&t.name).is_some())
+                .map(|t| (t.name.clone(), t.partitions.clone()))
                 .collect(),
         }
     }
@@ -222,5 +216,50 @@ mod tests {
         assert_eq!(resp.error_code, 0);
         assert_eq!(resp.results.len(), 1);
         assert_eq!(resp.results[0].topics[0].name, "t");
+    }
+
+    /// gh #298: only a null topics array means "everything". A named topic
+    /// contributes exactly its listed partitions, so an empty list
+    /// contributes nothing, as in Apache.
+    #[tokio::test]
+    async fn a_topic_with_an_empty_partition_list_contributes_nothing() {
+        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let topics = Arc::new(TopicRegistry::new());
+        topics.insert(TopicMeta {
+            name: "t".to_owned(),
+            partition_count: 3,
+            topic_id: [0; 16],
+        });
+        let h = DescribeLogDirsHandler::new(Arc::new(Broker::new(engine, topics, "test", 0)));
+        let listed = |req: describe_log_dirs::Request| {
+            let h = &h;
+            async move {
+                let mut body = BytesMut::new();
+                describe_log_dirs::encode_request(&mut body, &req, 4).unwrap();
+                let conn = Mutex::new(ConnState::new(
+                    "internal",
+                    SocketAddr::from_str("127.0.0.1:9092").unwrap(),
+                ));
+                let out = h.handle(&conn, 4, body.freeze()).await.unwrap();
+                let resp = describe_log_dirs::decode_response(&mut out.freeze(), 4).unwrap();
+                resp.results[0]
+                    .topics
+                    .iter()
+                    .flat_map(|t| t.partitions.iter().map(|p| p.partition_index))
+                    .collect::<Vec<i32>>()
+            }
+        };
+        let named = |partitions: Vec<i32>| describe_log_dirs::Request {
+            topics: Some(vec![describe_log_dirs::RequestTopic {
+                name: "t".to_owned(),
+                partitions,
+            }]),
+        };
+        assert_eq!(listed(named(vec![])).await, Vec::<i32>::new());
+        assert_eq!(listed(named(vec![1])).await, [1]);
+        assert_eq!(
+            listed(describe_log_dirs::Request { topics: None }).await,
+            [0, 1, 2]
+        );
     }
 }

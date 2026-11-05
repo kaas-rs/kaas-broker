@@ -136,8 +136,8 @@ default data dir plus every `storage.pool[]` volume (the
 deployments report exactly one dir, as before).
 Partitions group under the dir the placement record assigns them to. A
 null topics filter expands to every topic in the broker's registry with
-all partitions; a named topic with an empty partition list expands to
-all its partitions; unknown topics are silently dropped (matching
+all partitions; a named topic contributes exactly its listed partitions, so
+an empty list contributes nothing (gh #298); unknown topics are silently dropped (matching
 Apache, which omits partitions it doesn't host). Each partition row
 carries `partition_size` from the storage engine, `offset_lag = 0`, and
 `is_future_key = false`; the dir-level `error_code` is always 0. v4
