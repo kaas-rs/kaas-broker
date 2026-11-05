@@ -161,7 +161,11 @@ new low watermark. Records below
 fall entirely below it are unlinked from disk on the spot — safe on NFS
 because only the leader holds open handles. The new log start is durable before
 the answer and before any file goes, so a crash can't bring purged records back
-(gh #311).
+(gh #311). The exception is a volume too full to write that record: the covered
+segments go first, because nothing else makes room, and a broker clamps log start
+to its first segment's base on open, as Apache does, so a crash in between can't
+bring them back either. If the write still fails, the answer is
+`KAFKA_STORAGE_ERROR` (56), and log start reflects whatever was freed.
 
 **Deviations from Apache 3.7**:
 
