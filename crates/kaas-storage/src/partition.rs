@@ -50,13 +50,15 @@ use crate::idempotence::{
 };
 use crate::manifest::{self, Manifest, ReadResult};
 use crate::producer_snapshot::{
-    read_producer_snapshot, write_producer_snapshot, PRODUCER_SNAPSHOT_FILENAME,
+    read_producer_snapshot, write_producer_snapshot, ProducerSnapshotError, SnapshotCoverage,
+    PRODUCER_SNAPSHOT_FILENAME,
 };
 use crate::recovery_checkpoint::{self, RecoveryCheckpoint, RECOVERY_CHECKPOINT_FILENAME};
 use crate::segment::{self, parse_batch_offsets, ActiveSegment, SegmentMeta};
 use crate::txn_index::{AbortedTxn, AbortedTxnIndex, OpenTxnIndex};
 use crate::txn_index_snapshot::{
-    read_txn_index_snapshot, write_txn_index_snapshot, TXN_INDEX_SNAPSHOT_FILENAME,
+    read_txn_index_snapshot, write_txn_index_snapshot, TxnIndexSnapshotError,
+    TXN_INDEX_SNAPSHOT_FILENAME,
 };
 
 /// gh #recovery-checkpoint: the committer writes a fresh recovery
@@ -66,6 +68,16 @@ use crate::txn_index_snapshot::{
 /// 64 MiB keeps checkpoint writes rare (one per 64 MiB of throughput)
 /// while capping the worst-case re-scan at ~64 MiB.
 const CHECKPOINT_INTERVAL_BYTES: i64 = 64 * 1024 * 1024;
+
+/// How much log the committer lets through between snapshots of the
+/// producer window and the read_committed indexes, which bounds what a crash
+/// has to replay (gh #303). The same size as the checkpoint, but counted
+/// across rolls: a topic with small segments would never reach it otherwise.
+const STATE_SNAPSHOT_INTERVAL_BYTES: u64 = if cfg!(test) {
+    4 * 1024
+} else {
+    64 * 1024 * 1024
+};
 
 /// Per-partition tuning knobs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -210,9 +222,7 @@ struct OpenedState {
     log_start: i64,
     closed: Vec<SegmentMeta>,
     active: ActiveSegment,
-    producer_states: HashMap<i64, ProducerEntry>,
-    open_txns: OpenTxnIndex,
-    aborted_txns: AbortedTxnIndex,
+    restored: RestoredState,
 }
 
 /// Blocking prologue of [`Partition::open`] — runs on a
@@ -438,31 +448,7 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
     // The next checkpoint names this batch as its resume point (gh #230).
     active.set_last_batch(scan.last_batch);
 
-    // Restore the idempotence window.
-    let producer_states = read_producer_snapshot(fs, dir)
-        .map_err(|e| match e {
-            crate::producer_snapshot::ProducerSnapshotError::Io(e) => StorageError::Io(e),
-            crate::producer_snapshot::ProducerSnapshotError::Json(e) => StorageError::Json(e),
-        })?
-        .map(|entries| entries.into_iter().collect::<HashMap<i64, ProducerEntry>>())
-        .unwrap_or_default();
-
-    // Restore the read_committed indexes (gh #177). Absent snapshot →
-    // empty indexes, which is the pre-gh #177 behaviour for exactly one
-    // restart (the first persist writes the file). Aborted entries fully
-    // below log_start are dropped on the way in — DeleteRecords may have
-    // advanced it since the snapshot was written.
-    let (open_txns, aborted_txns) = match read_txn_index_snapshot(fs, dir).map_err(|e| match e {
-        crate::txn_index_snapshot::TxnIndexSnapshotError::Io(e) => StorageError::Io(e),
-        crate::txn_index_snapshot::TxnIndexSnapshotError::Json(e) => StorageError::Json(e),
-    })? {
-        Some((open, aborted)) => {
-            let mut idx = AbortedTxnIndex::restore(aborted);
-            idx.evict_below(log_start);
-            (OpenTxnIndex::restore(open), idx)
-        }
-        None => (OpenTxnIndex::new(), AbortedTxnIndex::new()),
-    };
+    let restored = restore_state(fs, dir, epoch, log_start, hwm, &closed, &active.meta)?;
 
     // Persist the manifest so the next open is fast — but never below
     // the epoch on disk (gh #235). `epoch` was read at the top of this
@@ -497,10 +483,320 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
         log_start,
         closed,
         active,
-        producer_states,
+        restored,
+    })
+}
+
+/// The producer window and read_committed indexes [`restore_state`] recovers.
+struct RestoredState {
+    producer_states: HashMap<i64, ProducerEntry>,
+    open_txns: OpenTxnIndex,
+    aborted_txns: AbortedTxnIndex,
+    /// The snapshots on disk lag these. The first flush re-takes them, so the
+    /// same bytes aren't replayed after every later crash.
+    replayed: bool,
+}
+
+/// What a snapshot contributes, once checked against the log it describes.
+/// `None` when it can't be used as a starting point: it says nothing about
+/// what it covers, a fenced leader wrote it, or it covers offsets that are
+/// gone from either end of the log. A gap below log start can hide a marker,
+/// and a snapshot past the log end describes records that didn't survive.
+fn usable_coverage(
+    covers: Option<SnapshotCoverage>,
+    manifest_epoch: i64,
+    log_start: i64,
+    hwm: i64,
+) -> Option<SnapshotCoverage> {
+    covers.filter(|c| c.epoch >= manifest_epoch && (log_start..=hwm).contains(&c.offset))
+}
+
+/// Restore the producer window and the read_committed indexes (gh #303).
+///
+/// The snapshots are written at intervals, so after an unclean stop they lag
+/// the log. Trusting them as they stand lost every transaction since the last
+/// one: read_committed consumers saw open transactions and were handed aborted
+/// records as committed, and a retry could be appended twice. So the log is
+/// authoritative here, as it is for the high watermark: start from a snapshot
+/// that checks out, and replay the batch headers after it. With none, rebuild
+/// from log start, which is what Apache does too (`rebuildProducerState`).
+///
+/// A snapshot that doesn't parse is treated the same way, because the log can
+/// replace it. An I/O error isn't: that says nothing about the snapshot, and
+/// rebuilding over a passing NFS failure could be slow for no reason.
+fn restore_state(
+    fs: &dyn Fs,
+    dir: &std::path::Path,
+    manifest_epoch: i64,
+    log_start: i64,
+    hwm: i64,
+    closed: &[SegmentMeta],
+    active: &SegmentMeta,
+) -> Result<RestoredState, StorageError> {
+    let (producers, producer_covers) = match read_producer_snapshot(fs, dir) {
+        Ok(Some((entries, covers))) => (entries.into_iter().collect(), covers),
+        Ok(None) => (HashMap::new(), None),
+        Err(ProducerSnapshotError::Io(e)) => return Err(StorageError::Io(e)),
+        Err(ProducerSnapshotError::Json(e)) => {
+            tracing::warn!(dir = %dir.display(), error = %e,
+                "producer snapshot doesn't parse; rebuilding it from the log");
+            (HashMap::new(), None)
+        }
+    };
+    let (open, aborted, txn_covers) = match read_txn_index_snapshot(fs, dir) {
+        Ok(Some(restored)) => restored,
+        Ok(None) => (Vec::new(), Vec::new(), None),
+        Err(TxnIndexSnapshotError::Io(e)) => return Err(StorageError::Io(e)),
+        Err(TxnIndexSnapshotError::Json(e)) => {
+            tracing::warn!(dir = %dir.display(), error = %e,
+                "txn index snapshot doesn't parse; rebuilding it from the log");
+            (Vec::new(), Vec::new(), None)
+        }
+    };
+
+    // A snapshot past the log end has to go, not just be ignored. Nothing else
+    // rewrites it before the next crash, because a restart at the same epoch
+    // makes `take_over` a no-op. By then appends can have carried the log back
+    // past its `covers`, and it would pass for a good one while describing
+    // records that were lost.
+    let mut removed = false;
+    for (covers, name) in [
+        (producer_covers, PRODUCER_SNAPSHOT_FILENAME),
+        (txn_covers, TXN_INDEX_SNAPSHOT_FILENAME),
+    ] {
+        if covers.is_some_and(|c| c.offset > hwm) {
+            match fs.remove(&dir.join(name)) {
+                Ok(()) => removed = true,
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e.into()),
+                Err(_) => {}
+            }
+        }
+    }
+    if removed {
+        fs.fsync_dir(dir)?;
+    }
+
+    // A fenced leader's window can name batches this log never held.
+    let mut producers: HashMap<i64, ProducerEntry> =
+        if producer_covers.is_some_and(|c| c.epoch < manifest_epoch) {
+            HashMap::new()
+        } else {
+            producers
+        };
+    // The window is kept even when the snapshot isn't a starting point, because
+    // it's all there is for a producer whose batches have aged out: an empty
+    // window at its epoch would refuse its next sequence (gh #306). But a batch
+    // past the log end is gone, and a retry of it must be written again rather
+    // than answered as a duplicate.
+    producers.retain(|_, entry| {
+        let had_batches = !entry.recent.is_empty();
+        entry.recent.retain(|b| b.base_offset < hwm);
+        !had_batches || !entry.recent.is_empty()
+    });
+
+    let producer_covers = usable_coverage(producer_covers, manifest_epoch, log_start, hwm);
+    let txn_covers = usable_coverage(txn_covers, manifest_epoch, log_start, hwm);
+    let (mut open_txns, mut aborted_txns) = if txn_covers.is_some() {
+        let mut aborted = AbortedTxnIndex::restore(aborted);
+        // DeleteRecords may have advanced log start since the snapshot.
+        aborted.evict_below(log_start);
+        (OpenTxnIndex::restore(open), aborted)
+    } else {
+        (OpenTxnIndex::new(), AbortedTxnIndex::new())
+    };
+
+    let producers_from = producer_covers.map_or(log_start, |c| c.offset);
+    let txns_from = txn_covers.map_or(log_start, |c| c.offset);
+    let from = producers_from.min(txns_from);
+    if from >= hwm {
+        return Ok(RestoredState {
+            producer_states: producers,
+            open_txns,
+            aborted_txns,
+            replayed: false,
+        });
+    }
+
+    let hint = [producer_covers, txn_covers]
+        .into_iter()
+        .flatten()
+        .find(|c| c.offset == from)
+        .map(|c| c.byte_pos);
+    let mut replayed = 0u64;
+    replay_log(fs, closed, active, from, hint, hwm, |prefix, base| {
+        replayed += 1;
+        if base >= txns_from {
+            track_txn_batch(prefix, base, &mut open_txns, &mut aborted_txns);
+        }
+        if base >= producers_from {
+            if let Ok(info) = parse_batch_producer_info(prefix) {
+                replay_producer_batch(&mut producers, info, base);
+            }
+        }
+    })?;
+    tracing::info!(dir = %dir.display(), from, hwm, batches = replayed,
+        "replayed the log into the producer window and the read_committed indexes");
+    Ok(RestoredState {
+        producer_states: producers,
         open_txns,
         aborted_txns,
+        replayed: true,
     })
+}
+
+/// Apply one batch from the log to the producer window: what `append` did when
+/// it accepted this batch. Everything in the log was accepted, so there's
+/// nothing to classify.
+///
+/// A rebuild can start below what the window already holds, and a batch below
+/// the fence a snapshot recorded has no business reopening the old epoch. The
+/// rest goes through `record_accepted`, which handles an epoch bump and trims
+/// the ring.
+fn replay_producer_batch(
+    states: &mut HashMap<i64, ProducerEntry>,
+    info: BatchProducerInfo,
+    base_offset: i64,
+) {
+    // A marker (`first_seq` -1) or a non-idempotent batch has no sequence.
+    if info.producer_id < 0 || info.first_seq < 0 {
+        return;
+    }
+    if let Some(entry) = states.get(&info.producer_id) {
+        let in_window = entry
+            .recent
+            .last()
+            .is_some_and(|b| b.base_offset >= base_offset);
+        if info.epoch < entry.epoch || in_window {
+            return;
+        }
+    }
+    idempotence::record_accepted(states, info, base_offset);
+}
+
+/// Hand `apply` the leading bytes and base offset of every batch in
+/// `[from, hwm)`, in order. `hint` is where `from` was in its segment, used only
+/// if the batch there really is at `from`.
+///
+/// A segment is only read up to the next one's base. A deposed leader can write
+/// to its file after its successor rolled past it, and those batches overlap the
+/// successor's offsets (gh #164): they are in the directory but not in the log.
+fn replay_log(
+    fs: &dyn Fs,
+    closed: &[SegmentMeta],
+    active: &SegmentMeta,
+    from: i64,
+    hint: Option<u64>,
+    hwm: i64,
+    mut apply: impl FnMut(&[u8], i64),
+) -> Result<(), StorageError> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::ops::ControlFlow;
+
+    let segments: Vec<&SegmentMeta> = closed.iter().chain(std::iter::once(active)).collect();
+    let first = segments
+        .partition_point(|s| s.base_offset <= from)
+        .saturating_sub(1);
+    for (i, seg) in segments.iter().enumerate().skip(first) {
+        let end = segments.get(i + 1).map_or(hwm, |n| n.base_offset.min(hwm));
+        let mut f = fs.open_read(&seg.log_path)?;
+        let mut start_byte = 0;
+        if let (true, Some(pos)) = (i == first, hint) {
+            let mut base = [0u8; 8];
+            let found = f
+                .seek(SeekFrom::Start(pos))
+                .and_then(|_| f.read_exact(&mut base));
+            if found.is_ok() && i64::from_be_bytes(base) == from {
+                start_byte = pos;
+            }
+        }
+        segment::walk_batch_prefixes(&mut f, start_byte, |prefix| {
+            let mut bytes = [0u8; 8];
+            bytes.copy_from_slice(&prefix[..8]);
+            let base = i64::from_be_bytes(bytes);
+            if base >= end {
+                return ControlFlow::Break(());
+            }
+            if base >= from {
+                apply(prefix, base);
+            }
+            ControlFlow::Continue(())
+        })?;
+    }
+    Ok(())
+}
+
+/// The state both snapshot files hold, taken at one moment under the partition
+/// lock. `covers.offset` is the high watermark then, so the bytes below it are
+/// only durable if the log was synced under the same lock hold.
+struct StateCapture {
+    covers: SnapshotCoverage,
+    producers: Vec<(i64, ProducerEntry)>,
+    open: Vec<(i64, i64)>,
+    aborted: Vec<AbortedTxn>,
+}
+
+fn capture_state(guard: &PartitionInner, epoch: i64) -> StateCapture {
+    StateCapture {
+        covers: SnapshotCoverage {
+            offset: guard.high_water,
+            byte_pos: guard.active.log_size(),
+            epoch,
+        },
+        producers: guard
+            .producer_states
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect(),
+        open: guard.open_txns.entries(),
+        aborted: guard.aborted_txns.snapshot(),
+    }
+}
+
+fn write_state(
+    fs: &dyn Fs,
+    dir: &std::path::Path,
+    state: &StateCapture,
+) -> Result<(), StorageError> {
+    write_producer_snapshot(fs, dir, &state.producers, state.covers).map_err(|e| match e {
+        ProducerSnapshotError::Io(e) => StorageError::Io(e),
+        ProducerSnapshotError::Json(e) => StorageError::Json(e),
+    })?;
+    write_txn_index_snapshot(fs, dir, &state.open, &state.aborted, state.covers).map_err(
+        |e| match e {
+            TxnIndexSnapshotError::Io(e) => StorageError::Io(e),
+            TxnIndexSnapshotError::Json(e) => StorageError::Json(e),
+        },
+    )
+}
+
+/// The committer's snapshot, written off the partition lock like its
+/// checkpoint. A failure only means a longer replay after a crash.
+///
+/// `stopped` is set once the partition is closed or abandoned, and holding it
+/// across the write is what makes that final: a write already under way
+/// finishes first, and a later one finds the flag. Otherwise this could land
+/// after a close's newer snapshot, or in a recreated topic's directory
+/// (gh #219). It also keeps two writers off the same `.tmp` path, which would
+/// tear the file. The epoch check covers a leader that's fenced but not closed.
+fn write_periodic_state(
+    fs: &dyn Fs,
+    dir: &std::path::Path,
+    stopped: &Mutex<bool>,
+    state: &StateCapture,
+) {
+    let stopped = stopped.lock();
+    if *stopped {
+        return;
+    }
+    if let Ok(ReadResult::Present(on_disk)) = manifest::read(fs, dir) {
+        if on_disk.epoch > state.covers.epoch {
+            return;
+        }
+    }
+    if let Err(error) = write_state(fs, dir, state) {
+        tracing::warn!(dir = %dir.display(), %error,
+            "could not write the partition state snapshots");
+    }
 }
 
 struct PartitionInner {
@@ -521,6 +817,10 @@ struct PartitionInner {
     /// [`CHECKPOINT_INTERVAL_BYTES`] past this, bounding how much of the
     /// tail a crash has to re-scan.
     last_checkpoint_byte: i64,
+    /// Log bytes appended since the state snapshots were last taken. Once it
+    /// reaches [`STATE_SNAPSHOT_INTERVAL_BYTES`] the committer takes them again
+    /// (gh #303).
+    unsnapshotted_bytes: u64,
     /// Monotonic counter incremented every time append decides to
     /// trigger a flush. Each appender's local copy of this value is
     /// what `acks=all` waits on `completed_flush_seq` to cover.
@@ -785,6 +1085,10 @@ pub struct Partition {
     snapshot: ArcSwap<ReadSnapshot>,
     flush: FlushCoord,
     committer: Mutex<Option<JoinHandle<()>>>,
+    /// Serialises snapshot writes, and is `true` once the partition has been
+    /// closed or abandoned: see [`write_periodic_state`]. Lock order is
+    /// `inner`, then this, and a holder of this never takes `inner`.
+    state_writes_stopped: Arc<Mutex<bool>>,
     /// Swappable so a `kafka-configs.sh --alter` on `segment.bytes` /
     /// `segment.ms` takes effect on a live partition, as it does in
     /// Apache. The retention sweep re-resolves it from the topic's
@@ -829,9 +1133,7 @@ impl Partition {
             log_start,
             closed,
             active,
-            producer_states,
-            open_txns,
-            aborted_txns,
+            restored,
         } = tokio::task::spawn_blocking(move || {
             open_blocking_retrying(fs_open.as_ref(), &dir_open)
         })
@@ -847,14 +1149,19 @@ impl Partition {
             epoch,
             pending_flush_records: 0,
             last_checkpoint_byte: 0,
+            unsnapshotted_bytes: if restored.replayed {
+                STATE_SNAPSHOT_INTERVAL_BYTES
+            } else {
+                0
+            },
             requested_flush_seq: 0,
             completed_flush_seq: 0,
             flush_err: None,
             log_start_unsaved: false,
             failed_flush_seq: 0,
-            producer_states,
-            open_txns,
-            aborted_txns,
+            producer_states: restored.producer_states,
+            open_txns: restored.open_txns,
+            aborted_txns: restored.aborted_txns,
         }));
         let initial_snapshot = snapshot_of(&inner.lock());
 
@@ -864,6 +1171,7 @@ impl Partition {
         // of `requested_flush_seq` covers all of them.
         let (req_tx, req_rx) = mpsc::channel::<()>(1);
         let cond = Arc::new(Notify::new());
+        let state_writes_stopped = Arc::new(Mutex::new(false));
 
         let committer_handle = spawn_committer(
             inner.clone(),
@@ -871,6 +1179,7 @@ impl Partition {
             req_rx,
             cfg.fsync_max_latency,
             fs.clone(),
+            state_writes_stopped.clone(),
         );
 
         Ok(Self {
@@ -878,6 +1187,7 @@ impl Partition {
             snapshot: ArcSwap::from(Arc::new(initial_snapshot)),
             flush: FlushCoord { req_tx, cond },
             committer: Mutex::new(Some(committer_handle)),
+            state_writes_stopped,
             cfg: ArcSwap::from_pointee(cfg),
             fs,
             topic,
@@ -922,6 +1232,7 @@ impl Partition {
         let inner = self.inner.clone();
         let fs = self.fs.clone();
         let flush = self.flush.clone();
+        let state_writes = self.state_writes_stopped.clone();
         let new_epoch = i64::from(epoch);
         // Same reasoning as the gh #210 open prologue: the roll fsyncs
         // the outgoing log and the persist writes two files, all
@@ -945,7 +1256,7 @@ impl Partition {
                 // a manifest that still says otherwise reports a takeover
                 // that never finished as complete — and nothing retries
                 // it (gh #227).
-                persist_state_locked(fs.as_ref(), &mut guard, new_epoch)?;
+                persist_state_locked(fs.as_ref(), &mut guard, new_epoch, &state_writes)?;
                 guard.epoch = new_epoch;
                 Ok(Some(snapshot_of(&guard)))
             })
@@ -990,7 +1301,13 @@ impl Partition {
         {
             let mut guard = self.inner.lock();
             let epoch = guard.epoch;
-            let persisted = persist_state_locked(self.fs.as_ref(), &mut guard, epoch)?;
+            let persisted = persist_state_locked(
+                self.fs.as_ref(),
+                &mut guard,
+                epoch,
+                &self.state_writes_stopped,
+            )?;
+            *self.state_writes_stopped.lock() = true;
             // gh #recovery-checkpoint: sync the log tail and checkpoint
             // the whole active segment as durable, so the next open
             // (this broker or the next leader, off the shared volume)
@@ -1058,6 +1375,7 @@ impl Partition {
             let mut guard = self.committer.lock();
             guard.take()
         };
+        *self.state_writes_stopped.lock() = true;
         {
             let mut guard = self.inner.lock();
             guard.active.close_handles();
@@ -1207,6 +1525,14 @@ impl Partition {
                 // then rescanned the whole segment. The takeover roll
                 // already reset it (gh #230 verification).
                 guard.last_checkpoint_byte = 0;
+                // A roll has just synced the log, so it's a good moment for
+                // state snapshots that are due. It's also the only moment for
+                // a topic whose appends never request a flush
+                // (`flush.messages=0`), which would otherwise replay everything
+                // since its last takeover after a crash.
+                if guard.unsnapshotted_bytes >= STATE_SNAPSHOT_INTERVAL_BYTES {
+                    let _ = self.flush.req_tx.try_send(());
+                }
                 // Deferred index-fsync + close runs off-lock on the
                 // blocking pool.
                 tokio::task::spawn_blocking(move || {
@@ -1233,6 +1559,7 @@ impl Partition {
 
             // Advance accounting.
             guard.high_water = assigned + i64::from(last_offset_delta) + 1;
+            guard.unsnapshotted_bytes = guard.unsnapshotted_bytes.saturating_add(batch_len_u64);
             let advanced_records = i64::from(last_offset_delta) + 1;
             guard.pending_flush_records += advanced_records;
 
@@ -1684,6 +2011,7 @@ fn persist_state_locked(
     fs: &dyn Fs,
     guard: &mut PartitionInner,
     epoch: i64,
+    state_writes: &Mutex<bool>,
 ) -> Result<bool, StorageError> {
     // gh #227: a fenced leader must not write its state over its
     // successor's. `close` / `relinquish` persist whatever the partition
@@ -1705,29 +2033,14 @@ fn persist_state_locked(
             return Ok(false);
         }
     }
-    let snap: Vec<(i64, ProducerEntry)> = guard
-        .producer_states
-        .iter()
-        .map(|(k, v)| (*k, v.clone()))
-        .collect();
-    write_producer_snapshot(fs, &guard.dir, &snap).map_err(|e| match e {
-        crate::producer_snapshot::ProducerSnapshotError::Io(e) => StorageError::Io(e),
-        crate::producer_snapshot::ProducerSnapshotError::Json(e) => StorageError::Json(e),
-    })?;
-    // gh #177: the read_committed indexes ride the same triggers and
-    // the same superseded-epoch guard as the producer snapshot — a
-    // fenced leader's stale LSO/abort state must not replay over its
-    // successor's either.
-    write_txn_index_snapshot(
-        fs,
-        &guard.dir,
-        &guard.open_txns.entries(),
-        &guard.aborted_txns.snapshot(),
-    )
-    .map_err(|e| match e {
-        crate::txn_index_snapshot::TxnIndexSnapshotError::Io(e) => StorageError::Io(e),
-        crate::txn_index_snapshot::TxnIndexSnapshotError::Json(e) => StorageError::Json(e),
-    })?;
+    // gh #177: the read_committed indexes ride the same triggers and the same
+    // superseded-epoch guard as the producer snapshot: a fenced leader's stale
+    // LSO/abort state must not replay over its successor's either.
+    {
+        let _writes = state_writes.lock();
+        write_state(fs, &guard.dir, &capture_state(guard, epoch))?;
+    }
+    guard.unsnapshotted_bytes = 0;
     // Re-checked at the write itself, not just at the top of this
     // function: the producer-snapshot write sits in between, and on a
     // slow substrate that is enough of a gap for a takeover to land
@@ -1835,6 +2148,7 @@ fn spawn_committer(
     mut req_rx: mpsc::Receiver<()>,
     fsync_max_latency: Option<Duration>,
     fs: Arc<dyn Fs>,
+    state_writes_stopped: Arc<Mutex<bool>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         while req_rx.recv().await.is_some() {
@@ -1847,23 +2161,37 @@ fn spawn_committer(
             }
 
             // Capture the seq we want to satisfy.
-            let target_seq = inner.lock().requested_flush_seq;
-            if target_seq == inner.lock().completed_flush_seq {
-                // Already satisfied by a previous cycle that
-                // coalesced multiple requests.
-                continue;
+            {
+                let guard = inner.lock();
+                if guard.requested_flush_seq == guard.completed_flush_seq
+                    && guard.unsnapshotted_bytes < STATE_SNAPSHOT_INTERVAL_BYTES
+                {
+                    // Already satisfied by a previous cycle that
+                    // coalesced multiple requests.
+                    continue;
+                }
             }
 
             let inner_clone = inner.clone();
             let fs_c = fs.clone();
+            let stopped = state_writes_stopped.clone();
             let fsync_handle = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
                 // Sync under the lock, then decide whether a fresh
                 // recovery checkpoint is due — but write it OFF the lock
                 // so the tmp+rename doesn't stall appenders.
-                let (seq, checkpoint) = {
+                let (seq, checkpoint, state) = {
                     let mut guard = inner_clone.lock();
                     guard.active.sync_log()?;
                     let seq = guard.requested_flush_seq;
+                    // Taken here because the log was synced under this lock
+                    // hold, so everything the snapshot covers is durable.
+                    // Reset optimistically, like the checkpoint below.
+                    let state =
+                        (guard.unsnapshotted_bytes >= STATE_SNAPSHOT_INTERVAL_BYTES).then(|| {
+                            guard.unsnapshotted_bytes = 0;
+                            let epoch = guard.epoch;
+                            (capture_state(&guard, epoch), guard.dir.clone())
+                        });
                     let durable = i64::try_from(guard.active.log_size()).unwrap_or(i64::MAX);
                     let cp = if durable.saturating_sub(guard.last_checkpoint_byte)
                         >= CHECKPOINT_INTERVAL_BYTES
@@ -1887,10 +2215,13 @@ fn spawn_committer(
                     } else {
                         None
                     };
-                    (seq, cp)
+                    (seq, cp, state)
                 };
                 if let Some((cp, dir)) = checkpoint {
                     let _ = recovery_checkpoint::write(fs_c.as_ref(), &dir, &cp);
+                }
+                if let Some((state, dir)) = state {
+                    write_periodic_state(fs_c.as_ref(), &dir, &stopped, &state);
                 }
                 Ok(seq)
             });
@@ -2699,6 +3030,530 @@ pub(crate) mod tests {
         });
     }
 
+    async fn open_partition(
+        fs: &Arc<dyn Fs>,
+        dir: &std::path::Path,
+        cfg: PartitionConfig,
+    ) -> Partition {
+        Partition::open(fs.clone(), "t".into(), 0, dir.to_path_buf(), cfg)
+            .await
+            .unwrap()
+    }
+
+    /// An idempotent, non-transactional batch.
+    fn build_idempotent_batch(pid: i64, num_records: i32, base_seq: i32) -> Bytes {
+        let mut buf = build_txn_data_batch_seq(pid, num_records, base_seq).to_vec();
+        buf[21..23].copy_from_slice(&0i16.to_be_bytes());
+        crate::segment::stamp_crc(&mut buf);
+        Bytes::from(buf)
+    }
+
+    fn open_entries(p: &Partition) -> Vec<(i64, i64)> {
+        let mut entries = p.inner.lock().open_txns.entries();
+        entries.sort_unstable();
+        entries
+    }
+
+    /// gh #303, the issue's repro. Everything appended since the last takeover
+    /// was missing from the indexes after a crash, so the open transaction's
+    /// records were exposed, and once aborted they were served as committed.
+    #[test]
+    fn a_crash_keeps_an_open_transaction_open_and_its_abort_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            p.take_over(1).await.unwrap();
+            p.append(1, -1, build_batch(2, 1_000)).await.unwrap();
+            p.append(1, -1, build_txn_data_batch(77, 3)).await.unwrap();
+            assert_eq!((p.high_watermark(), p.last_stable_offset()), (5, 2));
+            drop(p); // crash
+
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            assert_eq!(p.high_watermark(), 5);
+            assert_eq!(p.last_stable_offset(), 2, "the transaction is still open");
+            p.take_over(2).await.unwrap();
+            p.append(2, -1, build_marker_batch(77, false))
+                .await
+                .unwrap();
+
+            assert_eq!(p.last_stable_offset(), p.high_watermark());
+            assert_eq!(
+                p.aborted_in_range(0, i64::MAX),
+                vec![AbortedTxn {
+                    producer_id: 77,
+                    first_offset: 2,
+                    last_offset: 5,
+                }],
+                "without this entry a read_committed consumer delivers the \
+                 aborted records as committed"
+            );
+            p.close().await.unwrap();
+        });
+    }
+
+    /// gh #288's probe: a finished abort and an open transaction, both after
+    /// the takeover.
+    #[test]
+    fn a_crash_rebuilds_aborts_as_well_as_open_transactions() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            p.take_over(1).await.unwrap();
+            p.append(1, -1, build_txn_data_batch(7, 3)).await.unwrap();
+            p.append(1, -1, build_marker_batch(7, false)).await.unwrap();
+            p.append(1, -1, build_txn_data_batch(42, 3)).await.unwrap();
+            drop(p);
+
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            assert_eq!(p.high_watermark(), 7);
+            assert_eq!(p.last_stable_offset(), 4);
+            assert_eq!(p.aborted_in_range(0, i64::MAX).len(), 1);
+            p.close().await.unwrap();
+        });
+    }
+
+    /// The half of gh #303 the issue only inferred: without the window a retry
+    /// after a crash is written twice, and the client has two copies.
+    #[test]
+    fn a_crash_keeps_the_dedupe_window() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            p.take_over(1).await.unwrap();
+            let first = build_idempotent_batch(9, 2, 0);
+            let second = build_idempotent_batch(9, 2, 2);
+            assert_eq!(p.append(1, -1, first).await.unwrap(), 0);
+            assert_eq!(p.append(1, -1, second.clone()).await.unwrap(), 2);
+            drop(p);
+
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            assert_eq!(
+                p.append(1, -1, second).await.unwrap(),
+                2,
+                "a retry of an acked batch echoes its offset"
+            );
+            assert_eq!(p.high_watermark(), 4, "and isn't written again");
+            assert_eq!(
+                p.append(1, -1, build_idempotent_batch(9, 1, 4))
+                    .await
+                    .unwrap(),
+                4,
+                "the producer's next sequence still follows on"
+            );
+            assert!(matches!(
+                p.append(1, -1, build_idempotent_batch(9, 1, 9)).await,
+                Err(StorageError::OutOfOrderSequence)
+            ));
+            p.close().await.unwrap();
+        });
+    }
+
+    #[test]
+    fn replay_crosses_segment_rolls() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let one_len = u64::try_from(build_batch(1, 1_000).len()).unwrap();
+            let cfg = PartitionConfig {
+                segment_bytes: one_len,
+                ..Default::default()
+            };
+            let p = open_partition(&fs, tmp.path(), cfg.clone()).await;
+            p.take_over(1).await.unwrap();
+            p.append(1, -1, build_txn_data_batch(7, 1)).await.unwrap(); // 0
+            p.append(1, -1, build_batch(1, 1_000)).await.unwrap(); // 1
+            p.append(1, -1, build_marker_batch(7, false)).await.unwrap(); // 2
+            p.append(1, -1, build_txn_data_batch(8, 1)).await.unwrap(); // 3
+            p.append(1, -1, build_batch(1, 1_000)).await.unwrap(); // 4
+            assert!(p.inner.lock().closed.len() >= 3);
+            drop(p);
+
+            let p = open_partition(&fs, tmp.path(), cfg).await;
+            assert_eq!(p.high_watermark(), 5);
+            assert_eq!(p.last_stable_offset(), 3);
+            assert_eq!(
+                p.aborted_in_range(0, i64::MAX),
+                vec![AbortedTxn {
+                    producer_id: 7,
+                    first_offset: 0,
+                    last_offset: 2,
+                }]
+            );
+            p.close().await.unwrap();
+        });
+    }
+
+    /// Replay starts from what the snapshot covers. Landing below it would
+    /// count a finished transaction twice.
+    #[test]
+    fn replay_does_not_repeat_what_the_snapshot_holds() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            p.append(0, -1, build_txn_data_batch(7, 3)).await.unwrap();
+            p.append(0, -1, build_marker_batch(7, false)).await.unwrap();
+            p.close().await.unwrap(); // covers everything so far
+
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            assert_eq!(p.aborted_in_range(0, i64::MAX).len(), 1);
+            p.append(0, -1, build_txn_data_batch(8, 3)).await.unwrap();
+            p.append(0, -1, build_marker_batch(8, false)).await.unwrap();
+            drop(p);
+
+            // Twice, because reopening doesn't write the snapshots: the second
+            // open starts from the same point as the first.
+            for _ in 0..2 {
+                let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+                assert_eq!(p.high_watermark(), 8);
+                let aborted = p.aborted_in_range(0, i64::MAX);
+                assert_eq!(
+                    aborted.iter().map(|a| a.producer_id).collect::<Vec<_>>(),
+                    vec![7, 8]
+                );
+                drop(p);
+            }
+        });
+    }
+
+    /// `covers.byte_pos` is only a hint. A wrong one has to cost a longer walk,
+    /// never a missed batch.
+    #[test]
+    fn a_wrong_byte_position_only_costs_a_longer_walk() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            p.append(0, -1, build_batch(2, 1_000)).await.unwrap();
+            p.close().await.unwrap();
+            let covers = SnapshotCoverage {
+                offset: 2,
+                byte_pos: 7,
+                epoch: 0,
+            };
+            write_producer_snapshot(fs.as_ref(), tmp.path(), &[], covers).unwrap();
+            write_txn_index_snapshot(fs.as_ref(), tmp.path(), &[], &[], covers).unwrap();
+
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            p.append(0, -1, build_txn_data_batch(8, 3)).await.unwrap();
+            drop(p);
+
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            assert_eq!(p.last_stable_offset(), 2);
+            p.close().await.unwrap();
+        });
+    }
+
+    /// What the release before gh #303 left behind: no `covers`, so nothing says
+    /// how stale it is. The indexes come from the log, and the window keeps
+    /// what only it knows.
+    #[test]
+    fn a_snapshot_without_coverage_is_rebuilt_from_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            p.append(0, -1, build_txn_data_batch(7, 3)).await.unwrap();
+            p.append(0, -1, build_marker_batch(7, false)).await.unwrap();
+            p.append(0, -1, build_txn_data_batch(42, 3)).await.unwrap();
+            p.close().await.unwrap();
+
+            std::fs::write(
+                tmp.path().join(TXN_INDEX_SNAPSHOT_FILENAME),
+                r#"{"version":1,"open":[{"producer_id":7,"first_offset":0}]}"#,
+            )
+            .unwrap();
+            // Producer 5's batches have aged out of this log.
+            std::fs::write(
+                tmp.path().join(PRODUCER_SNAPSHOT_FILENAME),
+                r#"{"version":1,"entries":[{"producer_id":5,"epoch":3,"recent":
+                    [{"first_seq":10,"last_seq":10,"base_offset":0}]}]}"#,
+            )
+            .unwrap();
+
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            assert_eq!(open_entries(&p), vec![(42, 4)]);
+            assert_eq!(p.aborted_in_range(0, i64::MAX).len(), 1);
+            let window = p.inner.lock().producer_states.get(&5).cloned().unwrap();
+            assert_eq!((window.epoch, window.recent.len()), (3, 1));
+            p.close().await.unwrap();
+        });
+    }
+
+    /// A torn snapshot used to refuse the partition until someone removed the
+    /// file by hand. The log can replace it.
+    #[test]
+    fn an_unparseable_snapshot_is_rebuilt_from_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            p.append(0, -1, build_txn_data_batch(42, 3)).await.unwrap();
+            p.close().await.unwrap();
+            std::fs::write(tmp.path().join(TXN_INDEX_SNAPSHOT_FILENAME), "{ torn").unwrap();
+            std::fs::write(tmp.path().join(PRODUCER_SNAPSHOT_FILENAME), "{ torn").unwrap();
+
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            assert_eq!(open_entries(&p), vec![(42, 0)]);
+            p.close().await.unwrap();
+        });
+    }
+
+    /// The tail a snapshot describes can be gone: `close` writes the snapshots
+    /// before its last sync. A transaction in the lost tail isn't open, and a
+    /// retry of a lost batch must be written again, not answered as a duplicate.
+    #[test]
+    fn a_snapshot_past_the_log_end_describes_nothing_that_survived() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            let log = p.inner.lock().active.meta.log_path.clone();
+            let kept = build_idempotent_batch(9, 1, 0);
+            let lost = build_idempotent_batch(9, 1, 1);
+            p.append(0, -1, kept.clone()).await.unwrap();
+            p.append(0, -1, lost.clone()).await.unwrap();
+            p.append(0, -1, build_txn_data_batch(42, 1)).await.unwrap();
+            p.close().await.unwrap();
+            let f = std::fs::OpenOptions::new().write(true).open(&log).unwrap();
+            f.set_len(u64::try_from(kept.len()).unwrap()).unwrap();
+            drop(f);
+
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            assert_eq!(p.high_watermark(), 1);
+            assert_eq!(p.last_stable_offset(), 1, "the transaction was lost");
+            assert!(open_entries(&p).is_empty());
+            assert_eq!(p.append(0, -1, kept).await.unwrap(), 0, "still a duplicate");
+            assert_eq!(p.append(0, -1, lost).await.unwrap(), 1, "written again");
+            assert_eq!(p.high_watermark(), 2);
+            p.close().await.unwrap();
+        });
+    }
+
+    /// The bad snapshot can't wait for the next persist. A restart at the same
+    /// epoch doesn't write one, so the log can grow back past its `covers`, and
+    /// the next crash would take it for a good one.
+    #[test]
+    fn a_snapshot_past_the_log_end_cannot_come_back_after_the_log_regrows() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let cfg = PartitionConfig::default();
+            let p = open_partition(&fs, tmp.path(), cfg.clone()).await;
+            let log = p.inner.lock().active.meta.log_path.clone();
+            let kept = build_batch(1, 1_000);
+            p.append(0, -1, kept.clone()).await.unwrap();
+            p.append(0, -1, build_txn_data_batch(66, 1)).await.unwrap();
+            p.close().await.unwrap();
+            let f = std::fs::OpenOptions::new().write(true).open(&log).unwrap();
+            f.set_len(u64::try_from(kept.len()).unwrap()).unwrap();
+            drop(f);
+
+            let p = open_partition(&fs, tmp.path(), cfg.clone()).await;
+            assert!(open_entries(&p).is_empty());
+            for _ in 0..3 {
+                p.append(0, -1, build_batch(1, 1_000)).await.unwrap();
+            }
+            drop(p); // crash, with HWM 4 now past the old snapshot's `covers`
+
+            let p = open_partition(&fs, tmp.path(), cfg).await;
+            assert_eq!(p.high_watermark(), 4);
+            assert!(
+                open_entries(&p).is_empty(),
+                "producer 66's transaction was in the lost tail"
+            );
+            p.close().await.unwrap();
+        });
+    }
+
+    /// Otherwise a crash loop replays the same bytes every time, and a rebuild
+    /// from log start stays a rebuild from log start.
+    #[test]
+    fn a_replay_is_saved_by_the_next_flush() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let cfg = PartitionConfig::default();
+            let p = open_partition(&fs, tmp.path(), cfg.clone()).await;
+            p.append(0, -1, build_txn_data_batch(42, 2)).await.unwrap();
+            drop(p);
+
+            let p = open_partition(&fs, tmp.path(), cfg).await;
+            assert_eq!(snapshot_covers(fs.as_ref(), tmp.path()), None);
+            p.append(0, -1, build_batch(1, 1_000)).await.unwrap();
+            let covers = snapshot_covers(fs.as_ref(), tmp.path()).expect("re-taken");
+            assert_eq!(covers.offset, 3);
+            p.close().await.unwrap();
+        });
+    }
+
+    /// A fenced leader's write can land after its successor's takeover, because
+    /// NFS has no compare-and-swap, and it may name batches the successor's log
+    /// never held.
+    #[test]
+    fn a_fenced_leaders_snapshot_is_not_trusted() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            p.take_over(5).await.unwrap();
+            p.append(5, -1, build_txn_data_batch(42, 2)).await.unwrap();
+            p.close().await.unwrap();
+            let covers = SnapshotCoverage {
+                offset: 2,
+                byte_pos: 0,
+                epoch: 4,
+            };
+            write_txn_index_snapshot(fs.as_ref(), tmp.path(), &[(66, 0)], &[], covers).unwrap();
+
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            assert_eq!(open_entries(&p), vec![(42, 0)]);
+            p.close().await.unwrap();
+        });
+    }
+
+    /// A deposed leader keeps writing to its old file until it learns it was
+    /// deposed (gh #164), at offsets its successor reissues. Those batches are
+    /// in the directory but not in the log.
+    #[test]
+    fn a_deposed_leaders_late_batches_are_not_replayed() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            use std::io::Write;
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            p.take_over(1).await.unwrap();
+            let old_log = p.inner.lock().active.meta.log_path.clone();
+            p.append(1, -1, build_txn_data_batch(7, 1)).await.unwrap();
+            p.take_over(2).await.unwrap(); // the successor rolls at offset 1
+            p.append(2, -1, build_batch(1, 1_000)).await.unwrap();
+            drop(p);
+
+            let mut late = build_txn_data_batch(66, 1).to_vec();
+            late[0..8].copy_from_slice(&1i64.to_be_bytes());
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&old_log)
+                .unwrap();
+            f.write_all(&late).unwrap();
+            drop(f);
+            // Force the walk through the old file.
+            std::fs::remove_file(tmp.path().join(TXN_INDEX_SNAPSHOT_FILENAME)).unwrap();
+            std::fs::remove_file(tmp.path().join(PRODUCER_SNAPSHOT_FILENAME)).unwrap();
+
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            assert_eq!(open_entries(&p), vec![(7, 0)]);
+            p.close().await.unwrap();
+        });
+    }
+
+    fn snapshot_covers(fs: &dyn Fs, dir: &std::path::Path) -> Option<SnapshotCoverage> {
+        read_producer_snapshot(fs, dir)
+            .ok()
+            .flatten()
+            .and_then(|(_, covers)| covers)
+    }
+
+    /// The bound on replay: the committer keeps the snapshots near the log end,
+    /// so a crash doesn't walk everything since the last takeover.
+    #[test]
+    fn the_committer_snapshots_state_as_the_log_grows() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            p.append(0, -1, build_txn_data_batch(42, 1)).await.unwrap();
+            assert_eq!(snapshot_covers(fs.as_ref(), tmp.path()), None);
+            let batch = u64::try_from(build_batch(1, 1_000).len()).unwrap();
+            for _ in 0..(STATE_SNAPSHOT_INTERVAL_BYTES / batch + 2) {
+                p.append(0, -1, build_batch(1, 1_000)).await.unwrap();
+            }
+            let covers = snapshot_covers(fs.as_ref(), tmp.path()).expect("a snapshot was taken");
+            assert!(covers.offset > 1, "{covers:?}");
+            assert!(covers.byte_pos > 0, "{covers:?}");
+            p.append(0, -1, build_marker_batch(42, false))
+                .await
+                .unwrap();
+            drop(p);
+
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            assert_eq!(p.aborted_in_range(0, i64::MAX).len(), 1);
+            assert_eq!(p.last_stable_offset(), p.high_watermark());
+            p.close().await.unwrap();
+        });
+    }
+
+    /// `flush.messages=0` never requests a flush, so only a roll can get the
+    /// snapshots taken, however small the segments are.
+    #[test]
+    fn a_topic_that_never_flushes_still_snapshots_at_a_roll() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let batch = u64::try_from(build_batch(1, 1_000).len()).unwrap();
+            let p = open_partition(
+                &fs,
+                tmp.path(),
+                PartitionConfig {
+                    segment_bytes: batch * 8,
+                    flush_interval_messages: 0,
+                    ..Default::default()
+                },
+            )
+            .await;
+            for _ in 0..(STATE_SNAPSHOT_INTERVAL_BYTES / batch + 16) {
+                p.append(0, 1, build_batch(1, 1_000)).await.unwrap();
+            }
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while snapshot_covers(fs.as_ref(), tmp.path()).is_none() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "no snapshot was taken"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            p.close().await.unwrap();
+        });
+    }
+
+    /// A close's snapshot is the last word, and an abandoned topic's directory
+    /// may already belong to its next incarnation (gh #219).
+    #[test]
+    fn a_periodic_write_stops_at_close_and_at_a_higher_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = RealFs::new();
+        let state = StateCapture {
+            covers: SnapshotCoverage {
+                offset: 1,
+                byte_pos: 0,
+                epoch: 3,
+            },
+            producers: Vec::new(),
+            open: Vec::new(),
+            aborted: Vec::new(),
+        };
+
+        write_periodic_state(&fs, tmp.path(), &Mutex::new(true), &state);
+        assert_eq!(snapshot_covers(&fs, tmp.path()), None, "stopped");
+
+        let manifest = Manifest {
+            epoch: 4,
+            high_watermark: 0,
+            log_start_offset: 0,
+        };
+        manifest::write_unless_superseded(&fs, tmp.path(), &manifest).unwrap();
+        write_periodic_state(&fs, tmp.path(), &Mutex::new(false), &state);
+        assert_eq!(snapshot_covers(&fs, tmp.path()), None, "superseded");
+
+        let mut current = state;
+        current.covers.epoch = 4;
+        write_periodic_state(&fs, tmp.path(), &Mutex::new(false), &current);
+        assert_eq!(snapshot_covers(&fs, tmp.path()), Some(current.covers));
+    }
+
     /// gh #177: a snapshotted aborted entry whose span fell below
     /// log_start while the partition was closed is evicted on restore,
     /// and delete_records evicts live entries as it advances.
@@ -2739,6 +3594,11 @@ pub(crate) mod tests {
                     first_offset: 0,
                     last_offset: 3,
                 }],
+                SnapshotCoverage {
+                    offset: 4,
+                    byte_pos: 0,
+                    epoch: 0,
+                },
             )
             .unwrap();
             let p2 = Partition::open(

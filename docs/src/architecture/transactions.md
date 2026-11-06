@@ -41,9 +41,11 @@ Sequences wrap from `i32::MAX` to 0, and a PID with no state accepts any
 sequence, both as in Apache. That second rule matters for a live producer
 whose entry has expired or whose records have been deleted.
 
-The ring survives leadership moves via `producer-state.snapshot`
-(written on take-over + relinquish, restored on open — see
-[File-handle ownership](./file-handles.md)).
+The ring survives leadership moves and crashes: `producer-state.snapshot`
+is written on take-over, relinquish and every 64 MiB of log, and an open
+replays the log after it (see
+[File-handle ownership](./file-handles.md)). So a retry of a batch acked
+before a crash is still answered as a duplicate.
 
 ### PIDs are never reused
 

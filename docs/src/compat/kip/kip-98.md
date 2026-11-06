@@ -36,9 +36,10 @@ under the partition mutex as duplicate (echo the cached `baseOffset`, no
 log write), out-of-order (wire error 45), invalid epoch (wire 47), or
 accept. Sequences wrap to 0, and a PID with no state accepts any sequence,
 both as in Apache. Only the 57-byte v2 batch header is parsed; record
-payloads stay opaque. The window survives restart via `producer-state.snapshot`
-(`crates/kaas-storage/src/producer_snapshot.rs`), written on take-over
-and close/relinquish beside `manifest.json`.
+payloads stay opaque. The window survives restart and crash via
+`producer-state.snapshot` (`crates/kaas-storage/src/producer_snapshot.rs`),
+written on take-over, close/relinquish and every 64 MiB of log beside
+`manifest.json`, plus a replay of the log after it on open.
 
 **Transactions — with three honest substitutions:**
 

@@ -82,13 +82,16 @@ Sibling files ride along with every partition's segments:
   the log start — not per append, and not on segment roll — so recovery
   treats the log itself as authoritative for the high watermark.
 - `producer-state.snapshot` — the idempotent-producer dedupe window,
-  written on takeover and close/relinquish, restored when the partition
-  opens. Without it a leadership move would drop the per-producer
-  sequence history, and in-flight producer retries would be misclassified
-  as `OUT_OF_ORDER_SEQUENCE_NUMBER` instead of duplicates.
+  written on takeover, close/relinquish and every 64 MiB of log, restored
+  when the partition opens. Without it a leadership move would drop the
+  per-producer sequence history, and in-flight producer retries would be
+  misclassified as `OUT_OF_ORDER_SEQUENCE_NUMBER` instead of duplicates.
 - `txn-index.snapshot` — the `read_committed` indexes: open transactions'
   first offsets, which set the last stable offset, and the aborted list.
-  Written alongside the producer snapshot and restored on open.
+  Written alongside the producer snapshot and restored on open. Both record
+  what part of the log they cover, and an open replays the log after that
+  point, so a crash loses nothing the log still holds (see the
+  [storage hot path](./storage-hot-path.md)).
 - `recovery-checkpoint.json` — how far the log is known to be fsynced; see
   the [storage hot path](./storage-hot-path.md).
 

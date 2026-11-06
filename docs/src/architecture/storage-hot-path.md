@@ -281,6 +281,33 @@ checkpointed batch: corruption there is not detected. A fenced
 leader's close still skips writing a checkpoint, since the directory
 belongs to its successor.
 
+### Transaction and producer state — the log decides
+
+`producer-state.snapshot` and `txn-index.snapshot` are written at takeover,
+at close and every 64 MiB of log, so after an unclean stop they lag the log.
+Each records what it covers: an offset, a byte position that saves walking
+the segment, and the writer's epoch. On open, the partition starts from a
+snapshot that checks out and replays the batch headers after it through the
+same bookkeeping `append` uses. So after a crash `read_committed` consumers
+still see the last stable offset held at an open transaction, the aborted
+list still filters aborted records, and a retry of an acked batch is still
+answered as a duplicate.
+
+With no usable snapshot the indexes are rebuilt from log start, which is what
+Apache does for a log with no producer snapshot. That covers a file from before
+this field existed, one that doesn't parse, one written by a fenced leader, one
+that covers offsets below log start, and one past the end of the recovered log.
+That last kind is also removed: a restart at the same epoch writes no snapshot,
+so otherwise the log could regrow past it and it would pass for a good one. The
+window is kept through a rebuild, because it's all that's left for a producer
+whose batches have aged out, and only entries past the log end are dropped.
+
+A crash replays at most about 64 MiB of headers, or a whole log the first time
+it rebuilds from log start. Only headers are read, so a log with large batches
+costs one read per batch. The one thing not recovered: a cross-partition epoch
+fence lives in memory until the next snapshot, so a crash can lose it on a
+partition the producer's new session hasn't written to yet.
+
 The index is **sparse**: one `(rel_offset: i32, file_pos: i32)` entry
 every `index.interval.bytes` of log data (4 KiB default). Lookup
 binary-searches to the closest entry ≤ the target offset, then scans

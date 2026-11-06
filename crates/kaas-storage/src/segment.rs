@@ -468,6 +468,60 @@ pub fn scan_high_watermark_from<R: Read + Seek>(
     })
 }
 
+/// How much of a batch [`walk_batch_prefixes`] hands over: the v2 header
+/// (61 bytes) plus a control batch's key type, at bytes 68..70.
+pub const BATCH_PREFIX_LEN: usize = 70;
+
+/// A v2 batch's fixed header, less the 12 bytes `batchLength` doesn't count.
+const MIN_BATCH_LENGTH: i32 = 49;
+
+/// Read-ahead for [`walk_batch_prefixes`]. Small batches are served from it,
+/// and a batch larger than it costs one read for its header.
+const BATCH_WALK_BUF_SIZE: usize = 64 * 1024;
+
+/// Walk a log's batches from `start_byte`, which must be a batch boundary,
+/// handing `visit` the first [`BATCH_PREFIX_LEN`] bytes of each until it
+/// breaks or the log ends. Record bodies are skipped rather than read, so
+/// byte opacity holds. No CRCs are checked here: the recovery scan vouches
+/// for the active segment, and a closed segment was fsynced at its roll. A
+/// structurally impossible batch ends the walk like the end of the file does.
+pub fn walk_batch_prefixes<R: Read + Seek>(
+    f: &mut R,
+    start_byte: u64,
+    mut visit: impl FnMut(&[u8]) -> std::ops::ControlFlow<()>,
+) -> io::Result<()> {
+    fn read_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<bool> {
+        match r.read_exact(buf) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    f.seek(SeekFrom::Start(start_byte))?;
+    let mut br = BufReader::with_capacity(BATCH_WALK_BUF_SIZE, f);
+    let mut prefix = [0u8; BATCH_PREFIX_LEN];
+    loop {
+        if !read_or_eof(&mut br, &mut prefix[..12])? {
+            return Ok(());
+        }
+        let batch_length = i32::from_be_bytes([prefix[8], prefix[9], prefix[10], prefix[11]]);
+        if batch_length < MIN_BATCH_LENGTH {
+            return Ok(());
+        }
+        let body = usize::try_from(batch_length).unwrap_or(0);
+        let wanted = body.min(BATCH_PREFIX_LEN - 12);
+        let end = 12 + wanted;
+        if !read_or_eof(&mut br, &mut prefix[12..end])? {
+            return Ok(());
+        }
+        if visit(&prefix[..end]).is_break() {
+            return Ok(());
+        }
+        br.seek_relative(i64::try_from(body - wanted).unwrap_or(i64::MAX))?;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // search_index
 // ---------------------------------------------------------------------------
@@ -1259,6 +1313,46 @@ mod tests {
             "a partial tail is not a batch"
         );
         assert_eq!(batch_attributes(&[]).count(), 0);
+    }
+
+    #[test]
+    fn walking_batches_reads_the_prefix_and_skips_the_body() {
+        fn batch(base: i64, body: usize) -> Vec<u8> {
+            let mut buf = vec![0xAB; 12 + body];
+            buf[0..8].copy_from_slice(&base.to_be_bytes());
+            let length = i32::try_from(body).unwrap();
+            buf[8..12].copy_from_slice(&length.to_be_bytes());
+            buf
+        }
+        fn bases(log: &[u8], start: u64) -> Vec<(i64, usize)> {
+            let mut seen = Vec::new();
+            walk_batch_prefixes(&mut std::io::Cursor::new(log), start, |prefix| {
+                let mut base = [0u8; 8];
+                base.copy_from_slice(&prefix[..8]);
+                seen.push((i64::from_be_bytes(base), prefix.len()));
+                std::ops::ControlFlow::Continue(())
+            })
+            .unwrap();
+            seen
+        }
+
+        // Shorter than the prefix, far longer than the read-ahead, and in between.
+        let mut log = batch(0, 49);
+        log.extend(batch(1, BATCH_WALK_BUF_SIZE * 3));
+        log.extend(batch(2, 200));
+        let first_len = u64::try_from(batch(0, 49).len()).unwrap();
+        assert_eq!(bases(&log, 0), vec![(0, 61), (1, 70), (2, 70)]);
+        assert_eq!(bases(&log, first_len), vec![(1, 70), (2, 70)]);
+
+        // A batch cut short ends the walk.
+        let mut torn = batch(0, 49);
+        torn.extend(&batch(1, 200)[..40]);
+        assert_eq!(bases(&torn, 0), vec![(0, 61)]);
+
+        // So does a length no batch can have, such as a zero-filled tail.
+        let mut zeroed = batch(0, 49);
+        zeroed.extend([0u8; 64]);
+        assert_eq!(bases(&zeroed, 0), vec![(0, 61)]);
     }
 
     #[test]
