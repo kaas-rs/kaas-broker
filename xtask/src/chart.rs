@@ -27,7 +27,7 @@ fn parse_documents(rendered: &str) -> Result<usize> {
     Ok(documents)
 }
 
-fn check_render(root: &Path, label: &str, args: &[&str]) -> Result<()> {
+fn render(root: &Path, label: &str, args: &[&str]) -> Result<String> {
     let output = Command::new("helm")
         .current_dir(root)
         .args(["template", "check-chart", CHART])
@@ -40,7 +40,80 @@ fn check_render(root: &Path, label: &str, args: &[&str]) -> Result<()> {
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    let rendered = String::from_utf8(output.stdout).context("helm wrote invalid UTF-8")?;
+    String::from_utf8(output.stdout).context("helm wrote invalid UTF-8")
+}
+
+/// The value the rendered StatefulSet gives env var `name`, if it sets one.
+fn statefulset_env(rendered: &str, name: &str) -> Result<Option<String>> {
+    for document in serde_yaml::Deserializer::from_str(rendered) {
+        let document = serde_yaml::Value::deserialize(document)?;
+        if document.get("kind").and_then(serde_yaml::Value::as_str) != Some("StatefulSet") {
+            continue;
+        }
+        let containers = document
+            .get("spec")
+            .and_then(|v| v.get("template"))
+            .and_then(|v| v.get("spec"))
+            .and_then(|v| v.get("containers"))
+            .and_then(serde_yaml::Value::as_sequence)
+            .map_or(&[][..], Vec::as_slice);
+        for container in containers {
+            let env = container
+                .get("env")
+                .and_then(serde_yaml::Value::as_sequence)
+                .map_or(&[][..], Vec::as_slice);
+            for var in env {
+                if var.get("name").and_then(serde_yaml::Value::as_str) == Some(name) {
+                    return Ok(var
+                        .get("value")
+                        .and_then(serde_yaml::Value::as_str)
+                        .map(str::to_owned));
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+/// `0` is a documented setting for these, and Sprig's `default` reads it as
+/// unset. `retentionCheckIntervalSeconds: 0` was documented as turning the
+/// sweep off and rendered as 300, so data kept being deleted (gh #342).
+fn check_zero_values(root: &Path) -> Result<()> {
+    const ZERO_IS_VALID: [(&str, &str, &str); 3] = [
+        (
+            "broker.flushIntervalMessages",
+            "KAAS_FLUSH_INTERVAL_MESSAGES",
+            "1",
+        ),
+        (
+            "broker.retentionCheckIntervalSeconds",
+            "KAAS_RETENTION_CHECK_INTERVAL",
+            "300",
+        ),
+        (
+            "broker.fsyncMaxLatencyMs",
+            "KAAS_FSYNC_MAX_LATENCY_MS",
+            "30000",
+        ),
+    ];
+    let defaults = render(root, "zero values", &[])?;
+    for (value, env, default) in ZERO_IS_VALID {
+        let rendered = render(root, "zero values", &["--set", &format!("{value}=0")])?;
+        let zero = statefulset_env(&rendered, env)?;
+        if zero.as_deref() != Some("0") {
+            bail!("{value}=0 renders {env} as {zero:?}, not 0");
+        }
+        let unset = statefulset_env(&defaults, env)?;
+        if unset.as_deref() != Some(default) {
+            bail!("the default for {value} renders {env} as {unset:?}, not {default}");
+        }
+    }
+    println!("check-chart: zero values: all reach the broker");
+    Ok(())
+}
+
+fn check_render(root: &Path, label: &str, args: &[&str]) -> Result<()> {
+    let rendered = render(root, label, args)?;
     let documents = parse_documents(&rendered)
         .with_context(|| format!("{label}: the chart renders invalid YAML"))?;
     if documents == 0 {
@@ -59,6 +132,7 @@ pub fn check(root: &Path, extra_values: Option<&str>) -> Result<()> {
         "control plane",
         &["--set", "storage.controlPlane.enabled=true"],
     )?;
+    check_zero_values(root)?;
 
     let mut value_files: Vec<_> = std::fs::read_dir(root.join(CI_VALUES))?
         .collect::<std::io::Result<Vec<_>>>()?

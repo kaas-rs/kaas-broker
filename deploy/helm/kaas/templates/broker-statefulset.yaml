@@ -147,10 +147,13 @@ spec:
               value: "{{ .Values.broker.controllerLease.renewDeadlineSeconds }}"
             - name: KAAS_CONTROLLER_RETRY_PERIOD_SECONDS
               value: "{{ .Values.broker.controllerLease.retryPeriodSeconds }}"
+            {{- /* NOT `| default`: helm's default treats 0 as unset, and 0
+                 is a documented value for both of these (gh #342). Only a
+                 truly absent key falls back. `xtask check-chart` pins it. */}}
             - name: KAAS_FLUSH_INTERVAL_MESSAGES
-              value: "{{ .Values.broker.flushIntervalMessages | default 1 }}"
+              value: "{{ if kindIs "invalid" .Values.broker.flushIntervalMessages }}1{{ else }}{{ .Values.broker.flushIntervalMessages | int }}{{ end }}"
             - name: KAAS_RETENTION_CHECK_INTERVAL
-              value: "{{ .Values.broker.retentionCheckIntervalSeconds | default 300 }}"
+              value: "{{ if kindIs "invalid" .Values.broker.retentionCheckIntervalSeconds }}300{{ else }}{{ .Values.broker.retentionCheckIntervalSeconds | int }}{{ end }}"
             # gh #253: Apache's message.max.bytes — broker-wide cap on
             # one Produce record batch. Same default as Apache
             # (1 MiB + batch-header overhead).

@@ -86,8 +86,8 @@ section).
 - `broker.minReadySeconds` (default 60) — how long a freshly Ready broker
   must stay Ready before the rollout proceeds to the next pod.
 - `broker.retentionCheckIntervalSeconds` (default 300) — the retention
-  sweep interval. The chart can't set `0` yet (tracked as gh #342); to keep a
-  topic's data, set its `retentionMs: -1`.
+  sweep interval. `0` turns the sweep off for every topic on the broker; to
+  keep one topic's data, set its `retentionMs: -1` instead.
 - `broker.maxMessageBytes` (default 1048588) — Apache's
   `message.max.bytes`, the cap on one Produce batch.
 - `broker.fsyncMaxLatencyMs` (default 30000) — fsync watchdog deadline;

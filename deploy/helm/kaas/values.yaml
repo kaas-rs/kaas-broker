@@ -119,8 +119,6 @@ broker:
   #               storage substrate's write cache is power-fail safe.
   #   0           — disable message-driven flushing entirely. Fsync only
   #               at segment roll. Maximum throughput, weakest durability.
-  #               The chart can't set this yet: `0` renders as 1 (gh #342).
-  #               A topic's own `flushMessages: 0` does work.
   flushIntervalMessages: 1
 
   # gh #250: how often the retention cleaner sweeps owned partitions and
@@ -129,9 +127,9 @@ broker:
   # `log.retention.check.interval.ms` (same 5-minute default).
   #
   # Only the partition's leader reaps, and the active segment is never
-  # reclaimed — that stays DeleteRecords' job. The broker treats `0` as
-  # "no sweep", but the chart can't set it yet: `0` renders as 300
-  # (gh #342). To keep a topic's data, set its `retentionMs: -1`.
+  # reclaimed — that stays DeleteRecords' job. `0` turns the sweep off for
+  # every topic on the broker. To keep one topic's data, set its
+  # `retentionMs: -1` instead.
   retentionCheckIntervalSeconds: 300
 
   # gh #253: Apache's message.max.bytes — the broker-wide cap on one

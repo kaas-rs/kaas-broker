@@ -90,6 +90,5 @@ The recorded benchmarks ([performance](./performance.md)) run the
 default honest fsync (interval 1). NFS COMMIT latency dominates either
 way; this dial decides how often you pay it.
 
-A topic can override the dial with `flushMessages` in `spec.config`, where `0`
-means fsync only at segment roll. The chart can't set the broker-wide value to
-`0` yet (tracked as gh #342).
+`0` means fsync only at segment roll. A topic can override the dial with
+`flushMessages` in `spec.config`, where `0` means the same.

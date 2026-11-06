@@ -131,8 +131,8 @@ new evidence: PGO builds, `FADV_SEQUENTIAL` on segment reads, and
 flush-interval `0` (pure throughput mode) all failed to move
 steady-state numbers meaningfully on this substrate — the NFS COMMIT
 round-trip, not CPU or readahead, is the dominant cost. One caveat on the
-flush-interval result: the chart can't actually set that value to `0`
-(tracked as gh #342), so a run configured through the chart was really at `1`.
+flush-interval result: until v0.3.64-preview the chart rendered `0` as `1`
+(gh #342), so a run configured through the chart may really have been at `1`.
 
 One dead-end deserves its own warning label: **moving the fsync off
 the partition lock** (syncing a cloned file descriptor so appends
