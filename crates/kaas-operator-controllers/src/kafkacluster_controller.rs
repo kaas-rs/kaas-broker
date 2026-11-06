@@ -5,8 +5,9 @@
 //!   per broker hostname (+ optional bootstrap hostname).
 //! - One `Service` per broker ordinal, selecting by
 //!   `statefulset.kubernetes.io/pod-name`.
-//! - One Gateway-API `TLSRoute` (gateway.networking.k8s.io/v1alpha2)
-//!   per broker ordinal, matched by SNI hostname.
+//! - One Gateway-API `TLSRoute` (gateway.networking.k8s.io, at whichever
+//!   version the API server serves) per broker ordinal, matched by SNI
+//!   hostname.
 //!
 //! Cleanup runs through K8s GC via OwnerReferences set at creation
 //! time — no finalizers. When `external.enabled` is toggled off
@@ -38,19 +39,17 @@ pub struct KafkaClusterReconciler {
     pub client: Client,
     pub namespace: String,
     pub observer: ReconcileObserver,
-    /// Whether the apiserver serves the exact optional resources this
-    /// reconciler touches, discovered once on first use (gh #187). A
-    /// request against an unserved group/version/resource doesn't
-    /// produce a typed NotFound — the apiserver answers a plain-text
-    /// `404 page not found` that kube-rs can't parse — so a cluster
-    /// without those CRDs paid 10+ dead API round-trips per
-    /// reconcile. Group-level discovery is NOT enough: k3s ships
-    /// Gateway API v1/v1beta1 while TLSRoute lives in the
-    /// experimental channel's v1alpha2, so the group exists and the
-    /// resource still 404s. Installing the CRDs later requires an
-    /// operator restart to be noticed — an acceptable trade (same
-    /// caching behaviour as controller-runtime's RESTMapper).
-    tls_routes_served: tokio::sync::OnceCell<bool>,
+    /// The TLSRoute version the API server serves, once found. Gateway API has
+    /// moved it from v1alpha2 to v1alpha3 to v1, and dropped the old ones from
+    /// its CRD (gh #322), so it can't be pinned. Only a positive answer is kept,
+    /// so installing the CRDs later is noticed without an operator restart.
+    tls_route_version: std::sync::OnceLock<&'static str>,
+    /// Whether the apiserver serves cert-manager's `certificates`, discovered
+    /// once on first use (gh #187). A request against an unserved
+    /// group/version/resource doesn't produce a typed NotFound — the apiserver
+    /// answers a plain-text `404 page not found` that kube-rs can't parse — so
+    /// a cluster without those CRDs paid 10+ dead API round-trips per
+    /// reconcile.
     certificates_served: tokio::sync::OnceCell<bool>,
 }
 
@@ -60,13 +59,13 @@ impl KafkaClusterReconciler {
             client,
             namespace,
             observer: ReconcileObserver::new("KafkaCluster"),
-            tls_routes_served: tokio::sync::OnceCell::new(),
+            tls_route_version: std::sync::OnceLock::new(),
             certificates_served: tokio::sync::OnceCell::new(),
         }
     }
 
     /// True when `plural` is served under `group_version`
-    /// (e.g. `tlsroutes` under `gateway.networking.k8s.io/v1alpha2`).
+    /// (e.g. `certificates` under `cert-manager.io/v1`).
     /// A 404 on the discovery endpoint means the group/version isn't
     /// served at all → definitively false. Any other discovery error
     /// fails open so the per-call error paths stay authoritative.
@@ -81,14 +80,35 @@ impl KafkaClusterReconciler {
         }
     }
 
-    async fn tls_routes_served(&self) -> bool {
-        *self
-            .tls_routes_served
-            .get_or_init(|| async {
-                let gv = format!("{}/{}", tls_route_gvk().group, tls_route_gvk().version);
-                Self::resource_served(&self.client, &gv, "tlsroutes").await
-            })
-            .await
+    /// The newest TLSRoute version the API server serves, or `None` if it
+    /// serves none. It asks the group which versions exist instead of probing
+    /// each one, because a version that doesn't exist answers a plain-text 404
+    /// that kube-rs logs as a WARN (gh #322). k3s ships Gateway API without
+    /// TLSRoute, so a served version doesn't mean it holds `tlsroutes`.
+    ///
+    /// A failed request is an error, not a `None` or a guess, so it's retried
+    /// rather than cached.
+    async fn tls_route_version(&self) -> Result<Option<&'static str>, ControllerError> {
+        if let Some(version) = self.tls_route_version.get() {
+            return Ok(Some(version));
+        }
+        let groups = self.client.list_api_groups().await?;
+        let Some(group) = groups.groups.iter().find(|g| g.name == TLS_ROUTE_GROUP) else {
+            return Ok(None);
+        };
+        for version in TLS_ROUTE_VERSIONS {
+            if !group.versions.iter().any(|v| v.version == version) {
+                continue;
+            }
+            let resources = self
+                .client
+                .list_api_group_resources(&format!("{TLS_ROUTE_GROUP}/{version}"))
+                .await?;
+            if resources.resources.iter().any(|r| r.name == "tlsroutes") {
+                return Ok(Some(self.tls_route_version.get_or_init(|| version)));
+            }
+        }
+        Ok(None)
     }
 
     async fn certificates_served(&self) -> bool {
@@ -314,6 +334,14 @@ impl KafkaClusterReconciler {
             .namespace
             .as_deref()
             .unwrap_or(&self.namespace);
+        // Says what's wrong in the cluster's Ready condition, where a create
+        // against an unserved version would only say `404 page not found`.
+        let Some(version) = self.tls_route_version().await? else {
+            return Err(ControllerError::Other(format!(
+                "the API server serves no {TLS_ROUTE_GROUP} TLSRoute: install the Gateway API \
+                 CRDs that include it"
+            )));
+        };
         let name = format!("{cluster_name}-broker-{ordinal}");
         let port = nonzero_or(cluster.spec.listeners.external.port, 9093);
         let hostname = format_hostname(&cluster.spec.listeners.external.hostname_pattern, ordinal);
@@ -343,7 +371,7 @@ impl KafkaClusterReconciler {
             }],
         });
 
-        self.apply_unstructured(cluster, ns, &name, &tls_route_gvk(), spec)
+        self.apply_unstructured(cluster, ns, &name, &tls_route_gvk(version), spec)
             .await
     }
 
@@ -431,21 +459,22 @@ impl KafkaClusterReconciler {
 
         // Services + TLSRoutes per ordinal, with a 10-floor
         // upper bound to catch shrink scenarios.
-        // TLSRoutes are skipped entirely when the Gateway API isn't
-        // installed — every such delete was an unrouted plain-text
-        // 404 the client had to error-parse (gh #187).
+        // TLSRoutes are skipped entirely when the API server serves none —
+        // every such delete was an unrouted plain-text 404 the client had
+        // to error-parse (gh #187).
         let upper = cluster.spec.replicas.max(10);
         let svc_api: Api<Service> = Api::namespaced(self.client.clone(), ns);
-        let routes_served = self.tls_routes_served().await;
-        let route_ar = ApiResource::from_gvk(&tls_route_gvk());
-        let route_api: Api<DynamicObject> =
-            Api::namespaced_with(self.client.clone(), ns, &route_ar);
+        let route_api: Option<Api<DynamicObject>> =
+            self.tls_route_version().await?.map(|version| {
+                let route_ar = ApiResource::from_gvk(&tls_route_gvk(version));
+                Api::namespaced_with(self.client.clone(), ns, &route_ar)
+            });
 
         for i in 0..upper {
             let name = format!("{cluster_name}-broker-{i}");
             delete_if_present(&svc_api, &name).await?;
-            if routes_served {
-                delete_if_present(&route_api, &name).await?;
+            if let Some(route_api) = &route_api {
+                delete_if_present(route_api, &name).await?;
             }
         }
         Ok(())
@@ -559,9 +588,14 @@ impl KafkaClusterReconciler {
 fn certificate_gvk() -> GroupVersionKind {
     GroupVersionKind::gvk("cert-manager.io", "v1", "Certificate")
 }
-fn tls_route_gvk() -> GroupVersionKind {
-    GroupVersionKind::gvk("gateway.networking.k8s.io", "v1alpha2", "TLSRoute")
+fn tls_route_gvk(version: &str) -> GroupVersionKind {
+    GroupVersionKind::gvk(TLS_ROUTE_GROUP, version, "TLSRoute")
 }
+
+const TLS_ROUTE_GROUP: &str = "gateway.networking.k8s.io";
+/// TLSRoute's versions, newest first. The spec this reconciler writes is valid
+/// under all three.
+const TLS_ROUTE_VERSIONS: [&str; 3] = ["v1", "v1alpha3", "v1alpha2"];
 
 // --- helpers --------------------------------------------------------
 
@@ -708,6 +742,263 @@ mod tests {
         }
     }
 
+    /// A fake API server that serves TLSRoute at the given versions, and records
+    /// every request. A request for a version it doesn't serve gets the real
+    /// server's plain-text 404, which kube-rs logs as a WARN (gh #322).
+    #[derive(Default)]
+    struct FakeApi {
+        /// `(version, holds tlsroutes)`.
+        versions: parking_lot::Mutex<Vec<(&'static str, bool)>>,
+        requests: parking_lot::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl FakeApi {
+        fn serving(versions: &[(&'static str, bool)]) -> Arc<Self> {
+            let fake = Arc::new(Self::default());
+            fake.versions.lock().extend_from_slice(versions);
+            fake
+        }
+
+        fn reconciler(self: &Arc<Self>) -> KafkaClusterReconciler {
+            let fake = Arc::clone(self);
+            let service = tower::service_fn(move |req: http::Request<kube::client::Body>| {
+                let fake = Arc::clone(&fake);
+                async move { Ok::<_, std::convert::Infallible>(fake.handle(req).await) }
+            });
+            KafkaClusterReconciler::new(Client::new(service, "default"), "default".to_owned())
+        }
+
+        fn request_count(&self) -> usize {
+            self.requests.lock().len()
+        }
+
+        /// Requests for a TLSRoute version this server doesn't serve.
+        fn dead_probes(&self) -> Vec<String> {
+            let served: Vec<&str> = self.versions.lock().iter().map(|(v, _)| *v).collect();
+            let prefix = format!("/apis/{TLS_ROUTE_GROUP}/");
+            self.requests
+                .lock()
+                .iter()
+                .filter_map(|(_, path, _)| path.strip_prefix(&prefix))
+                .filter(|rest| !served.contains(&rest.split('/').next().unwrap_or("")))
+                .map(str::to_owned)
+                .collect()
+        }
+
+        async fn handle(
+            &self,
+            req: http::Request<kube::client::Body>,
+        ) -> http::Response<kube::client::Body> {
+            use http_body_util::BodyExt;
+            let (parts, body) = req.into_parts();
+            let path = parts.uri.path().to_owned();
+            let method = parts.method.as_str().to_owned();
+            let body = body.collect().await.unwrap().to_bytes();
+            let text = String::from_utf8_lossy(&body).into_owned();
+            self.requests
+                .lock()
+                .push((method.clone(), path.clone(), text));
+
+            let json = |code: u16, value: serde_json::Value| {
+                http::Response::builder()
+                    .status(code)
+                    .header("content-type", "application/json")
+                    .body(kube::client::Body::from(value.to_string().into_bytes()))
+                    .unwrap()
+            };
+            let not_found = serde_json::json!({
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "NotFound", "code": 404, "message": "not found",
+            });
+            let versions = self.versions.lock().clone();
+            if path == "/apis" {
+                let served: Vec<_> = versions
+                    .iter()
+                    .map(|(v, _)| {
+                        serde_json::json!({
+                            "groupVersion": format!("{TLS_ROUTE_GROUP}/{v}"), "version": v,
+                        })
+                    })
+                    .collect();
+                let groups = if served.is_empty() {
+                    serde_json::json!([])
+                } else {
+                    serde_json::json!([{ "name": TLS_ROUTE_GROUP, "versions": served }])
+                };
+                return json(
+                    200,
+                    serde_json::json!({
+                        "kind": "APIGroupList", "apiVersion": "v1", "groups": groups,
+                    }),
+                );
+            }
+            let prefix = format!("/apis/{TLS_ROUTE_GROUP}/");
+            let Some(rest) = path.strip_prefix(&prefix) else {
+                return json(404, not_found);
+            };
+            let mut segments = rest.split('/');
+            let version = segments.next().unwrap_or("");
+            let Some((_, holds_routes)) = versions.iter().find(|(v, _)| *v == version) else {
+                return http::Response::builder()
+                    .status(404)
+                    .body(kube::client::Body::from(b"404 page not found\n".to_vec()))
+                    .unwrap();
+            };
+            if segments.next().is_none() {
+                let (name, kind) = if *holds_routes {
+                    ("tlsroutes", "TLSRoute")
+                } else {
+                    ("gateways", "Gateway")
+                };
+                return json(
+                    200,
+                    serde_json::json!({
+                        "kind": "APIResourceList", "apiVersion": "v1",
+                        "groupVersion": format!("{TLS_ROUTE_GROUP}/{version}"),
+                        "resources": [{
+                            "name": name, "singularName": "", "namespaced": true,
+                            "kind": kind, "verbs": ["get"],
+                        }],
+                    }),
+                );
+            }
+            if method == "POST" {
+                let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                return json(201, created);
+            }
+            json(404, not_found)
+        }
+    }
+
+    fn gateway_cluster() -> KafkaCluster {
+        let mut cluster = cluster_with(1, "broker-%d.example.com", 9093);
+        cluster.spec.listeners.external.gateway = GatewayConfig {
+            enabled: true,
+            gateway_ref: GatewayRef {
+                name: "gw".into(),
+                namespace: "gateway-system".into(),
+            },
+        };
+        cluster
+    }
+
+    /// gh #322: the newest served version wins, at whichever one a cluster has,
+    /// and it asks without probing a version that doesn't exist. Those probes
+    /// were a WARN on every operator start on Gateway API v1.5, which serves
+    /// TLSRoute at v1 only.
+    #[tokio::test]
+    async fn the_newest_served_tls_route_version_is_used_and_kept() {
+        for (served, want) in [
+            (vec![("v1", true)], "v1"),
+            (vec![("v1alpha2", true)], "v1alpha2"),
+            (vec![("v1alpha3", true)], "v1alpha3"),
+            (vec![("v1alpha2", true), ("v1", true)], "v1"),
+            // k3s: the group exists at v1 without TLSRoute, which is at v1alpha2.
+            (vec![("v1", false), ("v1alpha2", true)], "v1alpha2"),
+        ] {
+            let fake = FakeApi::serving(&served);
+            let r = fake.reconciler();
+            assert_eq!(
+                r.tls_route_version().await.unwrap(),
+                Some(want),
+                "{served:?}"
+            );
+            assert!(fake.dead_probes().is_empty(), "{:?}", fake.dead_probes());
+
+            let asked = fake.request_count();
+            assert_eq!(r.tls_route_version().await.unwrap(), Some(want));
+            assert_eq!(fake.request_count(), asked, "the answer wasn't kept");
+        }
+    }
+
+    /// gh #322: none served is `None`, whether the group is missing or it just
+    /// doesn't hold TLSRoute. That isn't kept, so installing the CRDs later is
+    /// noticed without a restart.
+    #[tokio::test]
+    async fn no_tls_route_version_is_none_and_installing_one_is_noticed() {
+        for served in [vec![], vec![("v1", false)]] {
+            let fake = FakeApi::serving(&served);
+            let r = fake.reconciler();
+            assert_eq!(r.tls_route_version().await.unwrap(), None, "{served:?}");
+            assert!(fake.dead_probes().is_empty(), "{:?}", fake.dead_probes());
+
+            *fake.versions.lock() = vec![("v1", true)];
+            assert_eq!(r.tls_route_version().await.unwrap(), Some("v1"));
+        }
+    }
+
+    /// gh #322: the route is created at the served version, with a spec that
+    /// version requires. Pinned to v1alpha2 this was a 404 on Gateway API v1.5.
+    #[tokio::test]
+    async fn a_tls_route_is_created_at_the_served_version() {
+        let fake = FakeApi::serving(&[("v1", true)]);
+        let r = fake.reconciler();
+        r.reconcile_broker_tls_route(&gateway_cluster(), 0)
+            .await
+            .unwrap();
+
+        let requests = fake.requests.lock().clone();
+        let (_, path, body) = requests.iter().find(|(m, _, _)| m == "POST").unwrap();
+        assert_eq!(
+            path,
+            "/apis/gateway.networking.k8s.io/v1/namespaces/default/tlsroutes"
+        );
+        let route: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(route["apiVersion"], "gateway.networking.k8s.io/v1");
+        assert_eq!(route["kind"], "TLSRoute");
+        assert_eq!(route["spec"]["hostnames"][0], "broker-0.example.com");
+        assert_eq!(route["spec"]["parentRefs"][0]["name"], "gw");
+        assert_eq!(route["spec"]["rules"][0]["backendRefs"][0]["port"], 9093);
+    }
+
+    /// gh #322: with none served the failure says why, which reaches the
+    /// cluster's Ready condition, and nothing is attempted.
+    #[tokio::test]
+    async fn no_served_tls_route_fails_with_a_reason_and_writes_nothing() {
+        let fake = FakeApi::serving(&[("v1", false)]);
+        let r = fake.reconciler();
+        let err = r
+            .reconcile_broker_tls_route(&gateway_cluster(), 0)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("serves no") && err.contains("TLSRoute"),
+            "{err}"
+        );
+        assert!(!fake.requests.lock().iter().any(|(m, _, _)| m == "POST"));
+    }
+
+    /// gh #322: turning the listener off cleans up at the served version, and
+    /// skips routes altogether when there are none. It used to look in v1alpha2,
+    /// so a route at any other version would be left behind.
+    #[tokio::test]
+    async fn cleanup_uses_the_served_tls_route_version() {
+        let fake = FakeApi::serving(&[("v1", true)]);
+        fake.reconciler()
+            .delete_external_resources(&gateway_cluster())
+            .await
+            .unwrap();
+        let deleted = fake.requests.lock().clone();
+        assert!(
+            deleted.iter().any(|(m, p, _)| m == "DELETE"
+                && p == "/apis/gateway.networking.k8s.io/v1/namespaces/default/tlsroutes/sk-broker-0"),
+            "{deleted:?}"
+        );
+        assert!(fake.dead_probes().is_empty(), "{:?}", fake.dead_probes());
+
+        let fake = FakeApi::serving(&[("v1", false)]);
+        fake.reconciler()
+            .delete_external_resources(&gateway_cluster())
+            .await
+            .unwrap();
+        assert!(!fake
+            .requests
+            .lock()
+            .iter()
+            .any(|(_, p, _)| p.contains("tlsroutes")));
+    }
+
     #[test]
     fn format_hostname_substitutes_one_decimal_verb() {
         assert_eq!(
@@ -789,9 +1080,9 @@ mod tests {
         assert_eq!(cert.version, "v1");
         assert_eq!(cert.kind, "Certificate");
 
-        let route = tls_route_gvk();
+        let route = tls_route_gvk("v1");
         assert_eq!(route.group, "gateway.networking.k8s.io");
-        assert_eq!(route.version, "v1alpha2");
+        assert_eq!(route.version, "v1");
         assert_eq!(route.kind, "TLSRoute");
     }
 

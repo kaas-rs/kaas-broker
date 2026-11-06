@@ -60,7 +60,7 @@ spec:
 | `listeners.external.hostnamePattern` | printf-style pattern with `%d` for the broker ordinal, e.g. `broker-%d.kafka.example.com`. Every broker needs its own routable hostname because Kafka clients bootstrap once, then connect to each broker directly at its advertised address. |
 | `listeners.external.bootstrapHostname` | Optional convenience hostname added to the certificate SANs (so a single bootstrap address presents a valid certificate). Not required for operation. |
 | `listeners.external.tls.certManager` | When `enabled`, the operator creates one cert-manager `Certificate` covering the per-broker hostnames, issued by `issuerRef` (`kind`: `ClusterIssuer` or `Issuer`; empty defaults to `ClusterIssuer` at reconcile time). |
-| `listeners.external.gateway` | When `enabled`, the operator creates one Gateway-API `TLSRoute` per broker attached to `gatewayRef`, SNI-routing each hostname to that broker's Service. |
+| `listeners.external.gateway` | When `enabled`, the operator creates one Gateway-API `TLSRoute` per broker attached to `gatewayRef`, SNI-routing each hostname to that broker's Service. The route is created at whichever version the API server serves, newest first (`v1`, `v1alpha3`, `v1alpha2`); if it serves none, the `Ready` condition says so. |
 | `listeners.external.service.annotations` | Declared for extra annotations on the per-broker Services (cloud load-balancer knobs) — **not yet applied**: the reconciler currently ignores this field. |
 
 Everything the operator creates from this CR carries an
