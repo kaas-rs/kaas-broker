@@ -3,8 +3,8 @@
 Where kaas stands against Strimzi-managed Apache Kafka on the same
 substrate, and why: group-commit fsync versus page-cache acks.
 
-Benchmark reports are recorded under `docs/perf-results/` in the
-repository; this chapter summarizes the current head-to-head series and
+Benchmark reports are recorded under `docs/perf-results/`, which is
+gitignored, so they aren't in the repository; this chapter summarizes the current head-to-head series and
 the methodology behind it. Treat every number as bound to its
 configuration — both systems ran on the *same* single-node k3s host and
 the same NFS export, which is a valid relative comparison and an unusual
@@ -40,6 +40,10 @@ producers, with p50 6.5 s vs 12.4 s and p99 8.2 s vs 30.8 s under
 saturation; idempotent produce 23.6 vs 11.2 MB/s; group consume 86.7
 vs 95.9 MB/s; the Kafka Streams wordcount passes on both systems with
 identical settle times.
+
+These are the latest recorded numbers, from `v0.3.1-preview`. Later releases
+added per-batch validation and a CRC check to the produce path, and that
+hasn't been re-measured.
 
 Two scenarios are deliberately not summarized into a verdict: the
 **no-group consume** spread is too wide to call anything but noisy on

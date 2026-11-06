@@ -14,8 +14,7 @@ it links here, but the two share no build — see [Publishing](#publishing).
 | `src/` | the book's chapters — Parts I–IV, plus `SUMMARY.md` (the table of contents) |
 | `book.toml` | mdbook config: `rust` default theme, search, fold nav, mermaid + linkcheck backends |
 | `mermaid.min.js`, `mermaid-init.js` | committed by `mdbook-mermaid install`; required by the build |
-| `perf-results/` | recorded benchmark reports, cited by Part IV's performance chapter |
-| `ARCHITECTURE.md` | pointer stub — the architecture content lives in Part I |
+| `perf-results/` | recorded benchmark reports, cited by Part IV's performance chapter; gitignored, so only on the machine that ran them |
 | `RELEASING.md` | canonical release procedure (Part IV links out to it) |
 | `book/` | build output, gitignored |
 

@@ -97,6 +97,15 @@ Reconciler guard rails worth knowing:
   reconcilers; cleanup happens via K8s GC (owned resources) and the
   orphan sweep (on-disk state).
 
+### Operator leader election
+
+Only the holder of the `kaas-operator-leader` Lease reconciles or sweeps,
+and it renews the Lease for as long as it leads. A standby reads as Ready,
+because a rollout stops the old pod only once the new one is Ready, and the
+old pod holds the Lease until then. Losing the Lease ends the process at
+once, since another candidate may already be reconciling. The details are in
+the [operator binary chapter](../code-tour/bin-kaas-operator.md).
+
 ## What brokers do with the CRDs
 
 On the broker side, the CRD surface is read-mostly — but not read-only:
@@ -105,10 +114,13 @@ are served by patching the `KafkaTopic` CR (`spec.partitions` /
 `spec.config`), `CreateTopics` mints a fresh one, `DeleteTopics`
 deletes it, and `AlterReplicaLogDirs` records partition moves in the
 CR's status. The user side works the same way against existing
-`KafkaUser` CRs: the ACL admin APIs edit `spec.authorization.acls`, the
-SCRAM admin API (KIP-554) patches `spec.authentication.scram`, and the
-quota admin API patches `spec.quotas`. The operator then materializes
-the change as usual. That is why broker RBAC carries write verbs on
+`KafkaUser` CRs: the ACL admin APIs edit `spec.authorization.acls`, and the
+SCRAM admin API (KIP-554) patches `spec.authentication.scram`. The
+operator then materializes the change as usual. (The quota admin API is
+the exception: `AlterClientQuotas` changes the serving broker's memory only
+and doesn't touch the CR; see the
+[quota API notes](../compat/api/acls-quotas.md#alterclientquotas).) That is
+why broker RBAC carries write verbs on
 `kafkatopics` (`create`, `patch`, `delete`), `get,patch` on
 `kafkatopics/status`, and `get,list,update,patch` on `kafkausers` (the ACL
 admin APIs list users to match filters). It carries nothing it doesn't
@@ -145,10 +157,9 @@ git" as drift in the ArgoCD UI. Off by default: non-ArgoCD installs
 get plain CRs.
 
 This applies only to CRs the broker **creates** — today, topics.
-`KafkaUser` CRs are never created at runtime: the ACL, SCRAM, and
-quota admin APIs edit the `spec.authorization.acls` /
-`spec.authentication.scram` / `spec.quotas` of a user that must
-already exist, and
+`KafkaUser` CRs are never created at runtime: the ACL and SCRAM admin APIs
+edit the `spec.authorization.acls` / `spec.authentication.scram` of a user
+that must already exist, and
 stamping ArgoCD metadata onto a git-managed resource would *cause* the
 drift the annotations exist to avoid. Runtime ACL edits to git-managed
 users therefore still show as drift until the next sync — the

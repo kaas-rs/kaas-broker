@@ -34,8 +34,9 @@ non-transactional, the KIP-98 client convention). Per-partition dedupe lives in
 sized to Java's `max.in.flight.requests.per.connection=5` — classified
 under the partition mutex as duplicate (echo the cached `baseOffset`, no
 log write), out-of-order (wire error 45), invalid epoch (wire 47), or
-accept. Only the 57-byte v2 batch header is parsed; record payloads stay
-opaque. The window survives restart via `producer-state.snapshot`
+accept. Sequences wrap to 0, and a PID with no state accepts any sequence,
+both as in Apache. Only the 57-byte v2 batch header is parsed; record
+payloads stay opaque. The window survives restart via `producer-state.snapshot`
 (`crates/kaas-storage/src/producer_snapshot.rs`), written on take-over
 and close/relinquish beside `manifest.json`.
 
@@ -81,7 +82,7 @@ consume-process-produce offsets are [KIP-447](kip-447.md).
 hand-rolled wire bytes: `eos_commit_path_records_visible_to_read_committed`
 and `eos_abort_path_populates_aborted_transactions`. Unit coverage:
 `duplicate_in_window_returns_cached_offset`,
-`fresh_pid_first_seq_must_be_zero`, `older_epoch_is_invalid`, and
+`a_pid_with_no_state_accepts_any_sequence`, `older_epoch_is_invalid`, and
 `ring_caps_at_five_entries` in `idempotence.rs`;
 `roundtrip_through_atomic_write` and
 `future_version_is_dropped_not_misinterpreted` in `producer_snapshot.rs`;

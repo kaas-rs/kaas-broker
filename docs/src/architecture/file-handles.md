@@ -53,39 +53,54 @@ there is a window where it still believes it leads and keeps accepting
 produce requests. Because the new leader appends to a *different* file,
 the two can't interleave writes into one — the deposed leader's records
 land in a segment belonging to a dead epoch and are discarded, instead
-of being spliced byte-wise into the live log. Its in-flight produce
-requests start failing as soon as the epoch bump lands, since the
-append path rejects any write carrying an epoch below the partition's
-current one.
+of being spliced byte-wise into the live log. Its produce requests start
+failing once its own assignment view catches up.
+
+**That window can lose acknowledged writes.** It lasts up to about a
+second plus the NFS attribute-cache TTL, capped at 3 s by the self-fence
+only when the move was caused by lost controller connectivity; a move off
+a healthy broker never trips the self-fence. A batch acknowledged in the
+window sits in the dead-epoch segment at offsets the new leader re-issues.
+The new log is never corrupted, but that write is gone. Apache closes its
+equivalent window through replication, which kaas doesn't have, and a
+Produce request carries no leader epoch to check at any version.
 
 This is the shape Apache Kafka gets from replication and a leader
 epoch cache: a follower that becomes leader starts a new epoch, and
 records written by the old leader past the divergence point are
 truncated away. kaas has no followers to truncate against, so it
-separates the writers at the filesystem instead — same guarantee,
-different mechanism.
+separates the writers at the filesystem instead: the same protection for
+the log, by a different mechanism.
 
 ## Manifest + producer snapshot
 
-Two sibling files ride along with every partition's segments:
+Sibling files ride along with every partition's segments:
 
 - `manifest.json` — `(epoch, highWatermark, logStartOffset)`, written
-  temp + fsync + rename. Persisted on partition open and on
-  close/relinquish — not per append, and not on segment roll — so
-  recovery treats the log itself as authoritative.
+  temp + fsync + rename. Persisted on partition open, takeover and
+  close/relinquish, and whenever `DeleteRecords` or retention advances
+  the log start — not per append, and not on segment roll — so recovery
+  treats the log itself as authoritative for the high watermark.
 - `producer-state.snapshot` — the idempotent-producer dedupe window,
-  written on segment roll and relinquish, restored on takeover. Without
-  it a leadership move would drop the per-producer sequence history,
-  and in-flight producer retries would be misclassified as
-  `OUT_OF_ORDER_SEQUENCE_NUMBER` instead of duplicates.
+  written on takeover and close/relinquish, restored when the partition
+  opens. Without it a leadership move would drop the per-producer
+  sequence history, and in-flight producer retries would be misclassified
+  as `OUT_OF_ORDER_SEQUENCE_NUMBER` instead of duplicates.
+- `txn-index.snapshot` — the `read_committed` indexes: open transactions'
+  first offsets, which set the last stable offset, and the aborted list.
+  Written alongside the producer snapshot and restored on open.
+- `recovery-checkpoint.json` — how far the log is known to be fsynced; see
+  the [storage hot path](./storage-hot-path.md).
 
 ## Topic delete: the handle-close path
 
 ```mermaid
 flowchart TD
     del["kubectl delete kafkatopic T"] --> watch["broker topic watch<br/>fires the delete event"]
-    watch --> abandon["broker drops T from its topic registry ·<br/>abandons T's partitions:<br/>close handles, persist NOTHING"]
-    abandon --> notify["assignment recompute triggered<br/>(reason: topic deleted)"]
+    watch --> registry["broker drops T from its topic registry"]
+    registry --> abandon["abandons T's partitions:<br/>close handles, persist NOTHING"]
+    abandon --> purge["purges T's committed offsets<br/>from the groups this broker coordinates"]
+    registry --> notify["assignment recompute triggered<br/>(reason: topic deleted)"]
     notify --> ctl["controller: balancer drops T's partitions,<br/>writes new assignment.json"]
     ctl --> apply["every broker applies it —<br/>relinquish is already a no-op<br/>for the abandoned partitions"]
     apply --> reclaim["operator reclaims /data/T:<br/>periodic sweep, or the identity check<br/>if T is recreated"]
@@ -103,11 +118,17 @@ drops the handles and writes nothing, and dropping the in-memory
 partition forces the next takeover to re-open from disk rather than
 keep serving the deleted topic's state.
 
-Both the delete and the recreate arrive on the *same* watch stream, so
-the abandon is ordered before the recreate's apply — no coordination
-needed. (What protects a recreated topic even *without* that ordering
+Both the delete and the recreate arrive on the *same* watch stream, and
+the watch finishes handling the delete before it applies anything else, so
+the abandon and the offset purge are ordered before the recreate. The cost
+is that a slow purge holds up the watch's other topic events while it runs.
+(What protects a recreated topic's *directory* even without that ordering
 is the topic-identity stamp — see
 [the RWX substrate contract](./nfs-substrate.md).)
+
+Removing a topic's committed offsets is Apache's behaviour too, where they
+are tombstoned out of `__consumer_offsets`. kaas does it file by file; see
+[Consumer-group coordination](./consumer-groups.md#writing-offsets).
 
 ## Graceful SIGTERM drain
 
@@ -138,7 +159,14 @@ is the next chapter: [The RWX substrate contract](./nfs-substrate.md).
   writes the dead incarnation's HWM and dedupe window into a recreated
   topic's directory.
 - The producer snapshot lives in
-  `crates/kaas-storage/src/producer_snapshot.rs`.
+  `crates/kaas-storage/src/producer_snapshot.rs`, the transaction indexes'
+  in `crates/kaas-storage/src/txn_index_snapshot.rs` (gh #177).
+- The stale-leader ack window is gh #164. Closing it would take
+  event-driven assignment delivery or a durable-epoch check on first write
+  after takeover.
+- The whole delete path, with its ordering rules, is written up in
+  [Topic delete & recreate](../code-tour/topic-lifecycle.md). The watch
+  waiting for the delete is gh #331.
 - The SIGTERM drain is in `bins/kaas/src/main.rs` (gh #61, gh #139);
   partition keys are parsed from the right so slash-bearing topic names
   split correctly.

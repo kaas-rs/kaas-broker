@@ -127,7 +127,9 @@ non-coordinator broker is never visible to clients.
   what a coordinator change looks like to clients of Apache Kafka too.
 - **Committed offsets**: one JSON file per group,
   `/data/__cluster/__consumer_offsets/<groupID>.json`, on the shared
-  volume. Durable across failover: where an Apache Kafka coordinator
+  volume (a group ID can be any string, so `/`, NUL and `%` are
+  percent-encoded in the file name). Durable across failover: where an
+  Apache Kafka coordinator
   replays its `__consumer_offsets` partition to materialize offsets,
   the new kaas coordinator simply reads the same file — the file *is*
   the materialized state.
@@ -136,8 +138,54 @@ non-coordinator broker is never visible to clients.
   when the transaction commits — see
   [Transactions & idempotence](./transactions.md).
 
+## Writing offsets
+
+Apache appends a commit to `__consumer_offsets`, and the log gives each
+writer its own place. kaas rewrites a group's whole file, which makes three
+things its own problem:
+
+- **A stale coordinator must not overwrite a newer one.** Every write
+  carries a stamp of the controller epoch and assignment version, and
+  refuses to replace a file stamped by a newer assignment. Without it, a
+  coordinator that hadn't yet noticed a handoff would erase partitions
+  committed only at the new one.
+- **Concurrent commits must not drop each other's offsets.** One lock per
+  group covers reading the cache, writing the file and updating the cache,
+  and the cache moves only after the write lands. So a failed commit leaves
+  fetches answering what's on disk, and the retry finds the group as it was.
+- **An idle consumer must not rewrite the file.** A commit that moves
+  nothing skips the write.
+
+A file that can't be *read* isn't "no offsets": OffsetFetch, DescribeGroups
+and DeleteGroups answer `COORDINATOR_LOAD_IN_PROGRESS` (14). Answering `-1`
+would reset the consumer per `auto.offset.reset`.
+
+Deleting a topic removes its committed offsets, as Apache's tombstones do.
+Without that, a delete and recreate under the same name (Kafka Streams'
+`application-reset` does this on every run) hands the new topic the old
+one's offsets, and if the new log is shorter the group resumes past its end
+and idles with no error on either side. Each broker purges only the groups
+it coordinates, since a group's file has one legal writer. A commit racing
+the delete checks the topic again under the group's lock and answers
+`UNKNOWN_TOPIC_OR_PARTITION` (3) if it's gone, which clients retry.
+
+This work runs on a bounded set of blocking threads, never on the runtime's
+workers. The stores do synchronous I/O behind locks, and waiting on someone
+else's fsync on a worker would stall every connection that worker drives.
+
 ## Implementation notes (for contributors)
 
+- Offset writes: `OffsetStore::write_group`, `write_and_cache` and
+  `FenceStamp` in `crates/kaas-coordinator/src/offset_store.rs` (gh #167,
+  gh #318). Unreadable files: `Manager::group_load_error` (gh #326). The
+  purge: `Manager::purge_topic_offsets` (gh #240, gh #331), and the re-check
+  under the lock: `OffsetStore::set_partition_source` (gh #335). A commit
+  that waits out a delete *and* a recreate can still write the dead
+  incarnation's offset; closing that needs offsets that know their topic's
+  incarnation (gh #105).
+- Off the workers: `Broker::coordinator_io` and `txn_store_io` in
+  `crates/kaas-broker/src/broker.rs`, bounded by `COORDINATOR_IO_THREADS`
+  (gh #328, gh #332).
 - Routing: `crates/kaas-broker/src/group_hash.rs` — pure functions over
   `(key, brokers, alive)`, no state, no I/O (gh #92). The same hash
   gates txn-slot ownership (gh #91).

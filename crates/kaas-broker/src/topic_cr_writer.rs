@@ -16,9 +16,9 @@
 //! ## Op surface
 //!
 //! [`ConfigOp`] mirrors Apache's IncrementalAlterConfigs op enum:
-//! `Set` and `Delete` map onto JSON-merge patches; `Append` and
-//! `Subtract` are list-valued ops that kaas's topic configs
-//! don't support — the writer returns [`TopicWriteError::UnsupportedOp`]
+//! `Set` and `Delete` map onto JSON-merge patches. `Append` and
+//! `Subtract` aren't implemented, even on `cleanup.policy`, which is
+//! list-typed: the writer returns [`TopicWriteError::UnsupportedOp`]
 //! and the handler surfaces it as `UNSUPPORTED_VERSION` (35).
 
 use async_trait::async_trait;
@@ -44,8 +44,8 @@ pub enum ConfigOpKind {
     Set,
     /// Remove the key — patch as JSON null.
     Delete,
-    /// Append to a list-valued config. kaas's keys are all
-    /// scalar — returns `UnsupportedOp` at the writer.
+    /// Append to a list-valued config. Not implemented: returns
+    /// `UnsupportedOp` at the writer.
     Append,
     /// Subtract from a list-valued config. Same as Append.
     Subtract,
@@ -86,8 +86,8 @@ pub enum TopicWriteError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
-    /// Caller tried to use `Append` / `Subtract` on a scalar config
-    /// key. Wire: `UNSUPPORTED_VERSION` (35).
+    /// Caller tried to use `Append` / `Subtract`, which aren't
+    /// implemented. Wire: `UNSUPPORTED_VERSION` (35).
     #[error("unsupported config op: {0:?}")]
     UnsupportedOp(ConfigOpKind),
 

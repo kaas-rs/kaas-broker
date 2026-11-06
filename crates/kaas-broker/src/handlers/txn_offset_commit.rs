@@ -7,10 +7,12 @@
 //! [`OffsetStore::store_pending`] / `commit_pending` / `discard_pending`.
 //!
 //! Routing: this handler runs on the **group** coordinator (not the
-//! txn coordinator). Cross-broker case (group coord ≠ txn coord on
-//! `EndTxn`) is currently handled by the same-broker fast path
-//! when they coincide; the gh #114 cross-broker `WriteTxnMarkers`
-//! RPC completes the loop for the general case.
+//! txn coordinator). `EndTxn`'s offset hook fires on the txn
+//! coordinator's local store, so the loop only closes when the two are
+//! the same broker. When they differ, what this handler stages is never
+//! materialised, and the group replays from its last committed offset
+//! (gh #340). The generation, member and producer epoch aren't checked
+//! either (gh #341).
 //!
 //! [`OffsetStore`]: kaas_coordinator::OffsetStore
 //! [`OffsetStore::store_pending`]: kaas_coordinator::OffsetStore::store_pending

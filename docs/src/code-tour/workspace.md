@@ -32,7 +32,8 @@ is a deliberate reading order, following the wire inward:
 ([kaas-operator-api](kaas-operator-api.md),
 [kaas-operator-controllers](kaas-operator-controllers.md)), and finally
 the two binaries that plug every seam together ([kaas](bin-kaas.md) and
-[kaas-operator](bin-kaas-operator.md)).
+[kaas-operator](bin-kaas-operator.md)). [Topic delete &
+recreate](topic-lifecycle.md) then follows one operation across those crates.
 
 ## Crate dependency graph
 
@@ -82,6 +83,8 @@ flowchart LR
     protocol --> auth
     protocol --> storage
 
+    coordinator --> storage
+
     controller --> broker
     controller --> coordinator
     controller --> storage
@@ -99,6 +102,6 @@ One crate is left off the diagram to keep it readable:
 `kaas-codec` and `kaas-operator-api` (and by both bins); it depends on
 no other kaas crate.
 
-> This graph is hand-maintained (checked against `Cargo.toml` on 2026-08-11).
+> This graph is hand-maintained (checked against `Cargo.toml` on 2026-11-06).
 > Auto-generating it from `cargo metadata` is a possible future
 > `gen-api-matrix`-style xtask.

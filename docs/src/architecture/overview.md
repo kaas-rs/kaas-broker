@@ -132,7 +132,8 @@ JSON files on the shared volume.
 The closing chapters face the operator of the cluster: [Listeners,
 authentication, authorization](./listeners-auth.md), [Kubernetes
 integration](./kubernetes.md), [Honest readiness & rollout
-pacing](./readiness-rollout.md), and
+pacing](./readiness-rollout.md), [Broker
+fencing](./broker-fencing.md), and
 [Observability](./observability.md).
 
 ## Implementation notes (for contributors)

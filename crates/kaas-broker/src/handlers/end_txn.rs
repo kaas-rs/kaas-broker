@@ -1,22 +1,25 @@
 //! EndTxn handler (key 26, v0–v3).
 //!
-//! Three steps, in this order, and the order is the correctness
-//! property (gh #225):
+//! Four steps, in this order, and the order is the correctness
+//! property (gh #225, gh #318):
 //!
 //! 1. Validate ownership + (pid, epoch), then **prepare** the txn via
 //!    [`TxnStateStore::prepare_end_txn`] — `Ongoing → Prepare{Commit,
 //!    Abort}`, keeping the partition list on the persisted entry.
-//! 2. Place a COMMIT / ABORT marker for every partition in that list.
+//! 2. **Settle** the staged offsets via
+//!    [`TxnStateStore::settle_offsets`], which fires the [`TxnOffsetHook`]
+//!    that materialises or discards them. A failed offset write leaves the
+//!    entry prepared, before any marker has been placed.
+//! 3. Place a COMMIT / ABORT marker for every partition in that list.
 //!    Partitions this broker leads get a [`build_control_batch`]
 //!    control batch appended with `acks = -1`; peer-led partitions get
 //!    a marker-queue entry on the shared PVC, which the peer's
 //!    `MarkerWatcher` retries until applied (gh #175).
-//! 3. Only once every marker is durable, **complete** via
+//! 4. Only once every marker is durable, **complete** via
 //!    [`TxnStateStore::complete_end_txn`] — `Prepare* → Complete*`,
-//!    clearing the list and firing the [`TxnOffsetHook`] that
-//!    materialises or discards staged offsets.
+//!    clearing the list.
 //!
-//! If step 2 fails for any partition the handler returns a retriable
+//! If step 2 or 3 fails the handler returns a retriable
 //! error and the entry stays in `Prepare*` with its list intact, so the
 //! producer's retry re-drives the identical dispatch set. Before
 //! gh #225 the state advanced to `Complete*` first, the list was
@@ -28,6 +31,7 @@
 //! transactions, so they must be durable before we ack the producer.
 //!
 //! [`TxnStateStore::prepare_end_txn`]: kaas_coordinator::TxnStateStore::prepare_end_txn
+//! [`TxnStateStore::settle_offsets`]: kaas_coordinator::TxnStateStore::settle_offsets
 //! [`TxnStateStore::complete_end_txn`]: kaas_coordinator::TxnStateStore::complete_end_txn
 //! [`TxnOffsetHook`]: kaas_coordinator::TxnOffsetHook
 //! [`build_control_batch`]: crate::control_batch::build_control_batch

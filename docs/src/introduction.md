@@ -77,7 +77,7 @@ assert it. [Part II](compat/wire-protocol.md) carries a
 wire surface, a [KIP index](compat/kip-index.md) that says implemented /
 partial / non-goal honestly, and a
 [verification story](compat/verification.md) built on Apache's own shell
-tools, run against every release.
+tools, run against a live cluster.
 
 ## How to read this book
 

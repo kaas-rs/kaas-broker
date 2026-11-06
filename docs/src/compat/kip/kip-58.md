@@ -41,7 +41,8 @@ infinite lag: the retention cleaner does not consult `cleanup.policy`,
 and the enforced `retention.ms` default of 7 days means a
 `cleanup.policy=compact` topic's closed segments age out like any
 other's unless `retention.ms` is set to `-1`. Until the compactor lands,
-data on compacted topics is subject to delete-style retention.
+data on compacted topics is subject to delete-style retention (tracked as
+gh #339).
 
 The intended enforcement semantics (per-segment `maxTimestamp` inside the
 lag window ⇒ segment skipped) are described with the storage engine in

@@ -226,6 +226,16 @@ incarnation — a reconcile-time check, so it needs no delete event and
 no ordering between watchers. An *unstamped* directory is always
 adopted, never reclaimed: "unknown identity" must not be destructive.
 
+A name can also be a route out. A topic name or group ID comes from a
+client and ends up in a path, so it must not be able to leave its
+directory. Topic names follow Apache's rules, plus two reserved shapes kaas
+needs for itself (`__cluster` and `.deleting-*`), and are checked wherever a
+name enters: the admin APIs, the operator, the topic watch and, as the last
+line of defence, partition open. An ACL check is no substitute, because a
+prefix ACL matches the raw string: `kperf-/../victim` passes a grant on
+`kperf-`. Apache allows any string as a group ID, so those can't be refused,
+and the offset store percent-encodes them in the file name instead.
+
 ## Why this matters more for kaas than for Kafka
 
 In Apache Kafka a broker's local disk is one replica among several: a
@@ -265,6 +275,7 @@ bug, and each is one rule ignored:
 | The per-partition manifest was read-modify-written by several paths, so a takeover completing inside another writer's read-work-write gap got replayed over — silently lowering the durable epoch and unarming the zombie fence (gh #235). | 3 — two writers | Every manifest write re-reads the on-disk file just before writing and skips itself if the epoch there is higher — no writer may lower the epoch, and identical writes are skipped outright. |
 | A broker that already had a topic's directory open when the operator renamed it aside kept appending into the staged `.deleting-*` copy — FDs follow the inode — while the live path served an empty log, with no error anywhere (gh #241). | 3 — two writers | Partition open consults the topic's incarnation identity and refuses (retriably) to open a directory stamped with a previous incarnation's ID, until the operator's reclaim lands. |
 | A tail torn by a crash mid-write was accepted as valid data on recovery: appends resumed after the garbage, and the *next* recovery stopped at the tear — losing every acked record written past it (gh #226/#228). | 2 — not driven to a verified end-state | The recovery scan verifies each batch's CRC and truncates the log to the last byte it *proved* valid before any write handle is used — a clean log is never touched, and the scan is bounded by the recovery checkpoint. |
+| A client-supplied topic name could resolve outside the data directory (gh #314). | 4 — a name used as a path | `kaas_storage::is_valid_topic_name` at every entry point and in `ensure_open`; `OffsetStore` percent-encodes group IDs. |
 
 Note the fifth entry was found by *this document's own checklist*,
 applied to a fix for the first: rename-aside solved a rule-3 race and

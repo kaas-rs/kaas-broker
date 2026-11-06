@@ -44,16 +44,17 @@ repository override is needed:
 
 ```bash
 helm install my-kaas oci://ghcr.io/kaas-rs/charts/kaas-broker \
-  --version 0.3.1-preview \
+  --version 0.3.63-preview \
   --namespace kafka --create-namespace \
   --set storage.className=ceph-filesystem \
   --set broker.replicaCount=3
 ```
 
-See available versions:
+See a version's chart, and the
+[releases page](https://github.com/kaas-rs/kaas-broker/releases) for the latest:
 
 ```bash
-helm show all oci://ghcr.io/kaas-rs/charts/kaas-broker --version 0.3.1-preview
+helm show all oci://ghcr.io/kaas-rs/charts/kaas-broker --version 0.3.63-preview
 ```
 
 ### CRDs on upgrade
@@ -64,11 +65,11 @@ CRDs, apply them explicitly before `helm upgrade`:
 
 ```bash
 # Pull the new chart version locally, then apply the CRDs it ships:
-helm pull oci://ghcr.io/kaas-rs/charts/kaas-broker --version 0.3.1-preview --untar
+helm pull oci://ghcr.io/kaas-rs/charts/kaas-broker --version 0.3.63-preview --untar
 kubectl apply -f kaas/crds/
 
 # Or apply them straight from the repo at a specific ref:
-REF=v0.3.1-preview
+REF=v0.3.63-preview
 BASE=https://raw.githubusercontent.com/kaas-rs/kaas-broker/${REF}/deploy/crds
 for f in kaas.rs_kafkaclusters.yaml \
          kaas.rs_kafkatopics.yaml \

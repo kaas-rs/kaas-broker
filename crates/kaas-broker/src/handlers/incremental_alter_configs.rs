@@ -7,8 +7,8 @@
 //! Each op gets translated by the installed [`TopicCRWriter`] into
 //! a JSON-merge PATCH on `KafkaTopic.spec.config`. `Set` writes
 //! the parsed value, `Delete` writes null, `Append` / `Subtract`
-//! surface as `UNSUPPORTED_VERSION` (kaas's topic configs are
-//! scalar — list-valued ops don't apply). Unknown keys and
+//! aren't implemented and surface as `UNSUPPORTED_VERSION`, even on
+//! `cleanup.policy`, which is list-typed. Unknown keys and
 //! unparseable values are rejected with `INVALID_CONFIG` (40)
 //! before anything touches the API server (gh #236).
 //!
@@ -65,9 +65,9 @@ impl Handler for IncrementalAlterConfigsHandler {
 
         for resource in req.resources {
             if resource.resource_type != incremental_alter_configs::resource_type::TOPIC {
-                // BROKER + BROKER_LOGGER not implemented — the
-                // CLAUDE.md note pins this as a non-goal until the
-                // broker grows a dynamic-config surface.
+                // BROKER + BROKER_LOGGER aren't implemented yet: the
+                // broker has no dynamic-config surface (gh #338 for
+                // log levels). A parity gap, not a non-goal.
                 responses.push(response_for(
                     &resource,
                     ERR_UNSUPPORTED_VERSION,

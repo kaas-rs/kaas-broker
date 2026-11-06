@@ -51,7 +51,7 @@
   - [KIP-368 — SASL re-authentication (partial)](compat/kip/kip-368.md)
   - [KIP-371 — mTLS principal mapping](compat/kip/kip-371.md)
   - [KIP-394 — member id required (partial)](compat/kip/kip-394.md)
-  - [KIP-447 — EOS v2](compat/kip/kip-447.md)
+  - [KIP-447 — EOS v2 (partial)](compat/kip/kip-447.md)
   - [KIP-482 — flexible versions](compat/kip/kip-482.md)
   - [KIP-516 — topic IDs (partial)](compat/kip/kip-516.md)
   - [KIP-546 — client-quota APIs](compat/kip/kip-546.md)
@@ -77,6 +77,7 @@
   - [kaas-operator-controllers](code-tour/kaas-operator-controllers.md)
   - [kaas (broker binary)](code-tour/bin-kaas.md)
   - [kaas-operator (operator binary)](code-tour/bin-kaas-operator.md)
+- [Topic delete & recreate](code-tour/topic-lifecycle.md)
 
 # Part IV — Operations
 

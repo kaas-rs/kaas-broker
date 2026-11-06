@@ -82,16 +82,32 @@ takeover conflict during a failover is normal; a steady stream of renew
 conflicts means two writers keep fighting over the Lease.
 
 The conditional write is not a fence. It guarantees one winner per
-transition, but a deposed controller keeps acting until its own next
-renew fails. The epoch checks on `assignment.json` and on every
-partition are what make that window harmless, as before. And during a
-rolling upgrade from a release that still force-applies, the
-older brokers can still overwrite; the gap closes once every broker runs
-the new image.
+transition, but a deposed controller keeps acting until it notices. The
+epoch checks on `assignment.json` and on every partition are what make
+that window harmless.
+
+## Giving the Lease up before it can expire
+
+A holder that can't renew stops being controller before its Lease can
+run out, so it never acts on a Lease someone else could already have
+taken. With the default timings (15 s Lease, 10 s renew deadline, 2 s
+retry period) it gives up 10 s after the start of the last renew that
+landed. Attempts that hang count against that window, and neither a
+retry's sleep nor a failing attempt runs past it. A win whose answer took
+longer than the window starts nothing and tries again, so a persistently
+slow API server never elects a controller.
+
+This is stricter than client-go, whose window starts a retry period after
+the last success, and the price is tolerance for API-server blips. The
+longest outage a holder survives depends on where in the renew cycle it
+starts: 5.9–7.5 s at 15/10/2, and 15.9–17.5 s at 30/20/2. A longer one
+costs a controller restart, with no epoch bump if nobody took the Lease
+meanwhile. If your API server blips for longer than that, widen
+`broker.controllerLease.*` rather than loosening the bound.
 
 ## What the controller does
 
-The Lease holder takes on four extra responsibilities:
+The Lease holder takes on three extra responsibilities:
 
 - **Observes peer brokers** via the heartbeat gRPC stream every broker
   dials into it. A broker that stops heartbeating ages out of the alive
@@ -192,11 +208,12 @@ authority to disagree with.
 
 ## Local-dev mode
 
-When the broker starts outside a pod (the `MY_POD_NAME` env unset), the
-cluster runtime isn't started at all: storage flips to in-memory and a
-local shim answers "yes, I lead" for every partition. This is a
-dev-loop convenience, not a single-node production mode — nothing is
-persisted.
+A broker started outside a pod (`MY_POD_NAME` unset) runs no Lease
+election. With `KAAS_DATA_DIR` unset too, storage is in-memory and a
+local shim answers "yes, I lead" for every partition: a dev-loop
+convenience with nothing persisted, not a single-node production mode.
+With `KAAS_DATA_DIR` set it uses the disk engine and writes a self-only
+`assignment.json`, so the same ownership path runs as in a cluster.
 
 ## Implementation notes (for contributors)
 
@@ -213,5 +230,8 @@ persisted.
   the single leadership authority was the gh #75 cleanup. The
   deposed-controller race is pinned down by
   `crates/kaas-controller/tests/stale_controller_race.rs`.
-- Dev-mode selection is in `bins/kaas/src/main.rs`; the always-leader
-  shim is `crates/kaas-broker/src/local_lease.rs`.
+- The three modes are described at the top of `bins/kaas/src/cluster.rs`;
+  the always-leader shim is `crates/kaas-broker/src/local_lease.rs`.
+- The renew window is gh #334. A broker re-acquiring its own Lease doesn't
+  count as a transition (gh #204). The balancer's keep-first ordering is
+  gh #206, and per-topic evenness is gh #247.

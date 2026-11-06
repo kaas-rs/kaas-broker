@@ -7,7 +7,8 @@ request* (`handlers/`) or *maintains the state requests read from*
 (everything else).
 
 **State side**: `broker.rs` (the `Broker` — the narrow shape every handler
-reads), `coordinator.rs` (the on-broker `Coordinator`: watches
+reads — plus `coordinator_io` / `txn_store_io`, which keep coordinator file
+work off the runtime workers, gh #328), `coordinator.rs` (the on-broker `Coordinator`: watches
 `assignment.json`, answers every ownership question with hash-fallthrough
 group/txn routing), `takeover.rs` + `group_takeover.rs` (drivers that
 diff assignments into storage-engine take-over/relinquish and group
@@ -30,9 +31,9 @@ coexistence annotations on broker-minted CRs), `topic_config_defaults.rs`
 to Kubernetes (CreateTopics/CreatePartitions/IncrementalAlterConfigs and
 Metadata auto-topic-creation → `KafkaTopic`, Create/DeleteAcls →
 `KafkaUser`, AlterUserScramCredentials → `KafkaUser.spec.authentication.scram`
-— KIP-554, gh #252). In dev mode the topic writer is a no-op impl that
-refuses politely; the ACL and user writers are simply not installed without
-a kube client.
+— KIP-554, gh #252). None of them is installed without a kube client, where
+the topic admin APIs answer `CLUSTER_AUTHORIZATION_FAILED` (31). The quota
+admin API writes no CR: it changes the serving broker's enforcer in memory.
 
 **Handlers**: one module per API key under `handlers/`. The per-key
 behaviour — versions, semantics, deviations — is documented exhaustively in

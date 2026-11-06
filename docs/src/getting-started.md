@@ -13,11 +13,14 @@ cluster can run on a plain `ReadWriteOnce` local-path class.
 
 ```bash
 helm install my-kaas oci://ghcr.io/kaas-rs/charts/kaas-broker \
-  --version 0.3.1-preview \
+  --version 0.3.63-preview \
   --namespace kafka --create-namespace \
   --set storage.className=<your-rwx-class> \
   --set broker.replicaCount=3
 ```
+
+Use the [latest release](https://github.com/kaas-rs/kaas-broker/releases): the chart version
+is the tag without its leading `v`.
 
 That deploys a broker `StatefulSet`, the operator, and the shared
 volume(s). The chart's defaults give you an anonymous in-cluster
@@ -65,10 +68,9 @@ actually went.
 
 ## Run locally in dev mode
 
-The broker binary detects dev mode by the absence of the `MY_POD_NAME`
-env var (which the StatefulSet always sets): storage flips to
-in-memory, no Kubernetes API is needed, and the broker treats itself as
-leader of every partition.
+With neither `MY_POD_NAME` nor `KAAS_DATA_DIR` set (the StatefulSet sets
+both), storage is in-memory, no Kubernetes API is needed, and the broker
+treats itself as leader of every partition.
 
 ```bash
 cargo run -p kaas

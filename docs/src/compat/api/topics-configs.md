@@ -240,7 +240,7 @@ Everything else (`BROKER_LOGGER` included) gets a per-resource
   `inter.broker.protocol.version = 3.6` strings (predating the 3.7 parity
   target).
 - `BROKER_LOGGER` is unsupported and answers `UNSUPPORTED_VERSION` (35),
-  where Apache serves log4j levels.
+  where Apache serves log4j levels (tracked as gh #338).
 
 **Source**: `crates/kaas-broker/src/handlers/describe_configs.rs`,
 `crates/kaas-broker/src/topic_config_defaults.rs`.
@@ -306,14 +306,16 @@ DescribeConfigs reports the override as `DYNAMIC_TOPIC_CONFIG`.
 **Deviations from Apache 3.7**:
 
 - **`APPEND` and `SUBTRACT` are unsupported** and answer
-  `UNSUPPORTED_VERSION` (35): every kaas topic-config key is scalar, so the
-  list-valued ops have nothing to apply to.
+  `UNSUPPORTED_VERSION` (35), even on `cleanup.policy`, the one list-typed
+  key kaas accepts. On a non-list key Apache answers `INVALID_CONFIG` (40).
+- `cleanup.policy` accepts only `delete`, `compact` and `compact,delete`,
+  where Apache accepts the elements in any order (tracked as gh #337).
 - Config keys outside the allow-list answer `INVALID_CONFIG` (40)
   as Apache does for unknown names — but the allow-list itself is far
   smaller than Apache's key set, so keys Apache would accept
   (`max.message.bytes`, ...) are rejected here.
 - `BROKER` / `BROKER_LOGGER` alteration is unsupported (Apache 3.7 supports
-  dynamic broker configs, KIP-226).
+  dynamic broker configs, KIP-226). Log levels are tracked as gh #338.
 - One bad op fails the whole resource — the ops for a resource are applied as
   a single all-or-nothing merge patch.
 - The change is asynchronous: it is visible to DescribeConfigs once the

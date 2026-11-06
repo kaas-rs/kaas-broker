@@ -15,7 +15,7 @@ Apache Kafka 3.7, with one deliberate post-3.7 exception: DescribeCluster
 v2 (KIP-1073) is served, because kaas has a real fenced broker state and
 no other way to report it — see [KIP-700](kip/kip-700.md).
 
-> Three corrections relative to earlier planning documents, all found by
+> Four corrections relative to earlier planning documents, all found by
 > source-verifying during the book build: **KIP-516, KIP-32, KIP-58, and
 > KIP-354 are partial, not implemented.** Topic IDs are minted but not
 > propagated to the wire (KIP-516); LogAppendTime and timestamp lookup
@@ -23,7 +23,7 @@ no other way to report it — see [KIP-700](kip/kip-700.md).
 > remain config plumbing without an enforcing compactor — though the
 > delete-policy retention cleaner now runs (gh #250).
 
-## Implemented (14)
+## Implemented (13)
 
 | KIP | What it is | kaas page |
 |---|---|---|
@@ -36,13 +36,12 @@ no other way to report it — see [KIP-700](kip/kip-700.md).
 | KIP-339 | `IncrementalAlterConfigs` (key 44) | [KIP-339](kip/kip-339.md) |
 | KIP-360 | Producer epoch bump on re-initialization | [KIP-360](kip/kip-360.md) |
 | KIP-371 | mTLS principal mapping (`ssl.principal.mapping.rules`) | [KIP-371](kip/kip-371.md) |
-| KIP-447 | EOS v2: producer-scalable transactional offsets | [KIP-447](kip/kip-447.md) |
 | KIP-482 | Flexible versions + tagged fields | [KIP-482](kip/kip-482.md) |
 | KIP-546 | Client-quota admin APIs (keys 48/49) | [KIP-546](kip/kip-546.md) |
 | KIP-700 | `DescribeCluster` admin API (key 60) | [KIP-700](kip/kip-700.md) |
 | KIP-800 | Join/leave reason strings | [KIP-800](kip/kip-800.md) |
 
-## Partial (10)
+## Partial (11)
 
 Each page leads with the "what's missing" block — these are the book's
 credibility test.
@@ -57,6 +56,7 @@ credibility test.
 | KIP-354 | `delete.retention.ms` config plumbing | tombstone-expiry enforcement (same missing compactor); upstream's `max.compaction.lag.ms` doesn't exist anywhere | [KIP-354](kip/kip-354.md) |
 | KIP-368 | re-auth on a live connection; `session_lifetime_ms` advertised + deadline enforced on `oauth` listeners; same-principal guard | a broker-wide `connections.max.reauth.ms` for SCRAM/PLAIN sessions; disconnect (vs in-band 58) past the deadline | [KIP-368](kip/kip-368.md) |
 | KIP-394 | `MEMBER_ID_REQUIRED` error code defined | the v4+ two-step join handshake — `join()` still takes the legacy assign-inline path | [KIP-394](kip/kip-394.md) |
+| KIP-447 | `TxnOffsetCommit` staging, offset settlement in `EndTxn`, `TxnOffsetCommit` v3 on the wire | cross-broker completion, so offsets only apply when the group and transaction coordinators are the same broker; generation, member and producer-epoch checks on `TxnOffsetCommit` | [KIP-447](kip/kip-447.md) |
 | KIP-516 | operator mints `Status.TopicID` (v4 UUID, never rotated) | broker-side wire propagation — the production topic watch inserts the all-zero sentinel, so Metadata serves nil topic IDs | [KIP-516](kip/kip-516.md) |
 | KIP-554 | wire keys 50/51 served — describe answers from the live credential store, alter rotates via the `KafkaUser` CR | SCRAM-SHA-256 (kaas is SHA-512-only); wire-side credential *deletion* (refused — the lifecycle stays on the CR) | [KIP-554](kip/kip-554.md) |
 

@@ -16,11 +16,14 @@ exhaustively.
 
 ```bash
 helm install my-kaas oci://ghcr.io/kaas-rs/charts/kaas-broker \
-  --version 0.3.1-preview \
+  --version 0.3.63-preview \
   --namespace kafka --create-namespace \
   --set storage.className=<your-rwx-class> \
   --set broker.replicaCount=3
 ```
+
+Use the [latest release](https://github.com/kaas-rs/kaas-broker/releases): the chart version
+is the tag without its leading `v`.
 
 ## The listeners array
 

@@ -30,8 +30,8 @@ sequenceDiagram
     C->>L: Produce (RecordBatch bytes)
     L->>L: read_frame → decode_request_header
     L->>H: dispatch by api_key<br/>(per-listener pre-auth gate)
-    H->>H: topic exists? · do I lead it?<br/>heartbeat fresh (self-fence)? · ACL Write?
-    Note over H: any gate fails →<br/>NOT_LEADER_FOR_PARTITION (6) /<br/>TOPIC_AUTHORIZATION_FAILED (29)
+    H->>H: ACL Write? · topic exists? · batch structure?<br/>do I lead it? · heartbeat fresh (self-fence)?<br/>size, CRC and header fields valid?
+    Note over H: any gate fails → its own error, e.g.<br/>TOPIC_AUTHORIZATION_FAILED (29) /<br/>NOT_LEADER_OR_FOLLOWER (6) / CORRUPT_MESSAGE (2)
     H->>P: engine.append(topic, partition, epoch, acks, bytes)
     activate P
     Note over P: under the partition mutex
@@ -52,11 +52,16 @@ sequenceDiagram
     H-->>C: ProduceResponse(base_offset,<br/>throttle_time from one post-append quota check)
 ```
 
-The RecordBatch bytes are never parsed on this path — only two
-fixed-size header peeks (producer info for idempotence, offsets for
-assignment); the same opaque bytes the client sent land verbatim on
-disk. The quota check runs once per request over the summed byte count,
-after the appends, and feeds `throttle_time_ms`.
+Records inside a batch are never parsed on this path. The handler reads
+the fixed-size batch header and checks the batch's CRC32C before anything
+is appended, as Apache's append path does: a bad CRC must never be acked,
+because the recovery scan stops at it and would truncate every acked
+record written after it. The same opaque bytes the client sent then land
+verbatim on disk. A duplicate writes nothing, but at `acks=all` it still
+waits for any flush outstanding, so a client retrying on a new connection
+can't be acked ahead of the original's fsync. The quota check runs once
+per request over the summed byte count, after the appends, and feeds
+`throttle_time_ms`.
 
 ## A Fetch request, end to end
 
@@ -67,7 +72,7 @@ sequenceDiagram
     participant E as Storage engine
 
     C->>H: Fetch (decode + dispatch, same front door as Produce)
-    H->>H: topic exists? · do I lead it? · ACL Read?
+    H->>H: ACL Read? · topic exists? · do I lead it?
     Note over H: read cap = last stable offset (read_committed)<br/>or high watermark (read_uncommitted)
     H->>E: read(topic, partition, fetch_offset, max_bytes)
     E->>E: walk closed segments + active,<br/>copy batch bytes into memory
@@ -113,9 +118,9 @@ flowchart TB
         direction TB
         recv["wait for a flush request"] --> target["lock: target = requested_flush_seq<br/>(skip if already completed)"]
         target --> fsync["spawn_blocking { lock(); log.sync_all() }<br/>fsync runs holding the partition mutex"]
-        fsync --> watchdog{"done within 30 s?"}
+        fsync --> watchdog{"done within the deadline?"}
         watchdog -- yes --> ok["completed_flush_seq = target<br/>notify_waiters()"]
-        watchdog -- "timeout / io error" --> dead["sticky flush_err = Stalled —<br/>partition fails fast on next append;<br/>orphaned fsync drains in background"]
+        watchdog -- "timeout / io error" --> dead["sticky flush_err = Stalled —<br/>partition fails fast on next append;<br/>orphaned fsync drains in background;<br/>a 5 s probe re-arms once a real fsync succeeds"]
     end
 
     subgraph deferred["deferred finalize — spawn_blocking after roll"]
@@ -136,9 +141,12 @@ Four properties that make this work:
 2. **Lock-free reads**: high-watermark / log-start observation goes
    through the `ArcSwap` snapshot, so a stuck NFS fsync can't stall
    metrics callbacks.
-3. **Fsync watchdog**: a hung NFS server trips the 30 s timeout, sets a
-   sticky `Stalled` error, and the partition fails fast instead of
-   hanging appenders forever.
+3. **Fsync watchdog**: a hung NFS server trips the timeout (30 s by
+   default, `broker.fsyncMaxLatencyMs`), sets a sticky `Stalled` error, and
+   the partition fails fast instead of hanging appenders forever. It isn't
+   permanent: every 5 s the committer probes the volume, and once a real
+   fsync of the log succeeds the partition re-arms, with no restart or
+   leadership move.
 4. **A failed fsync stalls too, wherever it happens** (gh #289): the two
    segment rolls sync the descriptor the committer syncs, and Linux reports
    a writeback error once per descriptor, so the next fsync succeeds without
@@ -187,6 +195,8 @@ rebuild it without new evidence.
     manifest.json                 ── { epoch, highWatermark, logStartOffset }
     producer-state.snapshot       ── idempotent-producer dedupe window
     recovery-checkpoint.json      ── fsynced-prefix hint (see below)
+    txn-index.snapshot            ── read_committed indexes (open txns,
+                                     aborted list)
     00000005-00000000000000000000.log   ── epoch=5, base_offset=0
     00000005-00000000000000000000.index ──   8-byte (rel_offset, file_pos)
     00000005-00000000000000001000.log   ── epoch=5, base_offset=1000
@@ -213,9 +223,19 @@ never physically collide with a new leader's segment:
 ```
 
 The manifest is written on partition open (takeover routes through
-open) and on close/relinquish — **not** on segment roll and not per
-append — so its `highWatermark` can lag in-memory state; recovery
-treats the log as authoritative and reconciles on open. The recovery
+open), on close/relinquish, and when `DeleteRecords` or retention advances
+the log start — **not** on segment roll and not per append — so its
+`highWatermark` can lag in-memory state; recovery treats the log as
+authoritative and reconciles on open. A log-start advance is durable
+before the request is answered and before any segment file goes, so
+purged records stay purged across a crash. The one exception is a full
+volume: writing the manifest needs a free block, so on `ENOSPC` the covered
+segments go first, or neither `DeleteRecords` nor retention could ever free
+the volume. Open makes that safe by clamping the log start to the first
+segment's base, as Apache's `LogLoader` does. A manifest with no segments
+left is handled the same way: the new segment starts at the log start, not
+at the manifest's stale high watermark, so a partition can't advertise
+offsets nothing backs. The recovery
 scan validates each batch against its own CRC32C and stops at the
 first batch that is short, structurally impossible, or fails its
 checksum; the log is then **truncated to the last valid byte** before
@@ -269,14 +289,17 @@ durability is on the `acks=all` promise.
 
 ## Byte opacity: the broker never parses records
 
-Exactly three places on the Produce path touch the RecordBatch bytes,
-and none of them decodes a record:
+Four places on the Produce path touch the RecordBatch bytes, and none of
+them decodes a record:
 
 1. The request decoder carries the records as an opaque, zero-copy
    slice into the frame buffer.
-2. The idempotence check peeks the fixed-size batch header for producer
+2. The handler validates the batch the way Apache's append path does: the
+   fixed-size header fields, plus a CRC32C over the batch's bytes. A
+   checksum reads the bytes without interpreting them.
+3. The idempotence check peeks the fixed-size batch header for producer
    ID / epoch / sequence — header only.
-3. The segment append peeks the head for
+4. The segment append peeks the head for
    `(base_offset, last_offset_delta, max_timestamp)` — header only.
 
 After that, the same opaque bytes the client sent land verbatim on disk
@@ -311,7 +334,10 @@ cleaner enforces it:
   pushed the partition over `retention.bytes`, whichever reaps more.
   A topic that sets neither gets the cluster default — seven days,
   as in Apache. `-1` on either knob opts out and retains forever. The
-  active segment is never reclaimed.
+  active segment is never reclaimed, and a partition that can't persist
+  doesn't stop the pass for the others. Retention doesn't consult
+  `cleanup.policy` yet, so a `compact` topic ages out like any other, where
+  Apache exempts it (tracked as gh #339).
 - **Segment rolls** happen at `segment.bytes` (1 GiB) or `segment.ms`
   (seven days), whichever comes first, per topic. The time-based roll
   is not a detail: retention only ever deletes *closed* segments, so a
@@ -405,6 +431,12 @@ ownership](./file-handles.md).
 - The producer-fence files and marker queue in the layout above belong
   to the transaction machinery (gh #108 phase 2, gh #175) — see
   [Transactions & idempotence](./transactions.md).
+- Fixes worth reading before touching this path: the durable log-start
+  advance and the full-volume exception (gh #311, gh #325), re-arming after
+  a stall (gh #168), a manifest with no segments (gh #229), duplicates
+  waiting for the fsync (gh #321), and the CRC check on append (gh #228).
+  Produce can still park a runtime worker on the partition mutex for up to
+  one fsync (gh #333).
 - The index is read into memory on open; an mmap-backed index is
   future work noted in `segment.rs` (the workspace forbids unsafe
   code, so it would need a vetted dependency).

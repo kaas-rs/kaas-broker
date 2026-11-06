@@ -111,7 +111,9 @@ CRC32C on the Fetch path.
 One log subscriber is installed at boot: a filter honouring
 `KAAS_LOG_LEVEL` (the broker also honours `RUST_LOG`, which wins) and a
 formatter honouring `KAAS_LOG_FORMAT` (`json` or text). Logs go to
-stdout, for whatever node log collector the cluster runs.
+stdout, for whatever node log collector the cluster runs. The level is read
+once at startup, so changing it means restarting the broker, where Apache
+can change it at runtime (tracked as gh #338).
 
 kaas exports no traces. Earlier releases wired an OTLP/gRPC span
 exporter and a sampler, but no code path ever opened a span, so they

@@ -17,8 +17,9 @@ retention only — compaction is still unimplemented, gh #158) +
 `recovery_checkpoint.rs` (the bounded-recovery-scan checkpoint, gh #230),
 `topic_identity.rs` (the `.topic-id.json` incarnation stamp, gh #219),
 `idempotence.rs` + `producer_snapshot.rs` (per-PID dedupe rings and their
-persistence), `txn_index.rs` (aborted-transaction ranges for read-committed
-Fetch), `memory.rs` (dev-mode in-memory engine), `atomic_write.rs`,
+persistence), `txn_index.rs` + `txn_index_snapshot.rs` (open-transaction and
+aborted ranges for read-committed Fetch, and their persistence, gh #177),
+`memory.rs` (dev-mode in-memory engine), `atomic_write.rs`,
 `errors.rs`, `fs.rs` (the filesystem seam that lets tests fault-inject).
 The crate also carries the multi-log-dir/volume-pool plumbing
 (`parse_log_dirs_json`, the `PlacementResolver` seam — gh #221/#224).

@@ -13,7 +13,7 @@ cluster-wide authorizer/quota checker, registers every handler with the
 dispatcher, spawns the kube topic watch (in cluster mode), starts
 `/healthz`/`/readyz`, and owns the **graceful SIGTERM drain** — relinquish
 every open partition (persisting manifests + producer snapshots, closing
-FDs), then flush remaining manifests as defence-in-depth
+FDs); the relinquish is the final persist
 ([file-handle ownership](../architecture/file-handles.md)). It also carries
 the `--init` init-container entry point, the retention-cleaner tick, the
 credentials/ACL hot-reload task, and the JWKS refresher loops for OAuth

@@ -336,8 +336,7 @@ Members the leader omitted receive a zero-byte assignment.
   cross-checked against the group — kaas never returns
   `INCONSISTENT_GROUP_PROTOCOL` from SyncGroup.
 - Omitted members get raw empty bytes; encoding a *valid* empty
-  `ConsumerProtocolAssignment` struct instead is a follow-up (tracked
-  as gh #111).
+  `ConsumerProtocolAssignment` struct instead is a follow-up.
 - No `FENCED_INSTANCE_ID` for static members ([KIP-345](../kip/kip-345.md)),
   same as the rest of the group surface.
 

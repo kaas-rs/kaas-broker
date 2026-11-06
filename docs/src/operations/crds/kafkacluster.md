@@ -103,5 +103,5 @@ external listener is enabled), and `Ready`.
 - The chart→CR template is
   `deploy/helm/kaas/templates/kafkacluster.yaml`, using the
   `kaas.firstByType` helper to collapse the listener array into the
-  legacy single-listener shape (gh #126 follow-up tracks consuming the
-  array natively).
+  legacy single-listener shape. Consuming the array natively is open
+  follow-up.

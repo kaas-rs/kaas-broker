@@ -10,7 +10,7 @@
 //! - `2` = `APPEND` (list-valued configs)
 //! - `3` = `SUBTRACT` (list-valued configs)
 //!
-//! kaas's topic configs are scalar — `APPEND` / `SUBTRACT` return
+//! `APPEND` / `SUBTRACT` aren't implemented and return
 //! `UNSUPPORTED_VERSION` at the handler. Carry the value through here
 //! at codec level for fidelity.
 //!

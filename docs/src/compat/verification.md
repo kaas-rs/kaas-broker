@@ -18,7 +18,9 @@ distribution's* shell tools (`kafka-topics`, `kafka-console-producer`,
 `kafka-verifiable-{producer,consumer}`, …) against a live kaas cluster —
 the same binaries an operator would point at Apache, unchanged. Every
 script honours the same `BOOTSTRAP` / `KAFKA_BIN` overrides; defaults
-target the in-cluster Service DNS and `/opt/kafka/bin`.
+target the in-cluster Service DNS and `/opt/kafka/bin`. A cluster with no
+anonymous listener is handled for them: `scripts/_common.sh` authenticates
+every tool call as the `kaas-scripts` KafkaUser.
 
 Two honesty conventions:
 
@@ -44,11 +46,13 @@ a broker started inside the test process:
 - [byte opacity](wire-protocol.md#the-byte-opacity-contract): a produced
   batch comes back byte-identical through Fetch;
 - multi-broker bring-up: assignment, takeover, coordinator routing;
-- the full KIP-447 consume-process-produce-commit round trip (EOS v2);
+- the full KIP-447 consume-process-produce-commit round trip (EOS v2), on
+  one broker;
 - controller failover and the stale-epoch fence.
 
-Plus per-crate unit tests — including the codec's fixture tests, which
-pin encode/decode byte-identity against captures from Apache Kafka 3.7.
+Plus per-crate unit tests. Most codec tests are round trips through kaas's
+own encoder and decoder, which can't catch a bug the two share, so the wire
+claims that matter are also pinned against Apache's values or a real socket.
 
 ## 3. The parity project board
 
@@ -61,11 +65,14 @@ Apache Kafka 3.7*, never invent kaas-specific semantics.
 
 ## 4. Docs that can't rot
 
-Two CI gates keep this book honest (`cargo xtask check-docs-drift`):
+Three CI gates keep this book honest (`cargo xtask check-docs-drift`). They
+catch moved files and changed wire surfaces, not prose that has gone wrong:
 
 - The [API support matrix](api-matrix.md) is generated from the same
   codec registry that builds the ApiVersions response; CI fails if the
   committed page drifts from the wire surface.
+- Every registered API key must have its heading on the page the matrix
+  links to, so a renamed heading can't silently break a deep link.
 - Every `crates/…` / `bins/…` source path cited anywhere in the book is
   checked against the tree; a refactor that moves a file fails CI until
   the citation is fixed.
@@ -75,7 +82,7 @@ Two CI gates keep this book honest (`cargo xtask check-docs-drift`):
 Benchmarks are treated with the same suspicion as compatibility claims:
 multi-run (5×) averaging with outlier exclusion, NFS RPC + network-rate
 snapshots as a NAS-liveness probe, and recorded reports under
-`docs/perf-results/`. Current standing and methodology live in
+`docs/perf-results/` (gitignored, so not in the repository). Current standing and methodology live in
 [Performance vs Strimzi](../operations/performance.md).
 
 ## Implementation notes (for contributors)

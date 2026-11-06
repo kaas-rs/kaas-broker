@@ -35,6 +35,9 @@ History so far:
 | `v0.3.1-preview`   | Authorization-only `KafkaUser`s (gh #42): `spec.authentication` optional, for OAuth principals. CRD change is a required→optional relaxation (existing CRs still validate), so it still rolls in place — but the chart does not upgrade CRDs, so apply `deploy/crds/kaas.rs_kafkausers.yaml` before the CR. |
 | `v0.3.2-preview`   | Remove the `KafkaClusterAssignments` CRD and the `CrMirror` seam (gh #191/#262): the status writer was never ported from Go, so the CR sat empty on every cluster. CRD-*removing* change, but it rolls in place — nothing ever read or wrote the CR. The orphaned CRD/CR on existing clusters is inert; clean up with `kubectl delete crd kafkaclusterassignments.kaas.rs`. Also drops the CR's RBAC, the `KAAS_CLUSTER_NAME` env, the `cr_mirror_writes` metric, and the never-firing `KaasCRMirrorErrorSustained` alert. |
 
+Later patches are listed on the project's
+[GitHub Releases](https://github.com/kaas-rs/kaas-broker/releases) page.
+
 > **Note on the `v0.3.0` minor bump.** The default rule is patch-only.
 > This release takes a minor bump deliberately — it adds a new
 > authentication mechanism (a user-visible capability), which is what a

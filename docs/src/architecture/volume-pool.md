@@ -145,9 +145,15 @@ replication layer to move data behind your back, so an inter-volume
 move is a raw copy, and raw copies only happen when you ask for one
 (next section).
 
-If a placement record ever points at a member that no longer exists,
-brokers fall back to the `default` volume rather than failing the
-partition — resolution can never make a partition unopenable.
+Where the data actually is outranks the record. Placement is eventually
+consistent: a broker routinely opens a partition before it has seen
+`status.volumeAssignments`, and at boot it takes over partitions before
+its topic watch has listed anything. So a broker opens the volume the
+record names if that volume holds the partition's manifest; otherwise any
+pool member that holds one; and only if none does, the volume the record
+names, as a fresh partition. A record naming a member that no longer
+exists falls back to `default`, so resolution can never make a partition
+unopenable. Only an explicit move relocates bytes.
 
 ## Moving data: cordon & drain
 
@@ -166,8 +172,9 @@ three-step, explicitly operator-driven flow:
    ```
 
    Each broker then walks the partitions it leads through the move —
-   close, copy to the target volume, flip the placement record, reclaim
-   the source — one partition every few seconds. The annotation is
+   close, copy to the target volume and fsync the copy, flip the placement
+   record, reclaim the source — one partition every few seconds. The
+   annotation is
    level-triggered and idempotent: partitions already on the target are
    skipped, and you remove the annotation once
    `status.volumeAssignments` shows the move complete. (The underlying
@@ -226,3 +233,8 @@ between volumes. Topic-level files (`.config.json`, the topic-identity
 stamp) are written to every root hosting the topic's partitions, and
 the topic-incarnation check and orphan sweep run per root — a deleted
 topic is reclaimed wherever its partitions were placed.
+
+The data-outranks-record precedence in `partition_dir` is gh #234: a
+restart used to re-derive the assigned volume, find it empty, and bring
+half a topic back as empty logs. gh #231 made the move's copy durable
+before the source is deleted.

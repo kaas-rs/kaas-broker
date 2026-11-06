@@ -357,7 +357,7 @@ the queue path it replaces is exercised end to end by
 
 The transactional counterpart of `OffsetCommit`: stages the consume-side
 offsets of a consume-process-produce cycle so they become visible
-atomically with the transaction — the [KIP-447](../kip/kip-447.md)
+only when the transaction commits — the [KIP-447](../kip/kip-447.md)
 (EOS v2) contract.
 
 **Versions**: v0–v3 (flexible from v3).
@@ -385,15 +385,15 @@ for that partition and isn't staged, as in Apache (gh #320).
   validated. Apache fences zombies at this API with
   `INVALID_PRODUCER_EPOCH` / `ILLEGAL_GENERATION` /
   `UNKNOWN_MEMBER_ID`; kaas keys staging purely on
-  `(group_id, producer_id)`.
+  `(group_id, producer_id)` (tracked as gh #341).
 - **Cross-broker gap**: the `EndTxn` offset hook fires on the *txn*
   coordinator's local offset store. When `hash(transactional.id)` and
   `hash(group.id)` resolve to different brokers, the pending entry
   staged here is never materialised — the group replays from its last
   committed offset, which breaks exactly-once (duplicates, not loss)
   for that group. Single-broker deployments and hash-coinciding cases
-  are complete; cross-broker completion is an open follow-up (tracked
-  as gh #114).
+  are complete; cross-broker completion is an open follow-up (tracked as
+  gh #340).
 
 **Source**: `crates/kaas-broker/src/handlers/txn_offset_commit.rs`
 (handler), `crates/kaas-codec/src/api/txn_offset_commit.rs` (codec),

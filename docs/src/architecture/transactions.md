@@ -31,13 +31,18 @@ at epoch 0. On every Produce, classification runs **under the partition
 mutex, before append** against a per-PID ring of the last 5 batches —
 mirroring the Java client's `max.in.flight.requests.per.connection=5`:
 
-- **duplicate** → echo the cached `baseOffset`, no log write;
+- **duplicate** → echo the cached `baseOffset`, no log write (at
+  `acks=all` it first waits for any flush still outstanding);
 - **out-of-order sequence** → error 45 (`OUT_OF_ORDER_SEQUENCE_NUMBER`);
 - **stale epoch** → error 47 (`INVALID_PRODUCER_EPOCH`);
 - otherwise accept and advance the ring.
 
+Sequences wrap from `i32::MAX` to 0, and a PID with no state accepts any
+sequence, both as in Apache. That second rule matters for a live producer
+whose entry has expired or whose records have been deleted.
+
 The ring survives leadership moves via `producer-state.snapshot`
-(written on segment roll + relinquish, restored on take-over — see
+(written on take-over + relinquish, restored on open — see
 [File-handle ownership](./file-handles.md)).
 
 ### PIDs are never reused
@@ -104,8 +109,8 @@ stateDiagram-v2
     Ongoing --> PrepareCommit : EndTxn(commit)<br/>partitions + groups retained —<br/>the durable dispatch set
     Ongoing --> PrepareAbort : EndTxn(abort)
     Ongoing --> PrepareAbort : timeout reaper, 10 s sweep<br/>ongoingSinceMs + transactionTimeoutMs elapsed<br/>epoch bump, dispatch set retained
-    PrepareCommit --> CompleteCommit : every marker durable<br/>clears partitions + groups,<br/>staged offsets committed
-    PrepareAbort --> CompleteAbort : every marker durable<br/>staged offsets discarded
+    PrepareCommit --> CompleteCommit : every marker durable<br/>clears partitions + groups
+    PrepareAbort --> CompleteAbort : every marker durable<br/>clears partitions + groups
     Ongoing --> PrepareAbort : InitProducerId rejoin<br/>old session fenced at epoch + 1,<br/>answers CONCURRENT_TRANSACTIONS
     CompleteCommit --> Ongoing : AddPartitionsToTxn /<br/>AddOffsetsToTxn<br/>next transaction begins
     CompleteAbort --> Ongoing : AddPartitionsToTxn /<br/>AddOffsetsToTxn
@@ -121,7 +126,7 @@ Facts the diagram compresses:
   write". A marker-dispatch failure, a coordinator crash, or a producer
   retry all re-derive the identical dispatch set from it; only the
   transition to `Complete*` — taken once every marker is durable —
-  clears the lists and releases the staged offsets.
+  clears the lists.
 - `InitProducerId` on a **rejoin** keeps the same PID, bumps
   `epoch += 1` and lands the entry in `Empty`. If the entry is `Ongoing`,
   the rejoin aborts that transaction first: `PrepareAbort` at `epoch + 1`
@@ -141,7 +146,8 @@ Facts the diagram compresses:
 
 Cross-broker marker dispatch goes through a queue on the shared volume —
 there is **no** WriteTxnMarkers RPC between brokers. `EndTxn` is
-**two-phase**: prepare, dispatch every marker, then complete. For a
+**two-phase**: prepare, settle the staged offsets, dispatch every marker,
+then complete. For a
 peer-led partition, a durably written queue entry counts as a
 dispatched marker (the peer's watcher retries until it applies); a
 dispatch failure returns the retriable `COORDINATOR_NOT_AVAILABLE` and
@@ -153,21 +159,28 @@ finishes the job.
 flowchart TD
     producer["Producer: EndTxn(commit)"] --> handler["EndTxn handler on the txn coordinator broker<br/>ownership gate — otherwise NOT_COORDINATOR"]
     handler --> prepare["state store: prepare_end_txn<br/>Ongoing → PrepareCommit<br/>partitions + groups retained — the dispatch set<br/>persist slot-N.json (tmp + fsync + rename)"]
-    prepare --> split{"leader of each<br/>txn partition?"}
+    prepare --> hook["settle offsets: hook per recorded group<br/>commit → commit pending offsets<br/>abort → discard pending offsets"]
+    hook -- "offset write fails" --> retriable
+    hook --> split{"leader of each<br/>txn partition?"}
     split -- "self-led" --> local["write COMMIT control batch directly<br/>append to the log, acks=-1"]
     split -- "peer-led" --> enqueue["marker queue enqueue<br/>marker_queue/to-&lt;broker&gt;/&lt;pid&gt;-&lt;epoch&gt;.json"]
     local --> complete["state store: complete_end_txn<br/>PrepareCommit → CompleteCommit<br/>clears partitions + groups, ongoingSinceMs = 0"]
     enqueue --> complete
-    complete --> hook["offset hook, per recorded group<br/>commit → commit pending offsets<br/>abort → discard pending offsets"]
-    hook --> respond["EndTxn response error_code=0"]
+    complete --> respond["EndTxn response error_code=0"]
     split -- "any dispatch fails" --> retriable["respond COORDINATOR_NOT_AVAILABLE (retriable)<br/>entry stays PrepareCommit — reconcile finishes it"]
     enqueue -.-> watcher["peer broker's marker watcher<br/>polls its own to-&lt;self&gt;/ every 2 s"]
     watcher -.-> apply["applies marker as control-batch append<br/>to partitions it leads, then deletes the file"]
 ```
 
-The offset hook fires on the complete transition — not the prepare —
-so staged offsets only become visible to `OffsetFetch` once the
-markers backing them are durable.
+The offsets settle right after the prepare, before any marker, and that
+step can fail: a commit whose offsets didn't reach the disk stays prepared
+with its groups and answers the retriable error. Settling first means a
+failed offset write costs nothing, where placing markers first would
+re-append a control batch to every partition on every retry. Showing the
+offsets before the markers are durable is safe, because `Prepare*` is the
+decision: the transaction can only finish in that direction. The cost is
+that while the offset write keeps failing, no marker lands, so the
+transaction's partitions keep a pinned last stable offset until it heals.
 
 Self-led markers are written *before* the queue entries, so a
 coordinator crash mid-dispatch never loses the local marker. A retried
@@ -191,9 +204,17 @@ replacement for Apache's `__transaction_state` topic.
 layer keyed by `(group ID, PID)` in the offset store — invisible to
 `OffsetFetch` until `EndTxn` commits. `AddOffsetsToTxn` (key 25)
 records which groups the transaction will touch, so the EndTxn offset
-hook knows exactly which pending sets to commit or discard. That hook
-firing atomically with the state transition is the KIP-447 (EOS v2)
-contract.
+hook knows exactly which pending sets to commit or discard. The hook is
+idempotent, since a retry or the reconcile can run it again.
+
+**One gap on multi-broker clusters.** `TxnOffsetCommit` runs on the group's
+coordinator, but `EndTxn` runs on the transaction's coordinator and fires
+the hook on that broker's own offset store. When the two hash to different
+brokers, the staged offsets are never materialised and the group replays
+from its last committed offset: duplicates, not loss (tracked as gh #340).
+`TxnOffsetCommit` also doesn't check the consumer's generation or the
+producer's epoch (tracked as gh #341). See the
+[TxnOffsetCommit notes](../compat/api/transactions.md#txnoffsetcommit).
 
 ## The timeout reaper and the marker reconcile
 
@@ -205,9 +226,9 @@ keeps its partition and group lists: a timed-out transaction owes
 ABORT markers exactly like a client-driven abort does.
 
 A **marker reconcile** pass shares the same 10 s tick: it walks every
-prepared transaction this broker coordinates, places the outstanding
-markers, and runs the complete transition — which is when the staged
-offsets are discarded (or committed) via the offset hook. The two
+prepared transaction this broker coordinates, settles its staged offsets
+through the offset hook, places the outstanding markers, and runs the
+complete transition. The two
 halves are complementary, not redundant: the EndTxn handler's inline
 dispatch keeps commit latency off the sweep interval, but only the
 reconcile can finish a transaction whose producer crashed, was fenced,
@@ -247,6 +268,11 @@ poll rather than skipping it.
   EndTxn + the marker reconcile: gh #225, shared dispatch in
   `crates/kaas-broker/src/txn_markers.rs` (`reconcile_pending_markers`
   over `TxnStateStore::pending_marker_dispatches`).
+- Settling offsets before markers: gh #318
+  (`TxnStateStore::settle_offsets`). Sequence wrap and no-state acceptance:
+  gh #306. Duplicates waiting for the fsync: gh #321. Store calls stay off
+  the runtime workers through `Broker::txn_store_io` (gh #328). A peer
+  records a fence as applied only after applying it.
 - The reaper and reconcile are spawned by the broker's cluster runtime
   (`bins/kaas/src/cluster.rs`), both gated on `Broker::owns_txn`
   (`abort_overdue_owned` on the store side; the ungated
