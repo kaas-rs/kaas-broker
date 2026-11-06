@@ -178,6 +178,15 @@ struct Operator {
 
 impl Operator {
     fn start(api_port: u16, dir: &Path, identity: &str) -> Self {
+        Self::start_with(api_port, dir, identity, &[])
+    }
+
+    fn start_with(
+        api_port: u16,
+        dir: &Path,
+        identity: &str,
+        extra_env: &[(&str, &std::ffi::OsStr)],
+    ) -> Self {
         let kubeconfig = dir.join("kubeconfig");
         std::fs::write(
             &kubeconfig,
@@ -209,6 +218,7 @@ impl Operator {
                 "HEALTH_PROBE_BIND_ADDRESS",
                 format!("127.0.0.1:{probe_port}"),
             )
+            .envs(extra_env.iter().copied())
             .stdout(out.try_clone().unwrap())
             .stderr(out)
             .spawn()
@@ -409,4 +419,30 @@ async fn a_stuck_reconcile_cant_hold_up_shutdown() {
         Some(""),
         "the lease wasn't released"
     );
+}
+
+/// A control plane on the data volume is refused at boot, before anything talks to
+/// the API server, so a full data volume can't take it down (gh #320).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_control_plane_on_the_data_volume_is_refused_at_boot() {
+    let dir = tempfile::tempdir().unwrap();
+    let api = Arc::new(FakeApi::default());
+    let port = serve(api.clone()).await;
+    let cluster_dir = dir.path().join("data").join("cluster-state");
+    let mut operator = Operator::start_with(
+        port,
+        dir.path(),
+        "op-e",
+        &[("KAAS_CLUSTER_DIR", cluster_dir.as_os_str())],
+    );
+
+    let exited = operator.exit(Duration::from_secs(10)).await;
+
+    assert!(
+        exited.is_some_and(|e| !e.success()),
+        "it should refuse to start, got {exited:?}:\n{}",
+        operator.log()
+    );
+    assert!(api.lease_writes.lock().unwrap().is_empty());
+    assert_eq!(api.crd_requests.load(Ordering::SeqCst), 0);
 }
