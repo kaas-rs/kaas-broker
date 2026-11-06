@@ -338,9 +338,12 @@ cleaner enforces it:
   A topic that sets neither gets the cluster default — seven days,
   as in Apache. `-1` on either knob opts out and retains forever. The
   active segment is never reclaimed, and a partition that can't persist
-  doesn't stop the pass for the others. Retention doesn't consult
-  `cleanup.policy` yet, so a `compact` topic ages out like any other, where
-  Apache exempts it (tracked as gh #339).
+  doesn't stop the pass for the others. Retention only runs when the
+  topic's `cleanup.policy` includes `delete`, as in Apache. kaas has no
+  compactor yet (tracked as gh #158), so a `compact` topic keeps every
+  record and its disk use only grows. A `.config.json` the sweep can't read
+  deletes nothing for that pass, because the topic might be `compact` or
+  `retention.ms=-1`.
 - **Segment rolls** happen at `segment.bytes` (1 GiB) or `segment.ms`
   (seven days), whichever comes first, per topic. The time-based roll
   is not a detail: retention only ever deletes *closed* segments, so a

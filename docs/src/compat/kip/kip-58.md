@@ -36,13 +36,9 @@ says so plainly: the compactor honouring these knobs
 metrics in `crates/kaas-observability/src/metrics.rs`
 (`kaas.compaction.*`) are declared ahead of that work and nothing records
 them today. So the knob round-trips through every admin surface but gates
-nothing — and "never compacted" is no longer the safe reading of an
-infinite lag: the retention cleaner does not consult `cleanup.policy`,
-and the enforced `retention.ms` default of 7 days means a
-`cleanup.policy=compact` topic's closed segments age out like any
-other's unless `retention.ms` is set to `-1`. Until the compactor lands,
-data on compacted topics is subject to delete-style retention (tracked as
-gh #339).
+nothing. A `cleanup.policy=compact` topic keeps every record: retention
+skips it, as in Apache, and nothing compacts it, so its disk use only
+grows until the compactor lands. `compact,delete` runs retention as usual.
 
 The intended enforcement semantics (per-segment `maxTimestamp` inside the
 lag window ⇒ segment skipped) are described with the storage engine in

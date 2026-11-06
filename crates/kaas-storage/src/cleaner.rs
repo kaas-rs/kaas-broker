@@ -129,24 +129,18 @@ impl TopicConfigPolicySource {
 }
 
 impl TopicConfigPolicySource {
-    /// Read `(topic, partition)`'s `.config.json`, or `None` when it is
-    /// absent or unreadable. An unreadable file is treated as absent on
-    /// purpose: the fallback is the engine default, and defaulting is
-    /// the safe direction for every knob here.
-    fn read(&self, topic: &str, partition: i32) -> Option<crate::topicconfig::TopicConfigFile> {
+    /// Read `(topic, partition)`'s `.config.json`: `Ok(None)` when it is
+    /// absent, `Err` when it is there and can't be read. Each caller
+    /// decides what an unreadable file means, because the safe answer
+    /// differs: a default for the segment tuning, but no deletion for
+    /// retention.
+    fn read(
+        &self,
+        topic: &str,
+        partition: i32,
+    ) -> std::io::Result<Option<crate::topicconfig::TopicConfigFile>> {
         let dir = self.engine.topic_dir(topic, partition);
-        match crate::topicconfig::read_topic_config(self.engine.fs(), &dir) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(
-                    topic,
-                    partition,
-                    error = %e,
-                    "unreadable .config.json; using default topic config"
-                );
-                None
-            }
-        }
+        crate::topicconfig::read_topic_config(self.engine.fs(), &dir)
     }
 
     /// The topic's partition tuning — `segment.bytes` and
@@ -164,17 +158,46 @@ impl TopicConfigPolicySource {
         base: &crate::partition::PartitionConfig,
     ) -> crate::partition::PartitionConfig {
         match self.read(topic, partition) {
-            Some(cfg) => crate::topicconfig::apply_to_partition_config(&cfg, base),
-            None => base.clone(),
+            Ok(Some(cfg)) => crate::topicconfig::apply_to_partition_config(&cfg, base),
+            Ok(None) => base.clone(),
+            Err(e) => {
+                tracing::warn!(
+                    topic,
+                    partition,
+                    error = %e,
+                    "unreadable .config.json; using default segment tuning"
+                );
+                base.clone()
+            }
         }
     }
 }
 
 impl PolicySource for TopicConfigPolicySource {
+    /// Apache only runs time and size retention when the topic's
+    /// `cleanup.policy` includes `delete` (`UnifiedLog.deleteOldSegments`),
+    /// so anything else is unlimited here (gh #339).
+    ///
+    /// An unreadable file deletes nothing this pass. The default would be
+    /// the 7-day one, and the topic may be `compact` or `retention.ms=-1`:
+    /// a transient read error must not cost it its data.
     fn policy_for(&self, topic: &str, partition: i32) -> RetentionPolicy {
-        let Some(cfg) = self.read(topic, partition) else {
-            return self.defaults;
+        let cfg = match self.read(topic, partition) {
+            Ok(Some(cfg)) => cfg,
+            Ok(None) => return self.defaults,
+            Err(e) => {
+                tracing::warn!(
+                    topic,
+                    partition,
+                    error = %e,
+                    "unreadable .config.json; skipping retention for this pass"
+                );
+                return RetentionPolicy::default();
+            }
         };
+        if !cfg.allows_delete() {
+            return RetentionPolicy::default();
+        }
         RetentionPolicy {
             retention_bytes: cfg
                 .retention_bytes
@@ -1115,6 +1138,71 @@ mod tests {
             );
             e.relinquish_all().await.unwrap();
         });
+    }
+
+    /// Five closed one-batch segments, one sweep far in the future with the
+    /// 7-day default in force, and how far log start moved. `config` is what
+    /// the topic's `.config.json` holds; `None` leaves the file absent.
+    fn log_start_after_a_sweep(config: Option<&str>) -> i64 {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let one_len = u64::try_from(build_batch(1, 1_000).len()).unwrap();
+            let e = engine_at(tmp.path().to_path_buf(), one_len);
+            seed_segments(&e, 5, 1_000_000).await;
+            if let Some(config) = config {
+                let path = e
+                    .topic_dir("t", 0)
+                    .join(crate::topicconfig::TOPIC_CONFIG_FILENAME);
+                std::fs::write(path, config).unwrap();
+            }
+            let src = Arc::new(TopicConfigPolicySource::new(
+                e.clone(),
+                time_only(604_800_000),
+            ));
+            let cleaner = RetentionCleaner::with_policy_source(e.clone(), src)
+                .with_clock(Arc::new(|| i64::MAX / 2));
+            cleaner.run_once().await.unwrap();
+            let log_start = e.log_start_offset("t", 0).unwrap();
+            e.relinquish_all().await.unwrap();
+            log_start
+        })
+    }
+
+    #[test]
+    fn retention_leaves_a_compact_topic_alone() {
+        // gh #339. There's no compactor yet, so a reaped record on a `compact`
+        // topic is simply gone, and a Streams changelog restores short.
+        assert_eq!(
+            log_start_after_a_sweep(Some(r#"{"cleanupPolicy":"compact"}"#)),
+            0
+        );
+        // An explicit retention.ms changes nothing: Apache ignores it too.
+        assert_eq!(
+            log_start_after_a_sweep(Some(r#"{"cleanupPolicy":"compact","retentionMs":1000}"#)),
+            0
+        );
+    }
+
+    #[test]
+    fn retention_runs_when_the_policy_includes_delete() {
+        for config in [
+            r#"{"cleanupPolicy":"delete"}"#,
+            r#"{"cleanupPolicy":"compact,delete"}"#,
+            r#"{"cleanupPolicy":"delete,compact"}"#,
+            r#"{"cleanupPolicy":"compact, delete"}"#,
+            // Absent from the file is the default policy, `delete`.
+            r#"{"retentionMs":1000}"#,
+        ] {
+            assert!(log_start_after_a_sweep(Some(config)) > 0, "{config}");
+        }
+        assert!(log_start_after_a_sweep(None) > 0, "no file is the default");
+    }
+
+    #[test]
+    fn an_unreadable_config_deletes_nothing() {
+        // The topic could be `compact` or `retention.ms=-1`. Falling back to
+        // the 7-day default on a read error would delete what it asked to keep.
+        assert_eq!(log_start_after_a_sweep(Some("{ not json")), 0);
     }
 
     #[test]

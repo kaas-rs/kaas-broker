@@ -64,6 +64,16 @@ pub struct TopicConfigFile {
     pub flush_messages: Option<i64>,
 }
 
+impl TopicConfigFile {
+    /// Whether `cleanup.policy` includes `delete`, which is what permits
+    /// time and size retention and `DeleteRecords`. Apache's
+    /// `LogConfig.delete`. An unset policy is the default, `delete`.
+    pub fn allows_delete(&self) -> bool {
+        self.cleanup_policy.is_empty()
+            || self.cleanup_policy.split(',').any(|p| p.trim() == "delete")
+    }
+}
+
 /// Kafka's "unlimited / never" sentinel is `-1`; `0` reaches us as an
 /// unset field far more often than as a deliberate "immediately", so
 /// both map to `None`.

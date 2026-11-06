@@ -110,15 +110,11 @@ impl Handler for DeleteRecordsHandler {
                         continue;
                     }
                 }
-                // An unset policy is the default, `delete`.
                 let compact_only = self
                     .broker
                     .engine
                     .topic_config(&topic.name)
-                    .is_some_and(|c| {
-                        !c.cleanup_policy.is_empty()
-                            && !c.cleanup_policy.split(',').any(|p| p.trim() == "delete")
-                    });
+                    .is_some_and(|c| !c.allows_delete());
                 if compact_only {
                     pr.error_code = ERR_POLICY_VIOLATION;
                     partitions.push(pr);

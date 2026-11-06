@@ -53,7 +53,7 @@ append.
 | `retentionBytes` | `retention.bytes` | Per-partition cap; oldest closed segments are deleted first. `-1`/`0` = unlimited. |
 | `segmentBytes` | `segment.bytes` | Roll size for log segments. |
 | `segmentMs` | `segment.ms` | Time-based roll, 7-day default. This is what makes `retentionMs` effective on low-volume topics — retention only ever deletes *closed* segments. |
-| `cleanupPolicy` | `cleanup.policy` | `delete`, `compact`, or `compact,delete`. **Honesty note:** the compactor is not implemented yet — `compact` is stored and advertised but nothing compacts. |
+| `cleanupPolicy` | `cleanup.policy` | `delete`, `compact`, or `compact,delete`. **Honesty note:** the compactor is not implemented yet (gh #158). Retention skips a `compact` topic, as in Apache, and nothing compacts it, so it keeps every record and its disk use only grows. Size the volume for that, or use `compact,delete`, which runs retention as usual. |
 | `minCompactionLagMs` | `min.compaction.lag.ms` | Stored/advertised only, pending the compactor. |
 | `deleteRetentionMs` | `delete.retention.ms` | Stored/advertised only, pending the compactor. |
 | `flushMessages` | `flush.messages` | Per-topic fsync interval, overriding the broker-wide setting. `1` = fsync every batch (honest `acks=all`), `0` = flush only at segment roll. The durability/throughput dial discussed in [Performance](../performance.md). |
