@@ -1041,7 +1041,7 @@ impl Partition {
         } else {
             None
         };
-        let (assigned_base, my_flush_seq, triggered_flush) = {
+        let (assigned_base, my_flush_seq, triggered_flush, duplicate_unflushed) = 'locked: {
             let mut guard = self.inner.lock();
 
             // Early-fail if the partition is in a sticky stall.
@@ -1075,7 +1075,18 @@ impl Partition {
             let mut accepted = false;
             if let Some(info) = prod_info {
                 match idempotence::classify(&guard.producer_states, info) {
-                    Outcome::Duplicate { base_offset } => return Ok(base_offset),
+                    Outcome::Duplicate { base_offset } => {
+                        // The original may still be waiting on its fsync: a
+                        // client that lost the connection retries while it's in
+                        // flight. So this waits like the original, or an acked
+                        // batch could be lost in a crash (gh #321, Apache's
+                        // purgatory waits for a duplicate too). Only while a
+                        // flush is outstanding: waiting on a seq the re-arm has
+                        // already passed would answer Stalled for ever.
+                        let requested = guard.requested_flush_seq;
+                        let unflushed = requested > guard.completed_flush_seq;
+                        break 'locked (base_offset, requested, false, unflushed);
+                    }
                     Outcome::OutOfOrder => return Err(StorageError::OutOfOrderSequence),
                     Outcome::InvalidEpoch => return Err(StorageError::InvalidProducerEpoch),
                     Outcome::Accept => accepted = true,
@@ -1222,7 +1233,7 @@ impl Partition {
             // Republish the read snapshot.
             self.snapshot.store(Arc::new(snapshot_of(&guard)));
 
-            (assigned, my_seq, trigger)
+            (assigned, my_seq, trigger, false)
         };
 
         if triggered_flush {
@@ -1246,7 +1257,7 @@ impl Partition {
         // whole pipeline for the full fsync window each cycle — worth
         // −26% Strimzi-relative throughput vs the v0.1 flavor at
         // interval 10000 on NFS (phase 9 A.3 gate, gh #188).
-        if acks == -1 && triggered_flush {
+        if acks == -1 && (triggered_flush || duplicate_unflushed) {
             self.await_flush(my_flush_seq).await?;
         }
 
@@ -4223,6 +4234,96 @@ pub(crate) mod tests {
             *journal.fail_create_suffix.lock() = None;
             assert_eq!(p.append(0, -1, build_batch(1, 1_000)).await.unwrap(), 1);
             assert_eq!(p.high_watermark(), 2);
+            p.close().await.unwrap();
+        });
+    }
+
+    /// gh #321: a retry of a batch whose fsync hasn't run yet is a duplicate,
+    /// and it waits for that flush at `acks=all` rather than acking data a crash
+    /// could still lose. It writes nothing, and `acks=1` doesn't wait.
+    #[test]
+    fn an_acks_all_duplicate_waits_for_the_outstanding_flush() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Arc::new(
+                Partition::open(
+                    fs,
+                    "t".into(),
+                    0,
+                    tmp.path().to_path_buf(),
+                    PartitionConfig::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            let batch = build_txn_data_batch(42, 1);
+            assert_eq!(p.append(0, -1, batch.clone()).await.unwrap(), 0);
+
+            // A flush the committer hasn't finished, as for an original that's
+            // parked on it. Nothing is queued, so only the test completes it.
+            let outstanding = {
+                let mut guard = p.inner.lock();
+                guard.requested_flush_seq += 1;
+                guard.requested_flush_seq
+            };
+            assert_eq!(p.append(0, 1, batch.clone()).await.unwrap(), 0);
+
+            let parked = p.clone();
+            let retry = batch.clone();
+            let dup = tokio::spawn(async move { parked.append(0, -1, retry).await });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(!dup.is_finished(), "acked before the original's fsync");
+
+            p.inner.lock().completed_flush_seq = outstanding;
+            p.flush.cond.notify_waiters();
+            assert_eq!(dup.await.unwrap().unwrap(), 0);
+            assert_eq!(p.high_watermark(), 1, "a duplicate writes nothing");
+            p.close().await.unwrap();
+        });
+    }
+
+    /// gh #321: if the flush a duplicate waits on fails, it gets `Stalled`. Once
+    /// the partition has re-armed nothing is outstanding, so it answers rather
+    /// than waiting on a seq that will never complete. Whether that answer is
+    /// right is gh #330: the bytes' fsync failed.
+    #[test]
+    fn a_duplicate_is_stalled_by_a_failed_flush_and_isnt_wedged_by_the_rearm() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Arc::new(
+                Partition::open(
+                    fs,
+                    "t".into(),
+                    0,
+                    tmp.path().to_path_buf(),
+                    PartitionConfig::default(),
+                )
+                .await
+                .unwrap(),
+            );
+            let batch = build_txn_data_batch(42, 1);
+            p.append(0, -1, batch.clone()).await.unwrap();
+            p.inner.lock().requested_flush_seq += 1;
+
+            let parked = p.clone();
+            let retry = batch.clone();
+            let dup = tokio::spawn(async move { parked.append(0, -1, retry).await });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            p.inner.lock().mark_flush_failed(StorageError::Stalled);
+            p.flush.cond.notify_waiters();
+            assert!(matches!(dup.await.unwrap(), Err(StorageError::Stalled)));
+
+            // What the re-arm leaves behind.
+            {
+                let mut guard = p.inner.lock();
+                guard.flush_err = None;
+                guard.completed_flush_seq = guard.requested_flush_seq;
+            }
+            let answered =
+                tokio::time::timeout(Duration::from_secs(5), p.append(0, -1, batch.clone())).await;
+            assert!(matches!(answered, Ok(Ok(0))), "{answered:?}");
             p.close().await.unwrap();
         });
     }

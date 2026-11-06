@@ -60,7 +60,9 @@ checks while the append path still read its header.
 Inside the engine, under the partition mutex: idempotent-producer
 classification runs first — a duplicate (PID/epoch/sequence already in the
 5-batch ring window) echoes the cached base offset with `error_code = 0` and
-never touches the log; out-of-order sequences get `OUT_OF_ORDER_SEQUENCE_NUMBER`
+never touches the log. At `acks=all` it first waits for any flush still
+outstanding, so a retry isn't acked before its original's fsync (gh #321).
+Out-of-order sequences get `OUT_OF_ORDER_SEQUENCE_NUMBER`
 (45); a stale producer epoch gets `INVALID_PRODUCER_EPOCH` (47). Accepted
 batches have their base offset rewritten in place to the current high
 watermark (the v2 CRC covers byte 21 onward, so the 8-byte overwrite is
