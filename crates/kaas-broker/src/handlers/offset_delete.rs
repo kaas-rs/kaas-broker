@@ -13,7 +13,7 @@
 //! `Read` on each topic. A denied topic's partitions answer
 //! `TOPIC_AUTHORIZATION_FAILED` (29) and keep their offsets.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -27,6 +27,7 @@ use parking_lot::Mutex;
 use super::principal_from;
 use crate::broker::Broker;
 
+const ERR_COORDINATOR_NOT_AVAILABLE: i16 = 15;
 const ERR_NOT_COORDINATOR: i16 = 16;
 const ERR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 const ERR_TOPIC_AUTHZ_FAILED: i16 = 29;
@@ -91,7 +92,13 @@ impl Handler for OffsetDeleteHandler {
                     .map(move |&p| build_offset_key(&t.name, p))
             })
             .collect();
-        let (group_error, removed) = mgr.delete_offsets(&req.group_id, &keys);
+        // Rewrites the group's file, behind its write lock (gh #328).
+        let group_id = req.group_id.clone();
+        let (group_error, removed) = self
+            .broker
+            .coordinator_io(move || mgr.delete_offsets(&group_id, &keys))
+            .await
+            .unwrap_or((ERR_COORDINATOR_NOT_AVAILABLE, HashMap::new()));
 
         let topics_resp: Vec<offset_delete::OffsetDeleteTopicResponse> = req
             .topics

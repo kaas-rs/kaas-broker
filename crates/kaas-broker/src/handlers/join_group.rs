@@ -85,6 +85,12 @@ impl Handler for JoinGroupHandler {
                     client_id,
                     client_host: conn.lock().peer_addr.to_string(),
                 };
+                // The first join since a restart reads the group's file, behind
+                // its write lock (gh #328). The join itself finds the group ready.
+                let (m, group_id) = (mgr.clone(), req.group_id.clone());
+                self.broker
+                    .coordinator_io(move || m.ensure_group(&group_id))
+                    .await;
                 let out = mgr.join_group(&req.group_id, cr).await;
                 join_group::Response {
                     throttle_time_ms: 0,

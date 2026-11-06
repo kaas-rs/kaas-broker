@@ -58,105 +58,117 @@ impl Handler for OffsetFetchHandler {
     ) -> Result<BytesMut, HandlerError> {
         let mut body = body;
         let req = offset_fetch::decode_request(&mut body, version)?;
-        let mgr = self.broker.coord_manager();
         let principal = principal_from(conn);
-        let may_describe_topic = |topic: &str| self.allowed(&principal, Resource::topic(topic));
-        let may_list_topic = |topic: &str| self.listed(&principal, Resource::topic(topic));
-
-        let resp = if version >= 8 {
-            let mut groups_resp =
-                Vec::<offset_fetch::OffsetFetchGroupResponse>::with_capacity(req.groups.len());
-            for g in &req.groups {
-                if !self.allowed(&principal, Resource::group(&g.group_id)) {
-                    groups_resp.push(offset_fetch::OffsetFetchGroupResponse {
-                        group_id: g.group_id.clone(),
-                        topics: Vec::new(),
-                        error_code: ERR_GROUP_AUTHZ_FAILED,
-                    });
-                    continue;
-                }
-                let (topics_resp, group_err) = fetch_group(
-                    mgr.as_ref(),
-                    &g.group_id,
-                    g.topics.as_deref(),
-                    &may_describe_topic,
-                    &may_list_topic,
-                );
-                groups_resp.push(offset_fetch::OffsetFetchGroupResponse {
-                    group_id: g.group_id.clone(),
-                    topics: topics_resp,
-                    error_code: group_err,
-                });
-            }
-            offset_fetch::Response {
-                throttle_time_ms: 0,
-                topics: Vec::new(),
-                error_code: 0,
-                groups: groups_resp,
-            }
-        } else if !self.allowed(&principal, Resource::group(&req.group_id)) {
-            // v1 has no top-level error field; Apache stamps the code
-            // on every requested partition instead.
-            let topics = if version < 2 {
-                req.topics
-                    .iter()
-                    .flatten()
-                    .map(|t| error_topic(t, ERR_GROUP_AUTHZ_FAILED))
-                    .collect()
-            } else {
-                Vec::new()
-            };
-            offset_fetch::Response {
-                throttle_time_ms: 0,
-                topics,
-                error_code: ERR_GROUP_AUTHZ_FAILED,
-                groups: Vec::new(),
-            }
-        } else {
-            let (mut topics_resp, group_err) = fetch_group(
-                mgr.as_ref(),
-                &req.group_id,
-                req.topics.as_deref(),
-                &may_describe_topic,
-                &may_list_topic,
-            );
-            // v1 has no top-level error field, so a group-level error goes on
-            // every partition (gh #326), as the ACL branch above does. Without
-            // it a client reads -1 with error 0: nothing committed.
-            if version < 2 && group_err != 0 {
-                topics_resp = req
-                    .topics
-                    .iter()
-                    .flatten()
-                    .map(|t| error_topic(t, group_err))
-                    .collect();
-            }
-            offset_fetch::Response {
-                throttle_time_ms: 0,
-                topics: topics_resp,
-                error_code: group_err,
-                groups: Vec::new(),
-            }
-        };
+        // A cold group reads its file behind the group's write lock, which a
+        // committer holds across an fsync (gh #328).
+        let broker = self.broker.clone();
+        let resp = self
+            .broker
+            .coordinator_io(move || respond(&broker, &principal, &req, version))
+            .await
+            .ok_or_else(|| HandlerError::Other("OffsetFetch task panicked".into()))?;
         let mut out = BytesMut::new();
         offset_fetch::encode_response(&mut out, &resp, version)?;
         Ok(out)
     }
 }
 
-impl OffsetFetchHandler {
-    fn allowed(&self, principal: &Principal, resource: Resource) -> bool {
-        self.broker
+/// The whole answer, off the workers. It reads group files.
+fn respond(
+    broker: &Broker,
+    principal: &Principal,
+    req: &offset_fetch::Request,
+    version: i16,
+) -> offset_fetch::Response {
+    let mgr = broker.coord_manager();
+    let allowed = |resource: Resource| {
+        broker
             .authorizer
             .authorize(principal, &resource, Operation::Describe)
-    }
-
-    /// [`Self::allowed`] for the all-topics form, which only filters, so
-    /// a topic left out is not a reported denial.
-    fn listed(&self, principal: &Principal, resource: Resource) -> bool {
-        self.broker
+    };
+    let may_describe_topic = |topic: &str| allowed(Resource::topic(topic));
+    // The all-topics form only filters, so a topic left out is not a
+    // reported denial.
+    let may_list_topic = |topic: &str| {
+        broker
             .authorizer
-            .authorize_quietly(principal, &resource, Operation::Describe)
+            .authorize_quietly(principal, &Resource::topic(topic), Operation::Describe)
+    };
+
+    if version >= 8 {
+        let mut groups_resp =
+            Vec::<offset_fetch::OffsetFetchGroupResponse>::with_capacity(req.groups.len());
+        for g in &req.groups {
+            if !allowed(Resource::group(&g.group_id)) {
+                groups_resp.push(offset_fetch::OffsetFetchGroupResponse {
+                    group_id: g.group_id.clone(),
+                    topics: Vec::new(),
+                    error_code: ERR_GROUP_AUTHZ_FAILED,
+                });
+                continue;
+            }
+            let (topics_resp, group_err) = fetch_group(
+                mgr.as_ref(),
+                &g.group_id,
+                g.topics.as_deref(),
+                &may_describe_topic,
+                &may_list_topic,
+            );
+            groups_resp.push(offset_fetch::OffsetFetchGroupResponse {
+                group_id: g.group_id.clone(),
+                topics: topics_resp,
+                error_code: group_err,
+            });
+        }
+        offset_fetch::Response {
+            throttle_time_ms: 0,
+            topics: Vec::new(),
+            error_code: 0,
+            groups: groups_resp,
+        }
+    } else if !allowed(Resource::group(&req.group_id)) {
+        // v1 has no top-level error field; Apache stamps the code
+        // on every requested partition instead.
+        let topics = if version < 2 {
+            req.topics
+                .iter()
+                .flatten()
+                .map(|t| error_topic(t, ERR_GROUP_AUTHZ_FAILED))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        offset_fetch::Response {
+            throttle_time_ms: 0,
+            topics,
+            error_code: ERR_GROUP_AUTHZ_FAILED,
+            groups: Vec::new(),
+        }
+    } else {
+        let (mut topics_resp, group_err) = fetch_group(
+            mgr.as_ref(),
+            &req.group_id,
+            req.topics.as_deref(),
+            &may_describe_topic,
+            &may_list_topic,
+        );
+        // v1 has no top-level error field, so a group-level error goes on
+        // every partition (gh #326), as the ACL branch above does. Without
+        // it a client reads -1 with error 0: nothing committed.
+        if version < 2 && group_err != 0 {
+            topics_resp = req
+                .topics
+                .iter()
+                .flatten()
+                .map(|t| error_topic(t, group_err))
+                .collect();
+        }
+        offset_fetch::Response {
+            throttle_time_ms: 0,
+            topics: topics_resp,
+            error_code: group_err,
+            groups: Vec::new(),
+        }
     }
 }
 

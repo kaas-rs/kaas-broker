@@ -180,9 +180,15 @@ impl InitProducerIdHandler {
             }
         };
         let broker_for_alloc = self.broker.clone();
-        let outcome = store.init_producer_id(txn_id, timeout_ms, expected, move || {
-            broker_for_alloc.next_producer_id()
-        });
+        let id = txn_id.to_owned();
+        let outcome = self
+            .broker
+            .txn_store_io(&store, move |s| {
+                s.init_producer_id(&id, timeout_ms, expected, move || {
+                    broker_for_alloc.next_producer_id()
+                })
+            })
+            .await;
         match outcome {
             Ok(InitPidOutcome::Ready { pid, epoch }) => {
                 // `epoch == 0` covers two cases — first-ever alloc, and
@@ -190,7 +196,7 @@ impl InitProducerIdHandler {
                 // needs fencing (no earlier (pid, epoch) state exists,
                 // or the PID itself has changed).
                 if epoch > 0 {
-                    self.fence(pid, epoch);
+                    self.fence(pid, epoch).await;
                 }
                 init_producer_id::Response {
                     throttle_time_ms: 0,
@@ -208,21 +214,28 @@ impl InitProducerIdHandler {
     }
 
     /// gh #30: fence locally + broadcast to peers via the outbound
-    /// FenceLog so their FenceWatcher applies it within ~2s.
-    fn fence(&self, pid: i64, epoch: i16) {
-        self.broker.engine.fence_producer_epoch(pid, epoch);
-        if let Some(log) = self.broker.fence_log() {
-            if let Err(err) = log.append(pid, epoch) {
-                tracing::warn!(
-                    pid,
-                    epoch,
-                    %err,
-                    "InitProducerId: outbound FenceLog append failed; \
-                     peer brokers will not see this epoch bump until \
-                     a future bump succeeds (zombie window on cross-broker partitions)",
-                );
-            }
-        }
+    /// FenceLog so their FenceWatcher applies it within ~2s. Off the workers
+    /// (gh #328): it takes every open partition's mutex, which a committer
+    /// holds across an fsync, then writes the log.
+    async fn fence(&self, pid: i64, epoch: i16) {
+        let broker = self.broker.clone();
+        self.broker
+            .coordinator_io(move || {
+                broker.engine.fence_producer_epoch(pid, epoch);
+                if let Some(log) = broker.fence_log() {
+                    if let Err(err) = log.append(pid, epoch) {
+                        tracing::warn!(
+                            pid,
+                            epoch,
+                            %err,
+                            "InitProducerId: outbound FenceLog append failed; \
+                             peer brokers will not see this epoch bump until \
+                             a future bump succeeds (zombie window on cross-broker partitions)",
+                        );
+                    }
+                }
+            })
+            .await;
     }
 
     /// Finish the abort a rejoin started on an `Ongoing` transaction
@@ -236,8 +249,8 @@ impl InitProducerIdHandler {
     /// intact, so a failure here is left to the marker reconcile, and
     /// the producer's retry reads `CONCURRENT_TRANSACTIONS` until it
     /// lands.
-    async fn abort_fenced_txn(&self, store: &TxnStateStore, abort: PendingMarkerDispatch) {
-        self.fence(abort.pid, abort.epoch);
+    async fn abort_fenced_txn(&self, store: &Arc<TxnStateStore>, abort: PendingMarkerDispatch) {
+        self.fence(abort.pid, abort.epoch).await;
         let dispatched = crate::txn_markers::dispatch_markers(
             &self.broker,
             &abort.txn_id,
@@ -257,7 +270,12 @@ impl InitProducerIdHandler {
             );
             return;
         }
-        if let Err(err) = store.complete_end_txn(&abort.txn_id, abort.pid, abort.epoch, false) {
+        let (id, pid, epoch) = (abort.txn_id.clone(), abort.pid, abort.epoch);
+        let completed = self
+            .broker
+            .txn_store_io(store, move |s| s.complete_end_txn(&id, pid, epoch, false))
+            .await;
+        if let Err(err) = completed {
             tracing::warn!(
                 txn_id = %abort.txn_id,
                 %err,

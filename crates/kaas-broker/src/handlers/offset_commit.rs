@@ -110,16 +110,13 @@ impl Handler for OffsetCommitHandler {
             match self.broker.coord_manager() {
                 None => ERR_NOT_COORDINATOR,
                 // An fsync, behind the group's write lock when others are
-                // committing. On a scheduler worker that parks the runtime, so
-                // one busy group would slow every connection (gh #318, as
-                // gh #209 for reads).
+                // committing (gh #318).
                 Some(mgr) => {
                     let group_id = req.group_id.clone();
-                    tokio::task::spawn_blocking(move || {
-                        mgr.offset_commit(&group_id, offsets, metadata)
-                    })
-                    .await
-                    .unwrap_or(ERR_COORDINATOR_NOT_AVAILABLE)
+                    self.broker
+                        .coordinator_io(move || mgr.offset_commit(&group_id, offsets, metadata))
+                        .await
+                        .unwrap_or(ERR_COORDINATOR_NOT_AVAILABLE)
                 }
             }
         };

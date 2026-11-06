@@ -16,9 +16,10 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 
 use kaas_auth::{AllowAllAuthorizer, Authorizer, NoQuotaChecker, QuotaChecker, QuotaEnforcer};
-use kaas_coordinator::{FenceLog, Manager, MarkerQueue, TxnStateStore};
+use kaas_coordinator::{FenceLog, Manager, MarkerQueue, TxnStateError, TxnStateStore};
 use kaas_storage::StorageEngine;
 use parking_lot::RwLock;
+use tokio::sync::Semaphore;
 
 use crate::coordinator::Coordinator;
 use crate::local_lease::LocalLeaseManager;
@@ -141,7 +142,16 @@ pub struct Broker {
     /// stands in — nothing on disk survives to collide with.
     producer_ids: RwLock<Option<Arc<crate::producer_id::ProducerIdAllocator>>>,
     producer_id_counter: AtomicI64,
+    /// Bounds [`Self::coordinator_io`] to [`COORDINATOR_IO_THREADS`].
+    coordinator_io: Arc<Semaphore>,
 }
+
+/// How many coordinator file operations can hold a blocking-pool thread at
+/// once (gh #328). Half of tokio's default 512: these threads mostly wait on
+/// a stripe of the offset store or on the txn store's mutex, and the storage
+/// committers' fsyncs need the rest of the pool. Callers past the limit wait
+/// without holding a thread.
+pub const COORDINATOR_IO_THREADS: usize = 256;
 
 impl std::fmt::Debug for Broker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -211,7 +221,53 @@ impl Broker {
             // Start at 1 so 0 stays available as an "unset" sentinel
             // for clients that read uninitialised pid.
             producer_id_counter: AtomicI64::new(1),
+            coordinator_io: Arc::new(Semaphore::new(COORDINATOR_IO_THREADS)),
         }
+    }
+
+    /// Run coordinator file work off the scheduler workers (gh #328).
+    ///
+    /// The offset store and the txn store do their file I/O synchronously,
+    /// behind locks the next caller waits on across someone else's fsync. On
+    /// a worker that wait parks every connection the worker drives, so one
+    /// busy group slowed ApiVersions from about 0.5 ms to over 300 ms.
+    ///
+    /// `f` runs to completion even if the request goes away, as it did when
+    /// it ran inline. `None` means it panicked, which a caller should answer
+    /// with a retriable error.
+    pub async fn coordinator_io<T, F>(&self, f: F) -> Option<T>
+    where
+        T: Send + 'static,
+        F: FnOnce() -> T + Send + 'static,
+    {
+        let permit = self.coordinator_io.clone().acquire_owned().await.ok()?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f()
+        })
+        .await
+        .ok()
+    }
+
+    /// [`Self::coordinator_io`] for a call on the txn store. A panic reads as
+    /// an I/O failure, which every txn handler answers retriably.
+    pub async fn txn_store_io<T, F>(
+        &self,
+        store: &Arc<TxnStateStore>,
+        f: F,
+    ) -> Result<T, TxnStateError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&TxnStateStore) -> Result<T, TxnStateError> + Send + 'static,
+    {
+        let store = store.clone();
+        self.coordinator_io(move || f(&store))
+            .await
+            .unwrap_or_else(|| {
+                Err(TxnStateError::Io(std::io::Error::other(
+                    "txn store task panicked",
+                )))
+            })
     }
 
     /// Install the live broker catalog (cluster mode). Metadata then
@@ -424,7 +480,13 @@ impl Broker {
         // for the brief window before the cluster runtime installs it —
         // no coordinated groups exist then either.
         if let Some(mgr) = self.coord_manager() {
-            let (purged, failed) = mgr.purge_topic_offsets(topic);
+            // Walks every group file on the volume, so not on a worker. Awaited,
+            // so a recreate on the same watch stream comes after it.
+            let name = topic.to_owned();
+            let (purged, failed) = self
+                .coordinator_io(move || mgr.purge_topic_offsets(&name))
+                .await
+                .unwrap_or_default();
             if purged > 0 {
                 tracing::info!(
                     topic,
@@ -495,5 +557,85 @@ mod tests {
         assert!(!tt.tracks(gone), "the deleted topic's series must go");
         assert!(tt.tracks(kept), "only the deleted topic's");
         assert_eq!(tt.produce_records(gone), 0);
+    }
+
+    /// gh #328, from the code rather than measured: commits queued on one group
+    /// held blocking threads, shared with the storage committers, so enough of
+    /// them would delay fsyncs. With one thread spare past the limit, a plain
+    /// blocking task must still run while twice the limit is queued.
+    #[test]
+    fn coordinator_io_leaves_the_blocking_pool_room_for_storage() {
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(COORDINATOR_IO_THREADS + 1)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let b = Arc::new(Broker::new(
+                Arc::new(kaas_storage::MemoryStorage::new()),
+                Arc::new(TopicRegistry::new()),
+                "test",
+                0,
+            ));
+            let (release, released) = tokio::sync::watch::channel(false);
+            let running = Arc::new(AtomicUsize::new(0));
+            let queued: Vec<_> = (0..COORDINATOR_IO_THREADS * 2)
+                .map(|_| {
+                    let (b, running) = (b.clone(), running.clone());
+                    let mut released = released.clone();
+                    tokio::spawn(async move {
+                        b.coordinator_io(move || {
+                            running.fetch_add(1, Ordering::SeqCst);
+                            let _ = tokio::runtime::Handle::current()
+                                .block_on(released.wait_for(|r| *r));
+                        })
+                        .await
+                    })
+                })
+                .collect();
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while running.load(Ordering::SeqCst) < COORDINATOR_IO_THREADS {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the limit's worth of work should be running");
+
+            tokio::time::timeout(Duration::from_secs(10), tokio::task::spawn_blocking(|| ()))
+                .await
+                .expect("storage's blocking work must still get a thread")
+                .unwrap();
+            assert_eq!(running.load(Ordering::SeqCst), COORDINATOR_IO_THREADS);
+
+            release.send(true).unwrap();
+            for task in queued {
+                assert!(task.await.unwrap().is_some());
+            }
+            assert_eq!(running.load(Ordering::SeqCst), COORDINATOR_IO_THREADS * 2);
+        });
+    }
+
+    /// A panic answers retriably, and doesn't cost a thread for good.
+    #[tokio::test]
+    #[allow(clippy::panic)]
+    async fn a_panic_in_coordinator_io_gives_its_thread_back() {
+        let tmp = tempfile::tempdir().unwrap();
+        let b = Broker::new(
+            Arc::new(kaas_storage::MemoryStorage::new()),
+            Arc::new(TopicRegistry::new()),
+            "test",
+            0,
+        );
+        assert_eq!(b.coordinator_io(|| -> i32 { panic!("boom") }).await, None);
+        let store = Arc::new(TxnStateStore::open(tmp.path(), 0).unwrap());
+        let answer = b
+            .txn_store_io(&store, |_| -> Result<(), TxnStateError> { panic!("boom") })
+            .await;
+        assert!(matches!(answer, Err(TxnStateError::Io(_))), "{answer:?}");
+        assert_eq!(b.coordinator_io.available_permits(), COORDINATOR_IO_THREADS);
     }
 }

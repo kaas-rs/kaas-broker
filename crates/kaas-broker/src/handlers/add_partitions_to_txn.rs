@@ -59,7 +59,7 @@ impl Handler for AddPartitionsToTxnHandler {
                 Some(resp) => resp,
                 None => {
                     let code = match self.broker.txn_state() {
-                        Some(store) => self.commit(&store, &req),
+                        Some(store) => self.commit(&store, &req).await,
                         // classify already verified Some(_); this arm only
                         // fires under a concurrent uninstall (no current path).
                         None => ERR_COORDINATOR_NOT_AVAILABLE,
@@ -178,7 +178,11 @@ impl AddPartitionsToTxnHandler {
         })
     }
 
-    fn commit(&self, store: &Arc<TxnStateStore>, req: &add_partitions_to_txn::Request) -> i16 {
+    async fn commit(
+        &self,
+        store: &Arc<TxnStateStore>,
+        req: &add_partitions_to_txn::Request,
+    ) -> i16 {
         let additions: Vec<TxnTopic> = req
             .topics
             .iter()
@@ -187,13 +191,15 @@ impl AddPartitionsToTxnHandler {
                 partitions: t.partitions.clone(),
             })
             .collect();
-        match store.add_partitions(
-            &req.transactional_id,
-            req.producer_id,
-            req.producer_epoch,
-            &additions,
-            now_ms(),
-        ) {
+        let txn_id = req.transactional_id.clone();
+        let (pid, epoch) = (req.producer_id, req.producer_epoch);
+        let added = self
+            .broker
+            .txn_store_io(store, move |s| {
+                s.add_partitions(&txn_id, pid, epoch, &additions, now_ms())
+            })
+            .await;
+        match added {
             Ok(()) => 0,
             Err(e) => map_store_error(&e),
         }

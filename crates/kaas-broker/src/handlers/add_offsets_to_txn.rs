@@ -54,16 +54,20 @@ impl Handler for AddOffsetsToTxnHandler {
         let error_code = match self.classify(&principal, &req) {
             Some(code) => code,
             None => match self.broker.txn_state() {
-                Some(store) => match store.add_offsets_to_txn(
-                    &req.transactional_id,
-                    req.producer_id,
-                    req.producer_epoch,
-                    &req.group_id,
-                    now_ms(),
-                ) {
-                    Ok(()) => 0,
-                    Err(e) => map_store_error(&e),
-                },
+                Some(store) => {
+                    let (txn_id, group_id) = (req.transactional_id.clone(), req.group_id.clone());
+                    let (pid, epoch) = (req.producer_id, req.producer_epoch);
+                    let added = self
+                        .broker
+                        .txn_store_io(&store, move |s| {
+                            s.add_offsets_to_txn(&txn_id, pid, epoch, &group_id, now_ms())
+                        })
+                        .await;
+                    match added {
+                        Ok(()) => 0,
+                        Err(e) => map_store_error(&e),
+                    }
+                }
                 None => ERR_COORDINATOR_NOT_AVAILABLE,
             },
         };

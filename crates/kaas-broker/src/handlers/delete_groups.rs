@@ -41,27 +41,34 @@ impl Handler for DeleteGroupsHandler {
         let mut body = body;
         let req = delete_groups::decode_request(&mut body, version)?;
         let principal = principal_from(conn);
-        let mgr = self.broker.coord_manager();
-        let results: Vec<delete_groups::DeleteGroupsResult> = req
-            .group_names
-            .into_iter()
-            .map(|name| {
-                let error_code = if !self.broker.authorizer.authorize(
-                    &principal,
-                    &Resource::group(&name),
-                    Operation::Delete,
-                ) {
-                    ERR_GROUP_AUTHZ_FAILED
-                } else {
-                    mgr.as_ref()
-                        .map_or(ERR_NOT_COORDINATOR, |m| m.delete_group(&name))
-                };
-                delete_groups::DeleteGroupsResult {
-                    group_id: name,
-                    error_code,
-                }
+        // Removes group files, behind the group's write lock (gh #328).
+        let broker = self.broker.clone();
+        let results = self
+            .broker
+            .coordinator_io(move || {
+                let mgr = broker.coord_manager();
+                req.group_names
+                    .into_iter()
+                    .map(|name| {
+                        let error_code = if !broker.authorizer.authorize(
+                            &principal,
+                            &Resource::group(&name),
+                            Operation::Delete,
+                        ) {
+                            ERR_GROUP_AUTHZ_FAILED
+                        } else {
+                            mgr.as_ref()
+                                .map_or(ERR_NOT_COORDINATOR, |m| m.delete_group(&name))
+                        };
+                        delete_groups::DeleteGroupsResult {
+                            group_id: name,
+                            error_code,
+                        }
+                    })
+                    .collect::<Vec<_>>()
             })
-            .collect();
+            .await
+            .ok_or_else(|| HandlerError::Other("DeleteGroups task panicked".into()))?;
         let resp = delete_groups::Response {
             throttle_time_ms: 0,
             results,

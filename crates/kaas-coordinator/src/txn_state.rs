@@ -902,13 +902,9 @@ impl TxnStateStore {
     /// [`Self::abort_overdue_owned`] does — a slot file has one legal
     /// writer (NFS substrate rule 3), so a multi-broker deployment must
     /// pass a real closure.
-    /// The `Sync` bound (unlike [`Self::abort_overdue_owned`]'s) is
-    /// what lets an async caller hold the closure across an await and
-    /// still have a `Send` future — the marker reconcile drives this
-    /// from a spawned task.
     pub fn pending_marker_dispatches(
         &self,
-        owns_txn: Option<&(dyn Fn(&str) -> bool + Sync)>,
+        owns_txn: Option<&dyn Fn(&str) -> bool>,
     ) -> Vec<PendingMarkerDispatch> {
         let _guard = self.mu.lock();
         let mut out = Vec::new();

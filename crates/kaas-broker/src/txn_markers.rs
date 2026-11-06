@@ -32,6 +32,10 @@ use kaas_coordinator::{MarkerEntry, TxnStateStore, TxnTopic};
 use crate::broker::Broker;
 use crate::control_batch::build_control_batch;
 
+/// Does this broker coordinate a transactional id? See
+/// [`reconcile_pending_markers`].
+pub type OwnsTxn = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
 /// Retriable wire code returned when a marker could not be placed.
 /// The caller must leave the transaction in `Prepare*`.
 pub const ERR_COORDINATOR_NOT_AVAILABLE: i16 = 15;
@@ -134,7 +138,14 @@ pub async fn dispatch_markers(
     // MarkerWatcher picks it up within ~2 s and applies it on the
     // peer leader (gh #175).
     if !queued.is_empty() {
-        enqueue_cross_broker_markers(broker, txn_id, producer_id, producer_epoch, commit, &queued)?;
+        // A durable file write per peer (gh #328).
+        let (b, id) = (broker.clone(), txn_id.to_owned());
+        broker
+            .coordinator_io(move || {
+                enqueue_cross_broker_markers(&b, &id, producer_id, producer_epoch, commit, &queued)
+            })
+            .await
+            .unwrap_or(Err(ERR_COORDINATOR_NOT_AVAILABLE))?;
     }
     Ok(())
 }
@@ -261,16 +272,19 @@ fn enqueue_cross_broker_markers(
 ///
 /// `owns_txn` must be `Some` in multi-broker deployments: a slot file
 /// has exactly one legal writer (NFS substrate rule 3).
-///
-/// The `Sync` bound is what lets the returned future be `Send`, so the
-/// caller can drive this from a spawned task — `&T` is `Send` only when
-/// `T: Sync`, and the closure is held across the dispatch awaits.
 pub async fn reconcile_pending_markers(
     broker: &Arc<Broker>,
-    store: &TxnStateStore,
-    owns_txn: Option<&(dyn Fn(&str) -> bool + Sync)>,
+    store: &Arc<TxnStateStore>,
+    owns_txn: Option<OwnsTxn>,
 ) -> usize {
-    let pending = store.pending_marker_dispatches(owns_txn);
+    let swept = store.clone();
+    let pending = broker
+        .coordinator_io(move || match &owns_txn {
+            Some(owns) => swept.pending_marker_dispatches(Some(&**owns)),
+            None => swept.pending_marker_dispatches(None),
+        })
+        .await
+        .unwrap_or_default();
     if pending.is_empty() {
         return 0;
     }
@@ -278,7 +292,11 @@ pub async fn reconcile_pending_markers(
     for p in pending {
         // Offsets before markers, or every pass over a failing write would
         // re-append a control batch to each partition (gh #318).
-        if let Err(err) = store.settle_offsets(&p.txn_id, p.pid, p.epoch, p.commit) {
+        let (id, pid, epoch, commit) = (p.txn_id.clone(), p.pid, p.epoch, p.commit);
+        let settled = broker
+            .txn_store_io(store, move |s| s.settle_offsets(&id, pid, epoch, commit))
+            .await;
+        if let Err(err) = settled {
             tracing::warn!(
                 txn_id = %p.txn_id,
                 %err,
@@ -298,7 +316,11 @@ pub async fn reconcile_pending_markers(
             );
             continue;
         }
-        match store.complete_end_txn(&p.txn_id, p.pid, p.epoch, p.commit) {
+        let id = p.txn_id.clone();
+        let finished = broker
+            .txn_store_io(store, move |s| s.complete_end_txn(&id, pid, epoch, commit))
+            .await;
+        match finished {
             Ok(()) => {
                 completed += 1;
                 tracing::info!(
@@ -319,6 +341,34 @@ pub async fn reconcile_pending_markers(
         }
     }
     completed
+}
+
+/// One tick of the timeout reaper and the marker reconcile. Returns how many
+/// overdue transactions it prepared to abort, and how many it completed.
+///
+/// `Broker::owns_txn` gates both (gh #91). A txn slot file has exactly one legal
+/// writer, its coordinator, so an ungated sweep had every broker
+/// read-modify-writing the same slot on the shared volume (NFS substrate rule
+/// 3). It degrades in the safe direction at both edges: it answers `true` when
+/// no Coordinator is installed (dev / single-broker), so nothing stops being
+/// swept, and in cluster mode `false` for everything until the first
+/// `assignment.json` load, which delays a sweep by one 1 s poll rather than
+/// skipping it.
+pub async fn sweep_transactions(
+    broker: &Arc<Broker>,
+    store: &Arc<TxnStateStore>,
+    now_ms: i64,
+) -> (usize, usize) {
+    let gate = broker.clone();
+    let owns: OwnsTxn = Arc::new(move |id: &str| gate.owns_txn(id));
+    let (swept, owned) = (store.clone(), owns.clone());
+    // Reads every slot file under the store's mutex (gh #328).
+    let aborted = broker
+        .coordinator_io(move || swept.abort_overdue_owned(now_ms, Some(&*owned)).len())
+        .await
+        .unwrap_or_default();
+    let completed = reconcile_pending_markers(broker, store, Some(owns)).await;
+    (aborted, completed)
 }
 
 #[cfg(test)]
@@ -496,8 +546,8 @@ mod tests {
             .prepare_end_txn("tx-theirs", pid, epoch, true)
             .unwrap();
 
-        let owns = |id: &str| id == "tx-mine";
-        assert_eq!(reconcile_pending_markers(&b, &store, Some(&owns)).await, 0);
+        let owns: OwnsTxn = Arc::new(|id: &str| id == "tx-mine");
+        assert_eq!(reconcile_pending_markers(&b, &store, Some(owns)).await, 0);
         assert_eq!(
             store.snapshot()["tx-theirs"].state,
             TxnState::PrepareCommit,

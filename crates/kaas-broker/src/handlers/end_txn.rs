@@ -141,12 +141,24 @@ impl EndTxnHandler {
             Some(s) => s,
             None => return ERR_COORDINATOR_NOT_AVAILABLE,
         };
-        let outcome = match store.prepare_end_txn(
-            &req.transactional_id,
-            req.producer_id,
-            req.producer_epoch,
-            req.committed,
-        ) {
+        let txn_id = req.transactional_id.clone();
+        let (pid, epoch, commit) = (req.producer_id, req.producer_epoch, req.committed);
+        // Slot writes and offset writes, under the store's global mutex, so not
+        // on a worker (gh #328).
+        let prepared = self
+            .broker
+            .txn_store_io(&store, move |s| {
+                let outcome = s.prepare_end_txn(&txn_id, pid, epoch, commit)?;
+                // Offsets before markers (gh #318): a failed offset write answers
+                // retriably, and with no markers placed the retry doesn't
+                // re-append them.
+                if outcome.transition_fired {
+                    s.settle_offsets(&txn_id, pid, epoch, commit)?;
+                }
+                Ok(outcome)
+            })
+            .await;
+        let outcome = match prepared {
             Ok(o) => o,
             Err(e) => return map_store_error(&e),
         };
@@ -154,16 +166,6 @@ impl EndTxnHandler {
         // attempt, nothing owed.
         if !outcome.transition_fired {
             return 0;
-        }
-        // Offsets before markers (gh #318): a failed offset write answers
-        // retriably, and with no markers placed the retry doesn't re-append them.
-        if let Err(e) = store.settle_offsets(
-            &req.transactional_id,
-            req.producer_id,
-            req.producer_epoch,
-            req.committed,
-        ) {
-            return map_store_error(&e);
         }
         let dispatched = crate::txn_markers::dispatch_markers(
             &self.broker,
@@ -186,12 +188,14 @@ impl EndTxnHandler {
             );
             return code;
         }
-        match store.complete_end_txn(
-            &req.transactional_id,
-            req.producer_id,
-            req.producer_epoch,
-            req.committed,
-        ) {
+        let txn_id = req.transactional_id.clone();
+        let completed = self
+            .broker
+            .txn_store_io(&store, move |s| {
+                s.complete_end_txn(&txn_id, pid, epoch, commit)
+            })
+            .await;
+        match completed {
             Ok(()) => 0,
             Err(e) => map_store_error(&e),
         }
@@ -677,5 +681,56 @@ mod tests {
             hwm_after_first, hwm_after_retry,
             "idempotent retry must not write a second marker"
         );
+    }
+
+    /// gh #328: the marker-queue write is a durable file write per peer, so it
+    /// stays off the workers. A FIFO stands in for the temp file: opening it to
+    /// write blocks until something reads the other end. On this one-thread
+    /// runtime the sleep can't end if the handler is waiting on the worker.
+    #[tokio::test]
+    async fn the_marker_queue_write_stays_off_the_workers() {
+        let (t, b) = broker_with_txn();
+        install_peer_leader_coordinator(&b, t.path());
+        let (pid, epoch) = ongoing_txn(&b);
+        b.install_marker_queue(kaas_coordinator::MarkerQueue::open(t.path()).unwrap());
+        let inbox = kaas_coordinator::marker_queue_dir(t.path()).join("to-kaas-1");
+        kaas_coordinator::atomic_write::create_dir_all_durable(&inbox).unwrap();
+        let fifo = inbox.join(format!("{pid}-{epoch}.json.tmp"));
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let reader = std::thread::spawn(move || {
+            let parked = released
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_err();
+            let _ = std::fs::read(&fifo);
+            parked
+        });
+
+        let task = tokio::spawn({
+            let h = EndTxnHandler::new(b.clone());
+            async move {
+                call(
+                    &h,
+                    &end_txn::Request {
+                        transactional_id: "tx-1".into(),
+                        producer_id: pid,
+                        producer_epoch: epoch,
+                        committed: true,
+                    },
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let stalled = !task.is_finished();
+        let _ = release.send(());
+        task.await.unwrap();
+
+        assert!(!reader.join().unwrap(), "it parked the scheduler worker");
+        assert!(stalled, "it never reached the queue: proves nothing");
     }
 }

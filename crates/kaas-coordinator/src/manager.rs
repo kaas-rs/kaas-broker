@@ -278,6 +278,16 @@ impl Manager {
         }
     }
 
+    /// Materialise `group_id` if this broker coordinates it, reading its offsets
+    /// when it is cold. That is file I/O behind the group's write lock, so a
+    /// handler runs this off the scheduler workers before [`Self::join_group`]
+    /// (gh #328).
+    pub fn ensure_group(&self, group_id: &str) {
+        if self.is_coordinator(group_id) {
+            self.get_or_create(group_id);
+        }
+    }
+
     fn get_or_create(&self, group_id: &str) -> Arc<Group> {
         if let Some(g) = self.groups.get(group_id) {
             return g.clone();

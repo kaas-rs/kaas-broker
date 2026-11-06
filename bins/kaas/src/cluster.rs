@@ -486,30 +486,14 @@ async fn run_txn_reaper(
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
                     .unwrap_or(0);
-                // Ownership gate (gh #91). A txn slot file has exactly
-                // one legal writer — its coordinator — so an ungated
-                // sweep had every broker read-modify-writing the same
-                // slot on the shared volume (NFS substrate rule 3).
-                //
-                // Degrades in the safe direction at both edges:
-                // `Broker::owns_txn` answers `true` when no Coordinator
-                // is installed (dev / single-broker), so nothing stops
-                // being swept; and in cluster mode it answers `false`
-                // for everything until the first `assignment.json`
-                // load, which delays a sweep by one 1 s poll rather
-                // than skipping it.
-                let owns = |id: &str| broker.owns_txn(id);
-                let aborted = store.abort_overdue_owned(now_ms, Some(&owns));
-                if !aborted.is_empty() {
+                let (aborted, completed) =
+                    kaas_broker::txn_markers::sweep_transactions(&broker, &store, now_ms).await;
+                if aborted > 0 {
                     info!(
-                        count = aborted.len(),
+                        count = aborted,
                         "txn-timeout reaper prepared overdue Ongoing transactions for abort"
                     );
                 }
-                let completed = kaas_broker::txn_markers::reconcile_pending_markers(
-                    &broker, &store, Some(&owns),
-                )
-                .await;
                 if completed > 0 {
                     info!(
                         count = completed,
