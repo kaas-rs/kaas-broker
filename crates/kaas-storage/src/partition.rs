@@ -4267,7 +4267,9 @@ pub(crate) mod tests {
                 guard.requested_flush_seq += 1;
                 guard.requested_flush_seq
             };
-            assert_eq!(p.append(0, 1, batch.clone()).await.unwrap(), 0);
+            let acks_one =
+                tokio::time::timeout(Duration::from_secs(5), p.append(0, 1, batch.clone())).await;
+            assert!(matches!(acks_one, Ok(Ok(0))), "{acks_one:?}");
 
             let parked = p.clone();
             let retry = batch.clone();
