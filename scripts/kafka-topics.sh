@@ -14,6 +14,7 @@ PARTITIONS=3
 echo ">> Scenario 1: create topic '$TOPIC' with $PARTITIONS partitions"
 "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
   --create --topic "$TOPIC" --partitions "$PARTITIONS" --replication-factor 1
+delete_on_exit "$TOPIC"
 
 echo ">> Scenario 2: --list contains '$TOPIC'"
 "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" --list | grep -qx "$TOPIC"

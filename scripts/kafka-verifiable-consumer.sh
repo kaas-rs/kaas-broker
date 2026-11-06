@@ -8,6 +8,7 @@
 
 "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
   --create --topic "$TOPIC" --partitions 1 --replication-factor 1
+delete_on_exit "$TOPIC"
 
 echo ">> seeding 1000 records"
 "$KAFKA_BIN/kafka-verifiable-producer.sh" \
@@ -38,7 +39,5 @@ count=$(awk '
 ' "$TMP/out.json")
 echo "records_consumed total: $count"
 [ "$count" -ge 1000 ] || { echo "FAIL: consumed $count < 1000" >&2; exit 1; }
-
-"$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" --delete --topic "$TOPIC" || true
 
 echo ">> PASS"

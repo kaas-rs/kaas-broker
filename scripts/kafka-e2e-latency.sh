@@ -8,11 +8,10 @@
 
 "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
   --create --topic "$TOPIC" --partitions 1 --replication-factor 1
+delete_on_exit "$TOPIC"
 
 echo ">> Scenario 1: 1000 round-trips, 100B"
 "$KAFKA_BIN/kafka-e2e-latency.sh" \
   "$BOOTSTRAP" "$TOPIC" 1000 1 100
-
-"$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" --delete --topic "$TOPIC" || true
 
 echo ">> PASS"

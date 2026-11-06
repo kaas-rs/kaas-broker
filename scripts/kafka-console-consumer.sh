@@ -18,20 +18,6 @@
 TXN_TOPIC="$TOPIC-txn"
 TXN_RECORDS=2000
 
-# Combined cleanup: _common.sh sets its own EXIT trap for $TMP; this replaces it
-# with a superset, so a failed run doesn't leave its topics behind.
-cleanup() {
-  local rc=$?
-  set +e
-  for t in "$TOPIC" "$TXN_TOPIC"; do
-    "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
-      --delete --topic "$t" >/dev/null 2>&1
-  done
-  rm -rf "$TMP"
-  exit "$rc"
-}
-trap cleanup EXIT
-
 # The consumer with its records on stdout, and everything else (its banner, the
 # timeout it ends on) kept for the failure report. A timeout exits 0, so a
 # non-zero exit is a real failure.
@@ -63,6 +49,7 @@ expect() {
 
 "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
   --create --topic "$TOPIC" --partitions 1 --replication-factor 1
+delete_on_exit "$TOPIC"
 
 echo ">> seeding 3 messages"
 printf 'a\nb\nc\n' | \
@@ -90,13 +77,7 @@ echo ">> Scenario 4: --partition / --offset earliest + formatter props"
 # different selector shape. The Kafka 4.x default formatter (no
 # --formatter override needed; the old kafka.tools.DefaultMessageFormatter
 # class was renamed) still honours print.partition / print.offset.
-# --formatter-property replaced --property, which is deprecated where both
-# exist. An older KAFKA_BIN only has --property. --help exits non-zero.
-consumer_help=$("$KAFKA_BIN/kafka-console-consumer.sh" --help 2>&1 || true)
-case "$consumer_help" in
-  *--formatter-property*) formatter_flag=--formatter-property ;;
-  *) formatter_flag=--property ;;
-esac
+formatter_flag=$(newer_flag kafka-console-consumer.sh --formatter-property --property)
 got=$(consume --topic "$TOPIC" --partition 0 --offset earliest --max-messages 3 --timeout-ms 10000 \
   "$formatter_flag" print.partition=true \
   "$formatter_flag" print.offset=true)
@@ -113,6 +94,7 @@ echo ">> Scenario 5: read_committed after real transactions (gh #299)"
 # The transactional id is fixed so runs don't add an entry each to the txn state.
 "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
   --create --topic "$TXN_TOPIC" --partitions 1 --replication-factor 1
+delete_on_exit "$TXN_TOPIC"
 "$KAFKA_BIN/kafka-producer-perf-test.sh" --topic "$TXN_TOPIC" \
   --num-records "$TXN_RECORDS" --record-size 16 --throughput -1 \
   --transactional-id kaas-test-console-consumer --transaction-duration-ms 20 \

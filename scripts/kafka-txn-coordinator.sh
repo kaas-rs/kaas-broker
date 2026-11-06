@@ -60,8 +60,8 @@ echo ">> Scenario 3: kafka-transactions.sh describe-producers (DescribeProducers
 # Pick any topic — describe-producers is partition-scoped but only
 # needs the topic to exist. Create a throwaway one.
 "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
-  --create --topic "$TOPIC" --partitions 1 --replication-factor 1 \
-  --if-not-exists >/dev/null 2>&1
+  --create --topic "$TOPIC" --partitions 1 --replication-factor 1 >/dev/null
+delete_on_exit "$TOPIC"
 
 if "$KAFKA_BIN/kafka-transactions.sh" --bootstrap-server "$BOOTSTRAP" \
      describe-producers --topic "$TOPIC" --partition 0 \
@@ -86,7 +86,4 @@ fi
 # Tidy up: don't leave the throwaway topic behind on a shared bench
 # cluster. delete is best-effort; the operator's reconciler cleans up
 # storage either way.
-"$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
-  --delete --topic "$TOPIC" >/dev/null 2>&1 || true
-
 echo ">> PASS (txn coordinator wire surface intact for KIP-447 same-broker EOS-v2)"

@@ -14,6 +14,7 @@
 
 "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
   --create --topic "$TOPIC" --partitions 1 --replication-factor 1
+delete_on_exit "$TOPIC"
 
 echo ">> Scenario 1: 1000 records, acks=all"
 "$KAFKA_BIN/kafka-verifiable-producer.sh" \
@@ -49,7 +50,5 @@ if grep -qE 'OutOfOrderSequenceException|InvalidProducerEpoch|UnknownProducerIdE
   grep -E 'OutOfOrderSequenceException|InvalidProducerEpoch|UnknownProducerIdException' "$TMP/idem.err" >&2
   exit 1
 fi
-
-"$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" --delete --topic "$TOPIC" || true
 
 echo ">> PASS"

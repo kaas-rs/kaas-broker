@@ -9,6 +9,7 @@
 
 "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
   --create --topic "$TOPIC" --partitions 3 --replication-factor 1
+delete_on_exit "$TOPIC"
 
 echo ">> Scenario 1: 10k records / 1KB / acks=1"
 "$KAFKA_BIN/kafka-producer-perf-test.sh" --topic "$TOPIC" \
@@ -57,7 +58,5 @@ else
   tail -5 "$TMP/oversize.out" >&2
   exit 1
 fi
-
-"$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" --delete --topic "$TOPIC" || true
 
 echo ">> PASS"

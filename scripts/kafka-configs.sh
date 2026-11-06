@@ -21,6 +21,7 @@
 
 "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
   --create --topic "$TOPIC" --partitions 1 --replication-factor 1
+delete_on_exit "$TOPIC"
 
 echo ">> Scenario 1: --describe broker config"
 "$KAFKA_BIN/kafka-configs.sh" --bootstrap-server "$BOOTSTRAP" \
@@ -77,8 +78,6 @@ echo ">> Scenario 5: --describe specific broker config"
 "$KAFKA_BIN/kafka-configs.sh" --bootstrap-server "$BOOTSTRAP" \
   --entity-type brokers --entity-name 0 --describe 2>&1 | head -5
 
-"$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" --delete --topic "$TOPIC" || true
-
 # ---------------------------------------------------------------------------
 # Client quota scenarios (gh #260). Overrides set by AlterClientQuotas live
 # in the serving broker's memory, so the user name is per-run and the
@@ -98,7 +97,7 @@ quota_cleanup() {
     --entity-type users --entity-name "$QUOTA_USER" \
     --alter --delete-config "$QUOTA_KEYS_SET" >/dev/null 2>&1 || true
 }
-trap 'quota_cleanup; rm -rf "$TMP"' EXIT
+trap 'rc=$?; quota_cleanup; cleanup_on_exit "$rc"' EXIT
 
 describe_quota() {
   "$KAFKA_BIN/kafka-configs.sh" --bootstrap-server "$BOOTSTRAP" \

@@ -35,6 +35,7 @@ fi
 
 "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
   --create --topic "$TOPIC" --partitions 1 --replication-factor 1
+delete_on_exit "$TOPIC"
 
 echo ">> launching $RECORDS-record idempotent producer in background"
 # acks=-1 + the explicit idempotence config make the broker-side
@@ -147,7 +148,5 @@ if [ "$HWM" != "$RECORDS" ]; then
   echo "FAIL: HWM=$HWM, want $RECORDS (idempotence broken across restart)" >&2
   exit 1
 fi
-
-"$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" --delete --topic "$TOPIC" || true
 
 echo ">> PASS"

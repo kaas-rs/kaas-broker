@@ -38,6 +38,7 @@ expect_committed() {
 
 "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
   --create --topic "$TOPIC" --partitions 2 --replication-factor 1
+delete_on_exit "$TOPIC"
 
 echo ">> seeding 5 messages"
 printf 'a\nb\nc\nd\ne\n' | \
@@ -88,7 +89,5 @@ if "$KAFKA_BIN/kafka-consumer-groups.sh" --bootstrap-server "$BOOTSTRAP" --list 
   echo "FAIL: deleted group still appears in --list" >&2
   exit 1
 fi
-
-"$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" --delete --topic "$TOPIC" || true
 
 echo ">> PASS"

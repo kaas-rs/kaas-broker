@@ -8,6 +8,7 @@
 
 "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
   --create --topic "$TOPIC" --partitions 1 --replication-factor 1
+delete_on_exit "$TOPIC"
 
 echo ">> producing 10 records"
 for i in $(seq 1 10); do echo "msg-$i"; done | \
@@ -25,7 +26,5 @@ echo ">> verifying: earliest offset == 7"
 out=$("$KAFKA_BIN/kafka-get-offsets.sh" --bootstrap-server "$BOOTSTRAP" --topic "$TOPIC" --time -2)
 echo "$out"
 echo "$out" | grep -qE "${TOPIC}:0:7\$" || { echo "FAIL: earliest != 7" >&2; exit 1; }
-
-"$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" --delete --topic "$TOPIC" || true
 
 echo ">> PASS"

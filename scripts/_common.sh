@@ -15,6 +15,9 @@
 #   $TMP           per-run scratch dir, auto-cleaned on exit
 #   skip "<reason>"   print reason and exit 77 (autoconf "skipped" exit code)
 #   need <bin>     skip if a required tool is not on PATH
+#   delete_on_exit <topic>...  delete these topics however the script ends
+#   cleanup_on_exit [status]   the EXIT trap, for a script that needs its own
+#   newer_flag <tool> <new> <old>  whichever spelling of a flag KAFKA_BIN has
 #   wait_cluster_ready [timeout]  block until the brokers are serving again
 
 set -euo pipefail
@@ -25,7 +28,37 @@ NAMESPACE="${NAMESPACE:-kaas}"
 STS="${STS:-kaas}"
 TOPIC="${TOPIC:-kaas-test-$$-$(date +%s)}"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+
+# delete_on_exit <topic>...
+#
+# Delete these topics however the script ends, so a failed run doesn't leave
+# them behind. Call it after the create has succeeded, never before: TOPIC can
+# be overridden, and a create refused because a real topic has that name must
+# not get the real topic deleted.
+EXIT_TOPICS=()
+delete_on_exit() {
+  EXIT_TOPICS+=("$@")
+}
+
+# cleanup_on_exit [status]
+#
+# The EXIT trap. A script that needs its own trap should end it with this,
+# passing the status it saved first, or its topics and $TMP stay behind:
+#
+#   trap 'rc=$?; my_cleanup; cleanup_on_exit "$rc"' EXIT
+cleanup_on_exit() {
+  local rc="${1:-$?}" t
+  set +e
+  for t in "${EXIT_TOPICS[@]}"; do
+    # Bounded, or an unreachable broker holds each delete for the client's API
+    # timeout, on top of whatever just failed.
+    timeout 30 "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
+      --delete --topic "$t" >/dev/null 2>&1
+  done
+  rm -rf "$TMP"
+  exit "$rc"
+}
+trap cleanup_on_exit EXIT
 
 skip() {
   echo ">> SKIP: $*" >&2
@@ -34,6 +67,21 @@ skip() {
 
 need() {
   command -v "$1" >/dev/null 2>&1 || skip "missing required tool: $1"
+}
+
+# newer_flag <tool> <new flag> <old flag>
+#
+# Print <new flag> if this KAFKA_BIN's tool has it, otherwise <old flag>. The 4.x
+# CLI renamed some flags and prints a deprecation notice to stdout for the old
+# spelling, which a script reading the tool's output takes for a record. --help
+# exits non-zero.
+newer_flag() {
+  local help
+  help="$("$KAFKA_BIN/$1" --help 2>&1 || true)"
+  case "$help" in
+    *"$2"*) echo "$2" ;;
+    *) echo "$3" ;;
+  esac
 }
 
 # wait_cluster_ready [timeout_seconds]

@@ -25,6 +25,7 @@ CHANGELOG="$APP-KSTREAM-AGGREGATE-STATE-STORE-0000000003-changelog"
 for t in "$INPUT" "$REPART" "$CHANGELOG"; do
   "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
     --create --topic "$t" --partitions 1 --replication-factor 1
+  delete_on_exit "$t"
 done
 
 echo ">> seeding input + driving the consumer group $APP"
@@ -46,7 +47,5 @@ echo ">> verifying internal topics gone"
 list=$("$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" --list)
 echo "$list" | grep -qx "$REPART"    && { echo "FAIL: repartition topic still present" >&2; exit 1; }
 echo "$list" | grep -qx "$CHANGELOG" && { echo "FAIL: changelog topic still present" >&2; exit 1; }
-
-"$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" --delete --topic "$INPUT" || true
 
 echo ">> PASS"

@@ -9,6 +9,7 @@
 
 "$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" \
   --create --topic "$TOPIC" --partitions 1 --replication-factor 1
+delete_on_exit "$TOPIC"
 
 echo ">> Scenario 1: --describe (all dirs)"
 "$KAFKA_BIN/kafka-log-dirs.sh" --bootstrap-server "$BOOTSTRAP" --describe | tee "$TMP/all.json"
@@ -28,7 +29,5 @@ echo "$out" | grep -q "\"partition\":\"$TOPIC-" || { echo "FAIL: topic missing" 
 echo "$out" | grep -oE '"partition":"[^"]+"' | grep -v "\"partition\":\"$TOPIC-" \
   | grep -q . && { echo "FAIL: filter returned unrelated partitions" >&2; exit 1; }
 true
-
-"$KAFKA_BIN/kafka-topics.sh" --bootstrap-server "$BOOTSTRAP" --delete --topic "$TOPIC" || true
 
 echo ">> PASS"
