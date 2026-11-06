@@ -1451,19 +1451,8 @@ fn self_endpoint_lookup(self_id: &str, port: i32) -> Arc<dyn BrokerLookup> {
     // `<pod>.local` and NXDOMAIN. Local-dev has none of these env
     // vars set — fall through to the `.local` shape so a
     // MemoryStorage-backed dev binary still resolves.
-    let advertised = {
-        let pod = std::env::var("MY_POD_NAME").ok().filter(|s| !s.is_empty());
-        let svc = std::env::var("KAAS_HEADLESS_SVC")
-            .ok()
-            .filter(|s| !s.is_empty());
-        let ns = std::env::var("KAAS_NAMESPACE")
-            .ok()
-            .filter(|s| !s.is_empty());
-        match (pod, svc, ns) {
-            (Some(p), Some(s), Some(n)) => format!("{p}.{s}.{n}.svc.cluster.local"),
-            _ => format!("{id}.local"),
-        }
-    };
+    let advertised =
+        { kaas_broker::cli::derive_advertised_host().unwrap_or_else(|| format!("{id}.local")) };
     Arc::new(FnLookup::new(move |req: &str| {
         if req == id {
             Some(BrokerEndpoint {

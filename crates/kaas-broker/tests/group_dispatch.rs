@@ -46,12 +46,15 @@ const INITIAL_REBALANCE_DELAY: Duration = Duration::from_millis(3_100);
 
 fn broker_with_manager(tmpdir: &std::path::Path) -> Arc<Broker> {
     let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
-    let broker = Arc::new(Broker::new(
-        engine,
-        Arc::new(TopicRegistry::new()),
-        "test",
-        0,
-    ));
+    let topics = Arc::new(TopicRegistry::new());
+    for name in ["t1", "t2"] {
+        topics.insert(kaas_broker::TopicMeta {
+            name: name.to_owned(),
+            partition_count: 3,
+            topic_id: [0; 16],
+        });
+    }
+    let broker = Arc::new(Broker::new(engine, topics, "test", 0));
     let offsets = Arc::new(OffsetStore::new(tmpdir));
     let lookup: Arc<dyn BrokerLookup> = Arc::new(FnLookup::new(|id: &str| {
         if id == "kaas-0" {
@@ -351,4 +354,59 @@ async fn null_topic_offset_fetch_lists_every_committed_partition_after_a_restart
     let resp = offset_fetch::decode_response(&mut resp_bytes.freeze(), 5).unwrap();
     assert_eq!(resp.error_code, 0);
     want(&resp.topics);
+}
+
+/// gh #320: a topic or partition that doesn't exist answers Apache's 3 per
+/// partition, and isn't stored, while the rest of the request still commits. If
+/// nothing's left to commit the coordinator isn't consulted.
+#[tokio::test]
+async fn an_unknown_topic_or_partition_is_3_and_is_not_stored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let broker = broker_with_manager(tmp.path());
+    let commit = |topics: Vec<(&str, i32)>| offset_commit::Request {
+        group_id: "g1".to_owned(),
+        generation_id: -1,
+        member_id: String::new(),
+        group_instance_id: None,
+        retention_time_ms: offset_commit::DEFAULT_RETENTION_TIME_MS,
+        topics: topics
+            .into_iter()
+            .map(|(name, partition)| offset_commit::OffsetCommitTopic {
+                name: name.to_owned(),
+                partitions: vec![offset_commit::OffsetCommitPartition {
+                    partition_index: partition,
+                    committed_offset: 42,
+                    committed_leader_epoch: -1,
+                    committed_metadata: None,
+                }],
+            })
+            .collect(),
+    };
+    let send = |req: offset_commit::Request| {
+        let broker = broker.clone();
+        async move {
+            let mut body = BytesMut::new();
+            offset_commit::encode_request(&mut body, &req, 8).unwrap();
+            let out = OffsetCommitHandler::new(broker)
+                .handle(&conn(), 8, body.freeze())
+                .await
+                .unwrap();
+            let resp = offset_commit::decode_response(&mut out.freeze(), 8).unwrap();
+            resp.topics
+                .iter()
+                .map(|t| (t.name.clone(), t.partitions[0].error_code))
+                .collect::<Vec<_>>()
+        }
+    };
+
+    let codes = send(commit(vec![("t1", 0), ("t1", 3), ("nope", 0)])).await;
+    let want = [("t1", 0), ("t1", 3), ("nope", 3)].map(|(n, c)| (n.to_owned(), c));
+    assert_eq!(codes, want);
+    let mgr = broker.coord_manager().unwrap();
+    let (stored, _) = mgr.offsets.fetch_all("g1");
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    assert_eq!(stored.get("t1/0"), Some(&42));
+
+    let codes = send(commit(vec![("nope", 0)])).await;
+    assert_eq!(codes, [("nope".to_owned(), 3)]);
 }

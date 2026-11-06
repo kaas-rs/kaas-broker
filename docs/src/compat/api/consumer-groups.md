@@ -57,6 +57,8 @@ As in Apache, an Allow for `Read`, `Write`, `Delete` or `Alter` also grants
 
 Persists a group's consumed positions. Key 8.
 
+A topic or partition that doesn't exist answers `UNKNOWN_TOPIC_OR_PARTITION` (3)
+for that partition, after the ACL check, and isn't stored, as in Apache (gh #320).
 A group's offsets live in a file named after it. A group id is any string, as
 in Apache, so the path-unsafe bytes (`/`, NUL and `%`) are percent-encoded in
 the file name, and a group can't reach outside the offsets directory (gh #314).

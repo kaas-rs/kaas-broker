@@ -135,7 +135,19 @@ fn reclaim_orphan_dirs(
             remove_orphan(&entry.path(), name, &mut report);
             continue;
         }
-        if name.starts_with('.') || keep.contains(&name) {
+        if keep.contains(&name) {
+            continue;
+        }
+        // `.hidden` and `...` are legal topic names, so a dot doesn't mean
+        // "not a topic" (gh #320, they leaked). But a dot directory can be
+        // somebody else's, such as NFS `.snapshot`, so it goes only if it
+        // carries the reconciler's identity stamp.
+        if name.starts_with('.')
+            && !entry
+                .path()
+                .join(kaas_storage::TOPIC_IDENTITY_FILENAME)
+                .exists()
+        {
             continue;
         }
         remove_orphan(&entry.path(), name, &mut report);
@@ -236,6 +248,31 @@ mod tests {
         }
         removed.sort();
         Ok(removed)
+    }
+
+    /// gh #320: an orphan with a dot-prefixed name is reclaimed when the
+    /// reconciler stamped it as a topic. An unstamped dot directory isn't ours
+    /// to delete, and a topic with a live CR stays whatever its name.
+    #[test]
+    fn a_stamped_dot_prefixed_orphan_is_reclaimed_and_others_stay() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        for name in [".hidden", "...", ".live"] {
+            fs::create_dir(root.join(name)).unwrap();
+            fs::write(
+                root.join(name).join(kaas_storage::TOPIC_IDENTITY_FILENAME),
+                b"{}",
+            )
+            .unwrap();
+        }
+        fs::create_dir(root.join(".snapshot")).unwrap();
+        let mut keep = base_keep_set();
+        keep.insert(".live".to_owned());
+
+        let report = reclaim_orphan_dirs(root, &keep).unwrap();
+        assert_eq!(report.removed, ["...", ".hidden"]);
+        assert!(root.join(".live").is_dir());
+        assert!(root.join(".snapshot").is_dir());
     }
 
     #[test]

@@ -1,0 +1,6 @@
+# gh #320: must fail to render. A cluster-state dir inside a log dir would be
+# deleted by the operator's first sweep.
+storage:
+  controlPlane:
+    enabled: true
+    mountPath: /data/cluster

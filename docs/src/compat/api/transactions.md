@@ -374,6 +374,9 @@ The pending layer is memory-only by design: staged offsets of an
 unfinished transaction dying with the broker is abort-equivalent, which
 is the correct outcome.
 
+A topic or partition that doesn't exist answers `UNKNOWN_TOPIC_OR_PARTITION` (3)
+for that partition and isn't staged, as in Apache (gh #320).
+
 **Deviations from Apache 3.7**:
 
 - A group id too long for a file name answers `INVALID_GROUP_ID` (24) on every

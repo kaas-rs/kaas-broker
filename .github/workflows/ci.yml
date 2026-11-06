@@ -149,6 +149,18 @@ jobs:
             exit 1
           fi
           grep -q "hostnamePattern is required" <<<"$out" || { echo "$out" >&2; exit 1; }
+      # gh #320: a cluster-state dir inside a log dir would be deleted by the
+      # operator's sweep, and the default control-plane path must still render.
+      - name: helm template (control-plane placement)
+        run: |
+          set -euo pipefail
+          helm template test-release deploy/helm/kaas --set storage.controlPlane.enabled=true > /dev/null
+          if out=$(helm template test-release deploy/helm/kaas \
+              -f deploy/helm/ci/control-plane-under-data.invalid.yaml 2>&1); then
+            echo "expected the render to fail with the control plane under the data dir" >&2
+            exit 1
+          fi
+          grep -q "must be outside the data dir" <<<"$out" || { echo "$out" >&2; exit 1; }
 
   docs:
     runs-on: arc-runner-set

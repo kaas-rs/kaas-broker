@@ -212,6 +212,10 @@ async fn main() -> Result<()> {
     // Registry before engine: it doubles as the placement resolver
     // (gh #221 phase 2) — the engine resolves partition roots through
     // the volume assignments the topic watch stashes into it.
+    if let (Some(dir), Some(cluster)) = (cli.data_dir.as_deref(), cli.resolved_cluster_dir()) {
+        kaas_storage::check_cluster_dir_placement(&cluster, dir, &cli.log_dirs)
+            .map_err(anyhow::Error::msg)?;
+    }
     let (engine, disk_engine) = build_engine(
         cli.data_dir.clone(),
         cli.flush_interval_messages,

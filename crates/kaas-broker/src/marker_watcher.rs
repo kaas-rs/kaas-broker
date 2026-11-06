@@ -156,18 +156,30 @@ impl MarkerWatcher {
                 return;
             }
         };
-        if data.is_empty() {
-            // Half-written file mid-rename — leave it; next tick.
-            return;
-        }
+        // The writer is tmp + fsync + rename, so a `.json` file here is complete.
+        // One that doesn't decode never will, so it's set aside rather than
+        // retried and logged every 2 s for ever (gh #320). The name is kept for
+        // whoever looks into it, and it no longer matches the `.json` filter.
         let entry: MarkerEntry = match serde_json::from_slice(&data) {
             Ok(e) => e,
             Err(e) => {
-                tracing::warn!(
-                    file = %path.display(),
-                    %e,
-                    "marker watcher: decode failed; file likely mid-write, retry next tick"
-                );
+                let mut aside = path.as_os_str().to_owned();
+                aside.push(".bad");
+                match fs::rename(path, &aside) {
+                    Ok(()) => tracing::error!(
+                        file = %path.display(),
+                        %e,
+                        "marker watcher: undecodable queue entry set aside as .bad; a \
+                         transaction marker may be lost, and a partition's LSO with it"
+                    ),
+                    Err(rename) => tracing::warn!(
+                        file = %path.display(),
+                        %e,
+                        %rename,
+                        "marker watcher: undecodable queue entry can't be set aside; \
+                         will retry next tick"
+                    ),
+                }
                 return;
             }
         };
@@ -290,18 +302,30 @@ mod tests {
         assert!(q.list("kaas-0").unwrap().is_empty());
     }
 
+    /// gh #320: an undecodable entry is set aside rather than retried for
+    /// ever, an empty one too, and it's kept. A good entry next to it still
+    /// applies, and the next tick has nothing to retry.
     #[tokio::test]
-    async fn corrupt_file_is_skipped_not_deleted() {
+    async fn an_undecodable_entry_is_set_aside_and_the_rest_still_apply() {
         let tmp = tempfile::tempdir().unwrap();
         let q = MarkerQueue::open(tmp.path()).unwrap();
         let inbox = q.inbox("kaas-0");
         fs::create_dir_all(&inbox).unwrap();
         fs::write(inbox.join("garbage.json"), b"\xffnot-json").unwrap();
+        fs::write(inbox.join("empty.json"), b"").unwrap();
         let capturing = Capturing::new(ApplyOutcome::Applied);
         let w = MarkerWatcher::new(inbox.clone(), capturing.clone());
+        q.enqueue("kaas-0", &entry(7, 1)).unwrap();
         w.tick().await;
-        assert!(capturing.calls.lock().is_empty());
-        assert!(inbox.join("garbage.json").exists());
+        assert_eq!(capturing.calls.lock().len(), 1, "the good entry applies");
+
+        for name in ["garbage.json", "empty.json"] {
+            assert!(!inbox.join(name).exists(), "{name}");
+            assert!(inbox.join(format!("{name}.bad")).exists(), "{name}");
+        }
+        assert!(q.list("kaas-0").unwrap().is_empty(), "list skips them too");
+        w.tick().await;
+        assert_eq!(capturing.calls.lock().len(), 1);
     }
 
     /// Idempotency across ticks: enqueue + tick + re-enqueue with

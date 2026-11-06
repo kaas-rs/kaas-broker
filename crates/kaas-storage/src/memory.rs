@@ -28,6 +28,7 @@ use dashmap::DashMap;
 
 use crate::engine::StorageEngine;
 use crate::errors::StorageError;
+use crate::txn_index::{AbortedTxn, AbortedTxnIndex, OpenTxnIndex};
 
 /// The `data_dir` sentinel returned for an in-memory engine.
 pub const MEMORY_DATA_DIR: &str = "memory://";
@@ -44,6 +45,8 @@ struct MemoryPartition {
     batches: Vec<MemoryBatch>,
     high_water: i64,
     log_start: i64,
+    open_txns: OpenTxnIndex,
+    aborted_txns: AbortedTxnIndex,
 }
 
 #[derive(Debug)]
@@ -115,6 +118,16 @@ impl StorageEngine for MemoryStorage {
         delta_bytes.copy_from_slice(&owned[23..27]);
         let last_offset_delta = i32::from_be_bytes(delta_bytes);
 
+        // gh #320: without these, dev mode showed aborted records to
+        // read_committed.
+        let inner = &mut *guard;
+        crate::partition::track_txn_batch(
+            &owned,
+            assigned,
+            &mut inner.open_txns,
+            &mut inner.aborted_txns,
+        );
+
         let frozen = owned.freeze();
         guard.batches.push(MemoryBatch {
             base_offset: assigned,
@@ -173,6 +186,31 @@ impl StorageEngine for MemoryStorage {
         }
     }
 
+    fn last_stable_offset(&self, topic: &str, partition: i32) -> Result<i64, StorageError> {
+        let Some(entry) = self.partitions.get(&(topic.to_owned(), partition)) else {
+            return Ok(0);
+        };
+        let guard = entry.lock();
+        Ok(guard
+            .open_txns
+            .min_open_offset()
+            .unwrap_or(guard.high_water))
+    }
+
+    fn aborted_transactions_in_range(
+        &self,
+        topic: &str,
+        partition: i32,
+        start_offset: i64,
+        end_offset: i64,
+    ) -> Vec<AbortedTxn> {
+        self.partitions
+            .get(&(topic.to_owned(), partition))
+            .map_or_else(Vec::new, |entry| {
+                entry.lock().aborted_txns.in_range(start_offset, end_offset)
+            })
+    }
+
     fn offset_for_timestamp(
         &self,
         _topic: &str,
@@ -221,6 +259,7 @@ impl StorageEngine for MemoryStorage {
         };
         if new_start > guard.log_start {
             guard.log_start = new_start;
+            guard.aborted_txns.evict_below(new_start);
         }
         Ok(guard.log_start)
     }
@@ -491,6 +530,52 @@ mod tests {
     }
 
     // --- Sentinels ------------------------------------------------------
+
+    /// gh #320: dev mode tracks transactions like the disk engine, so
+    /// read_committed doesn't see open or aborted records. An open transaction
+    /// holds the LSO back, and its ABORT marker lists it as aborted.
+    #[test]
+    fn a_transaction_holds_the_lso_and_an_abort_is_listed() {
+        use crate::partition::tests::{build_marker_batch, build_txn_data_batch};
+        rt().block_on(async {
+            let s = MemoryStorage::new();
+            s.append("t", 0, 0, -1, build_batch(0, 1)).await.unwrap();
+            assert_eq!(s.last_stable_offset("t", 0).unwrap(), 1);
+
+            s.append("t", 0, 0, -1, build_txn_data_batch(42, 2))
+                .await
+                .unwrap();
+            assert_eq!(s.high_watermark("t", 0).unwrap(), 3);
+            assert_eq!(s.last_stable_offset("t", 0).unwrap(), 1, "open at offset 1");
+            assert!(s.aborted_transactions_in_range("t", 0, 0, 10).is_empty());
+
+            s.append("t", 0, 0, -1, build_marker_batch(42, false))
+                .await
+                .unwrap();
+            assert_eq!(s.last_stable_offset("t", 0).unwrap(), 4);
+            let aborted = s.aborted_transactions_in_range("t", 0, 0, 10);
+            assert_eq!(aborted.len(), 1);
+            assert_eq!(aborted[0].producer_id, 42);
+            assert_eq!(aborted[0].first_offset, 1);
+
+            // A COMMIT closes it too, and lists nothing.
+            s.append("t", 0, 0, -1, build_txn_data_batch(43, 1))
+                .await
+                .unwrap();
+            s.append("t", 0, 0, -1, build_marker_batch(43, true))
+                .await
+                .unwrap();
+            assert_eq!(s.aborted_transactions_in_range("t", 0, 0, 100).len(), 1);
+            assert_eq!(
+                s.last_stable_offset("t", 0).unwrap(),
+                s.high_watermark("t", 0).unwrap()
+            );
+
+            // Purged past its end, an aborted transaction is forgotten.
+            s.delete_records("t", 0, -1).await.unwrap();
+            assert!(s.aborted_transactions_in_range("t", 0, 0, 100).is_empty());
+        });
+    }
 
     #[test]
     fn offset_for_timestamp_sentinel() {

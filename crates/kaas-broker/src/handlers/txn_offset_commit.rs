@@ -30,6 +30,7 @@ use super::principal_from;
 use crate::broker::Broker;
 
 const ERR_INVALID_GROUP_ID: i16 = 24;
+const ERR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 const ERR_NOT_COORDINATOR: i16 = 16;
 const ERR_TOPIC_AUTHZ_FAILED: i16 = 29;
 const ERR_GROUP_AUTHZ_FAILED: i16 = 30;
@@ -66,19 +67,19 @@ impl Handler for TxnOffsetCommitHandler {
             &Resource::transactional_id(&req.transactional_id),
             Operation::Write,
         ) {
-            return write_response(version, &req, |_| ERR_TXN_ID_AUTHZ_FAILED);
+            return write_response(version, &req, |_, _| ERR_TXN_ID_AUTHZ_FAILED);
         }
         if !self.broker.authorizer.authorize(
             &principal,
             &Resource::group(&req.group_id),
             Operation::Read,
         ) {
-            return write_response(version, &req, |_| ERR_GROUP_AUTHZ_FAILED);
+            return write_response(version, &req, |_, _| ERR_GROUP_AUTHZ_FAILED);
         }
         // Offsets staged for a group that can't be stored could never be
         // committed, and the transaction could never finish (gh #318).
         if !kaas_coordinator::group_id_fits(&req.group_id) {
-            return write_response(version, &req, |_| ERR_INVALID_GROUP_ID);
+            return write_response(version, &req, |_, _| ERR_INVALID_GROUP_ID);
         }
 
         // Group-coordinator gate. Mirrors OffsetCommit: when no
@@ -87,11 +88,11 @@ impl Handler for TxnOffsetCommitHandler {
         let mgr = match self.broker.coord_manager() {
             Some(m) => m,
             None => {
-                return write_response(version, &req, |_| ERR_NOT_COORDINATOR);
+                return write_response(version, &req, |_, _| ERR_NOT_COORDINATOR);
             }
         };
         if !mgr.is_coordinator(&req.group_id) {
-            return write_response(version, &req, |_| ERR_NOT_COORDINATOR);
+            return write_response(version, &req, |_, _| ERR_NOT_COORDINATOR);
         }
 
         // gh #199 per-topic gate — Apache's shape: unauthorized topics
@@ -112,13 +113,23 @@ impl Handler for TxnOffsetCommitHandler {
         // Flatten (topic, partition) → offset_key. Mirrors the
         // OffsetCommit handler's transform so the offset store sees
         // the same key shape regardless of which API staged it.
+        // A topic or partition that doesn't exist is Apache's 3, as in
+        // OffsetCommit, and isn't staged (gh #320).
+        let known = |topic: &str, partition: i32| {
+            self.broker
+                .topics
+                .get(topic)
+                .is_some_and(|m| (0..m.partition_count).contains(&partition))
+        };
         let mut offsets: HashMap<String, i64> = HashMap::new();
         for t in &req.topics {
             if denied.contains(t.name.as_str()) {
                 continue;
             }
             for p in &t.partitions {
-                offsets.insert(offset_key(&t.name, p.partition_index), p.committed_offset);
+                if known(&t.name, p.partition_index) {
+                    offsets.insert(offset_key(&t.name, p.partition_index), p.committed_offset);
+                }
             }
         }
         if !offsets.is_empty() {
@@ -126,9 +137,11 @@ impl Handler for TxnOffsetCommitHandler {
                 .store_pending(&req.group_id, req.producer_id, offsets);
         }
 
-        write_response(version, &req, |topic| {
+        write_response(version, &req, |topic, partition| {
             if denied.contains(topic) {
                 ERR_TOPIC_AUTHZ_FAILED
+            } else if !known(topic, partition) {
+                ERR_UNKNOWN_TOPIC_OR_PARTITION
             } else {
                 0
             }
@@ -139,24 +152,21 @@ impl Handler for TxnOffsetCommitHandler {
 fn write_response(
     version: i16,
     req: &txn_offset_commit::Request,
-    code_for_topic: impl Fn(&str) -> i16,
+    code_for: impl Fn(&str, i32) -> i16,
 ) -> Result<BytesMut, HandlerError> {
     let topics = req
         .topics
         .iter()
-        .map(|t| {
-            let err_code = code_for_topic(&t.name);
-            txn_offset_commit::ResponseTopic {
-                name: t.name.clone(),
-                partitions: t
-                    .partitions
-                    .iter()
-                    .map(|p| txn_offset_commit::ResponsePartition {
-                        partition_index: p.partition_index,
-                        error_code: err_code,
-                    })
-                    .collect(),
-            }
+        .map(|t| txn_offset_commit::ResponseTopic {
+            name: t.name.clone(),
+            partitions: t
+                .partitions
+                .iter()
+                .map(|p| txn_offset_commit::ResponsePartition {
+                    partition_index: p.partition_index,
+                    error_code: code_for(&t.name, p.partition_index),
+                })
+                .collect(),
         })
         .collect();
     let resp = txn_offset_commit::Response {
@@ -187,12 +197,13 @@ mod tests {
     fn broker_with_manager() -> (tempfile::TempDir, Arc<Broker>, Arc<Manager>) {
         let tmp = tempfile::tempdir().unwrap();
         let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
-        let b = Arc::new(Broker::new(
-            engine,
-            Arc::new(TopicRegistry::new()),
-            "test",
-            0,
-        ));
+        let topics = Arc::new(TopicRegistry::new());
+        topics.insert(crate::topic_registry::TopicMeta {
+            name: "t".to_owned(),
+            partition_count: 2,
+            topic_id: [0; 16],
+        });
+        let b = Arc::new(Broker::new(engine, topics, "test", 0));
         let offsets = Arc::new(OffsetStore::new(tmp.path()));
         let lookup = Arc::new(FnLookup::new(|_| None));
         let mgr = Manager::new("kaas-0", offsets, lookup, LocalGroupSource::new("kaas-0"));
@@ -255,9 +266,17 @@ mod tests {
     ) -> (tempfile::TempDir, Arc<Broker>, Arc<Manager>) {
         let tmp = tempfile::tempdir().unwrap();
         let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let topics = Arc::new(TopicRegistry::new());
+        for name in ["t", "secret"] {
+            topics.insert(crate::topic_registry::TopicMeta {
+                name: name.to_owned(),
+                partition_count: 1,
+                topic_id: [0; 16],
+            });
+        }
         let b = Arc::new(Broker::with_auth(
             engine,
-            Arc::new(TopicRegistry::new()),
+            topics,
             "test",
             0,
             auth,
@@ -293,6 +312,27 @@ mod tests {
                 committed_metadata: None,
             }],
         }
+    }
+
+    /// gh #320: a topic or partition that doesn't exist answers Apache's 3 and
+    /// isn't staged, while the rest of the request still is.
+    #[tokio::test]
+    async fn an_unknown_topic_or_partition_is_3_and_is_not_staged() {
+        let (_t, b, mgr) = broker_with_manager_and_auth(Arc::new(kaas_auth::AllowAllAuthorizer));
+        let h = TxnOffsetCommitHandler::new(b);
+        let mut out_of_range = topic("t");
+        out_of_range.partitions[0].partition_index = 9;
+        let req = request_for(vec![topic("t"), topic("nope"), out_of_range]);
+        let resp = call(&h, &req).await;
+        let codes: Vec<i16> = resp
+            .topics
+            .iter()
+            .map(|t| t.partitions[0].error_code)
+            .collect();
+        assert_eq!(codes, [0, 3, 3]);
+        let staged = mgr.offsets.pending_for("g1", 42).unwrap();
+        assert_eq!(staged.len(), 1, "{staged:?}");
+        assert!(staged.contains_key(&offset_key("t", 0)));
     }
 
     /// gh #318: a group id too long to store answers 24 and stages nothing.

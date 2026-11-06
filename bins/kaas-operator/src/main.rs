@@ -93,6 +93,8 @@ async fn main() -> Result<()> {
     let log_dirs =
         kaas_storage::parse_log_dirs_json(&std::env::var("KAAS_LOG_DIRS").unwrap_or_default())
             .map_err(|e: String| anyhow::anyhow!(e))?;
+    kaas_storage::check_cluster_dir_placement(&cluster_dir, &data_dir, &log_dirs)
+        .map_err(|e: String| anyhow::anyhow!(e))?;
     let namespace = env_or("KAAS_NAMESPACE", DEFAULT_NAMESPACE);
     let probe_addr = env_or("HEALTH_PROBE_BIND_ADDRESS", DEFAULT_PROBE_ADDR);
 

@@ -28,6 +28,7 @@ use crate::broker::Broker;
 
 const ERR_NOT_COORDINATOR: i16 = 16;
 const ERR_COORDINATOR_NOT_AVAILABLE: i16 = 15;
+const ERR_UNKNOWN_TOPIC_OR_PARTITION: i16 = 3;
 const ERR_TOPIC_AUTHZ_FAILED: i16 = 29;
 const ERR_GROUP_AUTHZ_FAILED: i16 = 30;
 
@@ -59,7 +60,7 @@ impl Handler for OffsetCommitHandler {
             &Resource::group(&req.group_id),
             Operation::Read,
         ) {
-            return write_response(version, req.topics, |_| ERR_GROUP_AUTHZ_FAILED);
+            return write_response(version, req.topics, |_, _| ERR_GROUP_AUTHZ_FAILED);
         }
         let denied: HashSet<String> = req
             .topics
@@ -74,11 +75,25 @@ impl Handler for OffsetCommitHandler {
             .map(|t| t.name.clone())
             .collect();
 
+        // Apache answers 3 for a topic or partition that doesn't exist, after
+        // the ACL, and never stores it (gh #320).
+        let known = |topic: &str, partition: i32| {
+            self.broker
+                .topics
+                .get(topic)
+                .is_some_and(|m| (0..m.partition_count).contains(&partition))
+        };
+
         // Build the offsets + metadata maps the Manager expects.
         let mut offsets: HashMap<String, i64> = HashMap::new();
         let mut metadata: HashMap<String, String> = HashMap::new();
+        let mut any_unknown = false;
         for t in req.topics.iter().filter(|t| !denied.contains(&t.name)) {
             for p in &t.partitions {
+                if !known(&t.name, p.partition_index) {
+                    any_unknown = true;
+                    continue;
+                }
                 let key = build_offset_key(&t.name, p.partition_index);
                 offsets.insert(key.clone(), p.committed_offset);
                 if let Some(m) = &p.committed_metadata {
@@ -89,9 +104,9 @@ impl Handler for OffsetCommitHandler {
             }
         }
 
-        // Nothing authorized to commit: answer the per-topic denials
+        // Nothing left to commit: answer the per-partition refusals
         // without touching (or revealing) the coordinator.
-        let group_error = if offsets.is_empty() && !denied.is_empty() {
+        let group_error = if offsets.is_empty() && (!denied.is_empty() || any_unknown) {
             0
         } else {
             match self.broker.coord_manager() {
@@ -111,9 +126,11 @@ impl Handler for OffsetCommitHandler {
             }
         };
 
-        write_response(version, req.topics, |topic| {
+        write_response(version, req.topics, |topic, partition| {
             if denied.contains(topic) {
                 ERR_TOPIC_AUTHZ_FAILED
+            } else if !known(topic, partition) {
+                ERR_UNKNOWN_TOPIC_OR_PARTITION
             } else {
                 group_error
             }
@@ -121,23 +138,22 @@ impl Handler for OffsetCommitHandler {
     }
 }
 
-/// Echo the request's `(topic, partition)` layout with a per-topic
+/// Echo the request's `(topic, partition)` layout with a per-partition
 /// error code.
 fn write_response(
     version: i16,
     topics: Vec<offset_commit::OffsetCommitTopic>,
-    code_for_topic: impl Fn(&str) -> i16,
+    code_for: impl Fn(&str, i32) -> i16,
 ) -> Result<BytesMut, HandlerError> {
     let topics_resp: Vec<offset_commit::OffsetCommitTopicResponse> = topics
         .into_iter()
         .map(|t| {
-            let error_code = code_for_topic(&t.name);
             let partitions = t
                 .partitions
                 .iter()
                 .map(|p| offset_commit::OffsetCommitPartitionResponse {
                     partition_index: p.partition_index,
-                    error_code,
+                    error_code: code_for(&t.name, p.partition_index),
                 })
                 .collect();
             offset_commit::OffsetCommitTopicResponse {

@@ -113,6 +113,54 @@ pub fn check_distinct_log_dirs(default_dir: &Path, extra: &[LogDirInfo]) -> Resu
     Ok(())
 }
 
+/// `p` with symlinks and `..` resolved, as far as it exists. The rest, which
+/// a mkdir hasn't made yet, is appended as written.
+fn real_path(p: &Path) -> PathBuf {
+    let mut missing = Vec::new();
+    let mut cur = p;
+    loop {
+        if let Ok(mut real) = std::fs::canonicalize(cur) {
+            real.extend(missing.iter().rev());
+            return real;
+        }
+        match (cur.parent(), cur.file_name()) {
+            (Some(parent), Some(name)) => {
+                missing.push(name);
+                cur = parent;
+            }
+            _ => return p.to_path_buf(),
+        }
+    }
+}
+
+/// Refuse a cluster-state dir inside a log dir (gh #320). The operator's sweep
+/// deletes every directory in a log dir that isn't a topic, so its first pass
+/// would take the cluster state with it. A topic could also collide with it.
+/// The one allowed spot is the default, `<data_dir>/__cluster`, which the sweep
+/// and topic-name validation both reserve.
+pub fn check_cluster_dir_placement(
+    cluster_dir: &Path,
+    data_dir: &Path,
+    extra: &[LogDirInfo],
+) -> Result<(), String> {
+    let real = real_path;
+    let cluster = real(cluster_dir);
+    if cluster == real(data_dir).join("__cluster") {
+        return Ok(());
+    }
+    for root in std::iter::once(data_dir).chain(extra.iter().map(|d| d.path.as_path())) {
+        if cluster.starts_with(real(root)) {
+            return Err(format!(
+                "cluster-state dir {} is inside log dir {}, where the operator's sweep would \
+                 delete it: use a path outside every log dir, or leave KAAS_CLUSTER_DIR unset",
+                cluster_dir.display(),
+                root.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// KIP-827 capacity probe: `(total_bytes, usable_bytes)` of the
 /// filesystem hosting `path`, or `(-1, -1)` — the wire sentinel —
 /// when the statvfs fails (e.g. the sentinel `memory://` dir).
@@ -435,6 +483,38 @@ pub trait StorageEngine: Send + Sync + 'static {
 #[cfg(test)]
 mod distinct_log_dir_tests {
     use super::*;
+
+    /// gh #320: inside a log dir is refused, wherever it's reached from, and
+    /// the default and a separate volume are fine.
+    #[test]
+    fn a_cluster_dir_inside_a_log_dir_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let data = tmp.path().join("data");
+        let fast = tmp.path().join("fast");
+        std::fs::create_dir_all(data.join("nested")).unwrap();
+        std::fs::create_dir_all(&fast).unwrap();
+        std::fs::create_dir_all(tmp.path().join("cluster")).unwrap();
+        let pool = [dir("fast", &fast)];
+
+        for ok in [data.join("__cluster"), tmp.path().join("cluster")] {
+            check_cluster_dir_placement(&ok, &data, &pool)
+                .unwrap_or_else(|e| unreachable!("{}: {e}", ok.display()));
+        }
+        for bad in [
+            data.join("cp"),
+            data.clone(),
+            data.join("nested/cp"),
+            fast.join("cp"),
+            fast.join("__cluster"),
+            tmp.path().join("cluster/../data/cp"),
+        ] {
+            let err = check_cluster_dir_placement(&bad, &data, &pool).unwrap_err();
+            assert!(err.contains("inside log dir"), "{}: {err}", bad.display());
+        }
+
+        std::os::unix::fs::symlink(data.join("nested"), tmp.path().join("alias")).unwrap();
+        assert!(check_cluster_dir_placement(&tmp.path().join("alias"), &data, &pool).is_err());
+    }
 
     fn dir(name: &str, path: &Path) -> LogDirInfo {
         LogDirInfo {

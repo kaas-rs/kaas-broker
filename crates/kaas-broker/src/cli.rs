@@ -540,21 +540,43 @@ fn default_listeners() -> &'static str {
 }
 
 /// Build a StatefulSet-shaped FQDN
-/// `<MY_POD_NAME>.<KAAS_HEADLESS_SVC>.<KAAS_NAMESPACE>.svc.cluster.local`
-/// when all three env vars are set. Returns `None` in local-dev
-/// mode so listeners fall back to their bind IP.
-fn derive_advertised_host() -> Option<String> {
-    let pod = env::var("MY_POD_NAME").ok().filter(|s| !s.is_empty())?;
-    let svc = env::var("KAAS_HEADLESS_SVC")
-        .ok()
-        .filter(|s| !s.is_empty())?;
-    let ns = env::var("KAAS_NAMESPACE").ok().filter(|s| !s.is_empty())?;
-    Some(format!("{pod}.{svc}.{ns}.svc.cluster.local"))
+/// `<MY_POD_NAME>.<KAAS_HEADLESS_SVC>.<KAAS_NAMESPACE>.svc.<KAAS_CLUSTER_DOMAIN>`
+/// when the first three env vars are set; the domain defaults to
+/// `cluster.local`. Returns `None` in local-dev mode so listeners fall
+/// back to their bind IP.
+pub fn derive_advertised_host() -> Option<String> {
+    let non_empty = |name: &str| env::var(name).ok().filter(|s| !s.is_empty());
+    pod_fqdn(
+        &non_empty("MY_POD_NAME")?,
+        &non_empty("KAAS_HEADLESS_SVC")?,
+        &non_empty("KAAS_NAMESPACE")?,
+        non_empty("KAAS_CLUSTER_DOMAIN").as_deref(),
+    )
+}
+
+fn pod_fqdn(pod: &str, svc: &str, ns: &str, domain: Option<&str>) -> Option<String> {
+    let domain = domain.unwrap_or("cluster.local");
+    Some(format!("{pod}.{svc}.{ns}.svc.{domain}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// gh #320: the advertised host follows `KAAS_CLUSTER_DOMAIN`. It was
+    /// hard-coded, so a cluster with another domain advertised names that
+    /// don't resolve, though the chart sets the variable.
+    #[test]
+    fn the_advertised_host_follows_the_cluster_domain() {
+        assert_eq!(
+            pod_fqdn("kaas-0", "kaas-headless", "ns", Some("corp.example")).as_deref(),
+            Some("kaas-0.kaas-headless.ns.svc.corp.example")
+        );
+        assert_eq!(
+            pod_fqdn("kaas-0", "kaas-headless", "ns", None).as_deref(),
+            Some("kaas-0.kaas-headless.ns.svc.cluster.local")
+        );
+    }
 
     #[test]
     fn default_listener_parses() {

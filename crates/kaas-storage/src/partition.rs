@@ -686,6 +686,42 @@ fn drop_covered_segments(fs: &dyn Fs, guard: &mut PartitionInner, upto: i64) -> 
     removed
 }
 
+/// gh #176 — update the open + aborted-txn indexes off one appended batch.
+/// Same byte-opacity contract: this only reads the header attrs + pid + (for
+/// control batches) the key's type byte.
+pub(crate) fn track_txn_batch(
+    batch: &[u8],
+    assigned: i64,
+    open_txns: &mut OpenTxnIndex,
+    aborted_txns: &mut AbortedTxnIndex,
+) {
+    let Some(txn_info) = parse_batch_txn_info(batch) else {
+        return;
+    };
+    // Only a batch with a producer id takes part (gh #305, as in Apache's
+    // `analyzeAndValidateProducerState`). A transactional bit with pid -1 would
+    // otherwise pin the LSO under a PID no marker can ever close.
+    if !txn_info.is_transactional || txn_info.producer_id < 0 {
+        return;
+    }
+    if txn_info.is_control {
+        // COMMIT or ABORT marker — close the open txn.
+        if let Some(first_offset) = open_txns.close(txn_info.producer_id) {
+            if matches!(txn_info.control_commit, Some(false)) {
+                aborted_txns.record(AbortedTxn {
+                    producer_id: txn_info.producer_id,
+                    first_offset,
+                    last_offset: assigned,
+                });
+            }
+        }
+    } else {
+        // Transactional data batch — record the first offset for this pid's
+        // current txn (no-op if already recorded).
+        open_txns.record_data_batch(txn_info.producer_id, assigned);
+    }
+}
+
 /// Snapshot the guarded state for publication on the lock-free read
 /// channel. Called under the inner lock everywhere the write path moves
 /// the high watermark, the log start, the epoch, or the segment set.
@@ -1163,37 +1199,13 @@ impl Partition {
                 }
             }
 
-            // gh #176 — update the open + aborted-txn indexes off the
-            // same batch. Same byte-opacity contract: we only read the
-            // header attrs + pid + (for control batches) the key's
-            // type byte.
-            if let Some(txn_info) = parse_batch_txn_info(&owned) {
-                // Only a batch with a producer id takes part (gh #305, as
-                // in Apache's `analyzeAndValidateProducerState`). A
-                // transactional bit with pid -1 would otherwise pin the LSO
-                // under a PID no marker can ever close.
-                if txn_info.is_transactional && txn_info.producer_id >= 0 {
-                    if txn_info.is_control {
-                        // COMMIT or ABORT marker — close the open txn.
-                        if let Some(first_offset) = guard.open_txns.close(txn_info.producer_id) {
-                            if matches!(txn_info.control_commit, Some(false)) {
-                                guard.aborted_txns.record(AbortedTxn {
-                                    producer_id: txn_info.producer_id,
-                                    first_offset,
-                                    last_offset: assigned,
-                                });
-                            }
-                        }
-                    } else {
-                        // Transactional data batch — record the first
-                        // offset for this pid's current txn (no-op if
-                        // already recorded).
-                        guard
-                            .open_txns
-                            .record_data_batch(txn_info.producer_id, assigned);
-                    }
-                }
-            }
+            let inner = &mut *guard;
+            track_txn_batch(
+                &owned,
+                assigned,
+                &mut inner.open_txns,
+                &mut inner.aborted_txns,
+            );
 
             // Decide whether to fire a flush request.
             let trigger = cfg.flush_interval_messages > 0
@@ -1895,7 +1907,7 @@ fn segment_mtime_ms(fs: &dyn Fs, path: &std::path::Path) -> Option<i64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::fs::RealFs;
 
@@ -2169,7 +2181,7 @@ mod tests {
     /// Build a transactional v2 data batch (attributes bit 4 set).
     /// PID is encoded; base_sequence is left at 0 so the
     /// idempotence classifier accepts as a fresh first-batch.
-    fn build_txn_data_batch(pid: i64, num_records: i32) -> Bytes {
+    pub(crate) fn build_txn_data_batch(pid: i64, num_records: i32) -> Bytes {
         let body_size = 49 + 16;
         let total = 12 + body_size;
         let mut buf = vec![0u8; total];
@@ -2212,7 +2224,7 @@ mod tests {
     /// has bits 4 (transactional) | 5 (control) set; base_sequence
     /// = -1 so the idempotence classifier returns NotIdempotent
     /// (markers don't consume sequence slots).
-    fn build_marker_batch(pid: i64, commit: bool) -> Bytes {
+    pub(crate) fn build_marker_batch(pid: i64, commit: bool) -> Bytes {
         let mut buf = vec![0u8; 70];
         buf[0..8].copy_from_slice(&0i64.to_be_bytes());
         // body_size = 58 (everything from attrs through the inline
