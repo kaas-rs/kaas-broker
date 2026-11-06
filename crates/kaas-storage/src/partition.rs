@@ -415,7 +415,11 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
             segment::scan_high_watermark_from(&mut f, 0, base)?
         }
     };
-    let hwm = scan.high_watermark;
+    // The log can end below log start: a tail lost after a purge covered it.
+    // Next offset is log start, as in Apache's `LogLoader`, or the next append
+    // lands below it, acked and unreadable (gh #325). This only skips offsets
+    // already purged, and the bytes stay until a later advance drops them.
+    let hwm = scan.high_watermark.max(log_start);
 
     // gh #226: the scan stopped at the end of the last *valid* batch,
     // but `log_size` still says "whatever stat() reported", so appends
@@ -526,6 +530,10 @@ struct PartitionInner {
     /// Sticky on first error. Subsequent appends return immediately
     /// with this error; the broker is expected to drop the partition.
     flush_err: Option<StorageError>,
+    /// `log_start` moved past what the manifest says: a volume too full to
+    /// write it dropped the segments anyway. A DeleteRecords at this offset has
+    /// to save it before it can answer success (gh #325).
+    log_start_unsaved: bool,
     /// The highest flush seq a failed log fsync may have covered. Nothing
     /// at or below it is ever acked, whatever later syncs report (gh #289):
     /// Linux reports a writeback error once per file descriptor, so the
@@ -607,6 +615,9 @@ fn delete_records_locked(
         target_offset
     };
     if new_start <= guard.log_start {
+        if guard.log_start_unsaved {
+            advance_log_start(fs, guard, guard.log_start)?;
+        }
         return Ok(guard.log_start);
     }
     // A target inside the active segment covers bytes that may not be on disk
@@ -614,15 +625,37 @@ fn delete_records_locked(
     // a crash as earliest above latest. Closed segments were synced at their
     // roll, so a sweep doesn't need this, and it mustn't refuse during a
     // stall either: freeing space is how an ENOSPC stall ends.
-    if new_start > guard.active.meta.base_offset {
-        if guard.flush_err.is_some() {
-            return Err(StorageError::Stalled);
-        }
-        if let Err(e) = guard.active.sync_log() {
-            return Err(stall_on_log_sync_failure(guard, flush, e));
+    let active_base = guard.active.meta.base_offset;
+    if new_start > active_base {
+        let stalled = if guard.flush_err.is_some() {
+            Some(StorageError::Stalled)
+        } else {
+            guard
+                .active
+                .sync_log()
+                .err()
+                .map(|e| stall_on_log_sync_failure(guard, flush, e))
+        };
+        // The active segment's bytes can't be vouched for, but the closed
+        // segments the purge covers can still go, and that may be what ends the
+        // stall (gh #325). The answer stays an error: the purge isn't done.
+        if let Some(stalled) = stalled {
+            if active_base > guard.log_start {
+                advance_log_start(fs, guard, active_base)?;
+            }
+            return Err(stalled);
         }
     }
+    advance_log_start(fs, guard, new_start)?;
+    Ok(new_start)
+}
 
+/// Make `new_start` the durable log start, then drop what it covers.
+fn advance_log_start(
+    fs: &dyn Fs,
+    guard: &mut PartitionInner,
+    new_start: i64,
+) -> Result<(), StorageError> {
     let m = Manifest {
         epoch: guard.epoch,
         high_watermark: guard.high_water,
@@ -639,6 +672,7 @@ fn delete_records_locked(
         )
     );
     if out_of_space && drop_covered_segments(fs, guard, new_start) {
+        guard.log_start_unsaved = true;
         written = manifest::write_unless_superseded(fs, &guard.dir, &m);
     }
     let written = written.map_err(|e| match e {
@@ -651,11 +685,12 @@ fn delete_records_locked(
         return Err(StorageError::EpochMismatch);
     }
     guard.log_start = new_start;
+    guard.log_start_unsaved = false;
     drop_covered_segments(fs, guard, new_start);
     // gh #177: aborted-txn entries whose span is now fully below log_start
     // can never appear in a fetchable range again.
     guard.aborted_txns.evict_below(new_start);
-    Ok(new_start)
+    Ok(())
 }
 
 /// Unlink the closed segments entirely below `upto`, returning whether any
@@ -815,6 +850,7 @@ impl Partition {
             requested_flush_seq: 0,
             completed_flush_seq: 0,
             flush_err: None,
+            log_start_unsaved: false,
             failed_flush_seq: 0,
             producer_states,
             open_txns,
@@ -4326,6 +4362,183 @@ pub(crate) mod tests {
             let answered =
                 tokio::time::timeout(Duration::from_secs(5), p.append(0, -1, batch.clone())).await;
             assert!(matches!(answered, Ok(Ok(0))), "{answered:?}");
+            p.close().await.unwrap();
+        });
+    }
+
+    /// What the manifest on disk says log start is.
+    fn saved_log_start(dir: &std::path::Path) -> i64 {
+        match manifest::read(&RealFs::new(), dir).unwrap() {
+            ReadResult::Present(m) => m.log_start_offset,
+            _ => -1,
+        }
+    }
+
+    /// gh #325: a purge into the active segment during a stall can't vouch for
+    /// that segment's bytes, but the closed segments it covers still go. On a
+    /// full volume that can be what ends the stall. It answers `Stalled`, and
+    /// the active segment's records are still there. Both ways into the stall:
+    /// already stalled, or this purge's own sync failing.
+    #[test]
+    fn a_purge_during_a_stall_frees_the_closed_segments() {
+        for stall_first in [true, false] {
+            let tmp = tempfile::tempdir().unwrap();
+            rt().block_on(async {
+                let (journal, p) = journaled_partition(tmp.path(), 5).await;
+                if stall_first {
+                    p.inner.lock().flush_err = Some(StorageError::Stalled);
+                } else {
+                    journal
+                        .fail_next_file_sync
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+
+                assert!(matches!(
+                    p.delete_records(-1).await,
+                    Err(StorageError::Stalled)
+                ));
+                assert_eq!(logs_in(tmp.path()), 1, "stall_first={stall_first}");
+                assert_eq!(p.log_start_offset(), 4);
+                assert_eq!(saved_log_start(tmp.path()), 4);
+                assert_eq!(p.high_watermark(), 5);
+                assert!(p.inner.lock().flush_err.is_some());
+            });
+        }
+    }
+
+    /// gh #325: a stalled partition's purge still goes through the epoch fence:
+    /// a fenced leader frees nothing, stall or no stall.
+    #[test]
+    fn a_fenced_leader_purges_nothing_during_a_stall() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let (_journal, p) = journaled_partition(tmp.path(), 5).await;
+            p.inner.lock().flush_err = Some(StorageError::Stalled);
+            manifest::write_unchecked(
+                &RealFs::new(),
+                tmp.path(),
+                &Manifest {
+                    epoch: 9,
+                    high_watermark: 5,
+                    log_start_offset: 0,
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                p.delete_records(-1).await,
+                Err(StorageError::EpochMismatch)
+            ));
+            assert_eq!(logs_in(tmp.path()), 5);
+        });
+    }
+
+    /// gh #325: on a full volume the segments can go while the manifest write
+    /// still fails, so log start in memory already equals the target. A retry
+    /// mustn't read that as done and answer success with the manifest behind:
+    /// a power cut before the unlinks reached the disk would bring the records
+    /// back after an answered success.
+    #[test]
+    fn a_retry_saves_a_log_start_a_full_volume_couldnt() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let (journal, p) = journaled_partition(tmp.path(), 5).await;
+            journal
+                .no_space
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(p.delete_records(3).await.is_err());
+            assert_eq!(p.log_start_offset(), 3);
+            assert_ne!(saved_log_start(tmp.path()), 3);
+
+            // Still full: the retry can't claim success either.
+            assert!(p.delete_records(3).await.is_err());
+            assert_ne!(saved_log_start(tmp.path()), 3);
+
+            journal
+                .no_space
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(p.delete_records(3).await.unwrap(), 3);
+            assert_eq!(saved_log_start(tmp.path()), 3);
+
+            // Once saved, a repeat writes nothing.
+            journal.ops.lock().clear();
+            assert_eq!(p.delete_records(3).await.unwrap(), 3);
+            assert!(journal.ops.lock().is_empty(), "{:?}", journal.ops.lock());
+        });
+    }
+
+    /// gh #325: a target inside a segment is the case the clamp at open can't
+    /// cover, because the first segment left starts below it. Only the saved
+    /// log start stops those offsets coming back after a crash.
+    #[test]
+    fn a_purge_inside_a_segment_survives_a_crash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        rt().block_on(async {
+            let two_per_segment = || PartitionConfig {
+                segment_bytes: u64::try_from(build_batch(1, 1_000).len() * 2).unwrap(),
+                ..Default::default()
+            };
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Partition::open(fs.clone(), "t".into(), 0, dir.clone(), two_per_segment())
+                .await
+                .unwrap();
+            for _ in 0..6 {
+                p.append(0, -1, build_batch(1, 1_000)).await.unwrap();
+            }
+            assert_eq!(p.delete_records(3).await.unwrap(), 3);
+            assert_eq!(logs_in(&dir), 2, "the segment holding offset 3 stays");
+
+            // A second open with no close: what a restart after SIGKILL does.
+            let reopened = Partition::open(fs, "t".into(), 0, dir.clone(), two_per_segment())
+                .await
+                .unwrap();
+            assert_eq!(reopened.log_start_offset(), 3, "the purge was lost");
+            assert_eq!(reopened.high_watermark(), 6);
+        });
+    }
+
+    /// gh #325: a log that ends below log start restarts at log start, as in
+    /// Apache's `LogLoader`. Earliest and latest agree, and the next append
+    /// lands where it can be read. It used to land at the old log end, acked and
+    /// below log start.
+    #[test]
+    fn a_log_ending_below_log_start_restarts_at_log_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().to_path_buf();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = Partition::open(
+                fs.clone(),
+                "t".into(),
+                0,
+                dir.clone(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            for _ in 0..3 {
+                p.append(0, -1, build_batch(1, 1_000)).await.unwrap();
+            }
+            p.close().await.unwrap();
+            manifest::write_unchecked(
+                fs.as_ref(),
+                &dir,
+                &Manifest {
+                    epoch: 0,
+                    high_watermark: 5,
+                    log_start_offset: 5,
+                },
+            )
+            .unwrap();
+
+            let p = Partition::open(fs, "t".into(), 0, dir.clone(), PartitionConfig::default())
+                .await
+                .unwrap();
+            assert_eq!(p.log_start_offset(), 5);
+            assert_eq!(p.high_watermark(), 5);
+            assert_eq!(p.append(0, -1, build_batch(1, 1_000)).await.unwrap(), 5);
+            assert_eq!(p.high_watermark(), 6);
+            assert!(!p.read(5, 1 << 20).await.unwrap().is_empty());
             p.close().await.unwrap();
         });
     }

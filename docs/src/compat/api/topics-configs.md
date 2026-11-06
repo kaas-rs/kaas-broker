@@ -174,6 +174,10 @@ segments go first, because nothing else makes room, and a broker clamps log star
 to its first segment's base on open, as Apache does, so a crash in between can't
 bring them back either. If the write still fails, the answer is
 `KAFKA_STORAGE_ERROR` (56), and log start reflects whatever was freed.
+A retry saves the log start before it can answer success (gh #325). During a
+stall, a target inside the active segment answers `LEADER_NOT_AVAILABLE` (5),
+because that segment's bytes can't be vouched for, but the closed segments the
+purge covers still go, which may be what ends the stall.
 
 **Deviations from Apache 3.7**:
 
