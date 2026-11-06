@@ -83,9 +83,9 @@ use crate::election::LeaseElection;
 pub const DEFAULT_LEASE_DURATION: Duration = Duration::from_secs(15);
 pub const DEFAULT_RENEW_DEADLINE: Duration = Duration::from_secs(10);
 pub const DEFAULT_RETRY_PERIOD: Duration = Duration::from_secs(2);
-/// The least a renew attempt gets, however little of the renew window is left, so
-/// a stall of the task itself doesn't cost a lease that's still ours. Capped so
-/// the window plus this stays within the lease.
+/// What a renew attempt gets when the window ran out with no failure, so a stall
+/// of the task itself doesn't cost a lease that's still ours. Capped at the gap
+/// between the window and the lease.
 const MIN_RENEW_ATTEMPT: Duration = Duration::from_secs(3);
 
 /// client-go's leader-election jitter factor: the renew deadline must
@@ -489,6 +489,33 @@ impl KubeLeaseElection {
     /// Returns only when `cancel` fires (best-effort releasing the
     /// Lease if held).
     ///
+    /// Retry until elected. Also returns when the winning attempt started, which
+    /// is what the renew window counts from: the lease was stamped after that, and
+    /// the answer may have been slow (gh #334).
+    async fn acquire_stamped(&self) -> (i64, Instant) {
+        let started = std::time::Instant::now();
+        loop {
+            let attempt_started = Instant::now();
+            match self.try_acquire().await {
+                Ok(Some(epoch)) => {
+                    if self.controller_metrics {
+                        let m = kaas_observability::metrics::global();
+                        m.controller_failovers.add(1, &[]);
+                        m.controller_failover_duration
+                            .record(started.elapsed().as_secs_f64(), &[]);
+                    }
+                    return (epoch, attempt_started);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    let (code, reason, message) = error_fields(&err);
+                    warn!(code, reason, %message, "lease election: try_acquire failed; retrying");
+                }
+            }
+            tokio::time::sleep(self.retry_period).await;
+        }
+    }
+
     /// Leader-election callbacks: `on_acquired` ≙
     /// start-of-leadership (spawn controller tasks bound to the
     /// token), `on_lost` ≙ `OnStoppedLeading` — invoked
@@ -505,22 +532,36 @@ impl KubeLeaseElection {
         G: Fn() + Send + Sync,
     {
         loop {
-            let epoch = tokio::select! {
+            let (epoch, mut last_renewed) = tokio::select! {
                 () = cancel.cancelled() => return,
-                epoch = self.acquire() => epoch,
+                won = self.acquire_stamped() => won,
             };
+
+            // Leadership: renew until loss or shutdown. Failures are tolerated until
+            // `renew_deadline` past the start of the last attempt that landed, as in
+            // client-go (the lease was stamped after that start). This is what puts
+            // the abdication inside the lease (gh #334): it used to count from the
+            // end of the first failed attempt, so a hung call read as no failure yet
+            // and a leader ran on for 24 s.
+            //
+            // Nothing outlives the window: a retry's sleep and a failing attempt
+            // both stop at its end, and that's the only place this abdicates. With
+            // no failure yet and nothing left, it was this task that stalled and the
+            // lease may still be ours, so it gets one attempt, of at most the gap
+            // between the window and the lease. So a holder is gone within
+            // `lease_duration` of the last renew that landed, stalls aside.
+            if last_renewed.elapsed() >= self.renew_deadline {
+                // The answer took so long the lease is nearly spent. Don't start
+                // anything on it. If it's still ours, the next attempt stamps it.
+                warn!(identity = %self.identity, "lease won too slowly to use; re-reading");
+                continue;
+            }
             info!(epoch, identity = %self.identity, "lease acquired");
             let leader_token = cancel.child_token();
             on_acquired(epoch, leader_token.clone());
-
-            // Leadership: renew until loss or shutdown. Failures are
-            // tolerated until `renew_deadline` past the last renew that
-            // landed, as in client-go. Counting from there is what puts the
-            // abdication before the lease can expire (gh #334): it used to
-            // count from the end of the first failed attempt, so a hung call
-            // read as no failure yet and a leader ran on for 24 s.
-            let mut last_renewed = Instant::now();
+            let mut failing = false;
             loop {
+                let left = self.renew_deadline.saturating_sub(last_renewed.elapsed());
                 tokio::select! {
                     () = cancel.cancelled() => {
                         on_lost();
@@ -539,26 +580,38 @@ impl KubeLeaseElection {
                         self.release().await;
                         break;
                     }
-                    () = tokio::time::sleep(self.retry_period) => {}
+                    () = tokio::time::sleep(self.retry_period.min(left)) => {}
                 }
-                // A single kube call must never block the loop past
-                // the renew window — the API server on a loaded node
-                // can stall for tens of seconds (observed p99 1.7 s,
-                // long tail ≫ lease_duration during pod churn) and an
-                // unbounded call here is how the lease gets stolen
-                // out from under a healthy controller. An attempt gets what's
-                // left of the window: one slow-but-live call may use all of
-                // it, and a hung one burns it once and we abdicate cleanly.
-                let attempt_budget = self
-                    .renew_deadline
-                    .saturating_sub(last_renewed.elapsed())
-                    .max(
+                let left = self.renew_deadline.saturating_sub(last_renewed.elapsed());
+                if failing && left.is_zero() {
+                    warn!(
+                        identity = %self.identity,
+                        renew_deadline_seconds = self.renew_deadline.as_secs(),
+                        "lease renew kept failing to the deadline; abdicating"
+                    );
+                    break;
+                }
+                // A single kube call must never block the loop past the
+                // renew window: the API server on a loaded node can stall
+                // for tens of seconds (observed p99 1.7 s, long tail much
+                // longer than the lease during pod churn) and an unbounded
+                // call here is how the lease gets stolen out from under a
+                // healthy controller. One slow-but-live call may use all
+                // that's left, and a hung one burns it once.
+                let attempt_budget = if failing {
+                    left
+                } else {
+                    left.max(
                         MIN_RENEW_ATTEMPT
                             .min(self.lease_duration.saturating_sub(self.renew_deadline)),
-                    );
+                    )
+                };
                 let attempt_started = Instant::now();
                 match tokio::time::timeout(attempt_budget, self.try_renew()).await {
-                    Ok(Ok(LeaseWrite::Written)) => last_renewed = attempt_started,
+                    Ok(Ok(LeaseWrite::Written)) => {
+                        last_renewed = attempt_started;
+                        failing = false;
+                    }
                     Ok(Ok(LeaseWrite::NotHolder { holder, epoch })) => {
                         warn!(
                             identity = %self.identity,
@@ -575,37 +628,22 @@ impl KubeLeaseElection {
                     }
                     Ok(Ok(LeaseWrite::Conflict)) => {
                         record_conflict("renew");
-                        if last_renewed.elapsed() >= self.renew_deadline {
-                            warn!(identity = %self.identity,
-                                  "lease kept changing under our renew past \
-                                   renew_deadline; abdicating");
-                            break;
-                        }
+                        failing = true;
                         warn!(identity = %self.identity,
                               "lease written by someone else since our read (409); \
-                               re-reading next tick to check we still hold it");
+                               re-reading to check we still hold it");
                     }
                     Ok(Err(err)) => {
                         let (code, reason, message) = error_fields(&err);
-                        if last_renewed.elapsed() >= self.renew_deadline {
-                            warn!(
-                                code,
-                                reason,
-                                %message,
-                                "lease renew failed past renew_deadline; abdicating"
-                            );
-                            break;
-                        }
-                        warn!(code, reason, %message, "lease renew failed; retrying");
+                        failing = true;
+                        warn!(code, reason, %message, "lease renew failed");
                     }
                     Err(_elapsed) => {
-                        if last_renewed.elapsed() >= self.renew_deadline {
-                            warn!("lease renew timed out past renew_deadline; abdicating");
-                            break;
-                        }
+                        failing = true;
                         warn!(
-                            budget_s = attempt_budget.as_secs(),
-                            "lease renew attempt timed out; retrying"
+                            budget_ms =
+                                u64::try_from(attempt_budget.as_millis()).unwrap_or(u64::MAX),
+                            "lease renew attempt timed out"
                         );
                     }
                 }
@@ -619,26 +657,7 @@ impl KubeLeaseElection {
 #[async_trait]
 impl LeaseElection for KubeLeaseElection {
     async fn acquire(&self) -> i64 {
-        let started = std::time::Instant::now();
-        loop {
-            match self.try_acquire().await {
-                Ok(Some(epoch)) => {
-                    if self.controller_metrics {
-                        let m = kaas_observability::metrics::global();
-                        m.controller_failovers.add(1, &[]);
-                        m.controller_failover_duration
-                            .record(started.elapsed().as_secs_f64(), &[]);
-                    }
-                    return epoch;
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    let (code, reason, message) = error_fields(&err);
-                    warn!(code, reason, %message, "lease election: try_acquire failed; retrying");
-                }
-            }
-            tokio::time::sleep(self.retry_period).await;
-        }
+        self.acquire_stamped().await.0
     }
 
     fn identity(&self) -> String {
@@ -697,6 +716,8 @@ mod tests {
         /// writer landing between a caller's read and its write.
         pending_write: Mutex<Option<ForeignWrite>>,
         outage: Mutex<Outage>,
+        /// A write lands at once, and its answer takes this long.
+        write_answer_delay: Mutex<Duration>,
     }
 
     /// What the API server does instead of answering.
@@ -704,8 +725,16 @@ mod tests {
     enum Outage {
         #[default]
         None,
+        /// Never answers.
         Hang,
-        Unavailable,
+        /// 503, after this long.
+        Unavailable(Duration),
+        /// Reads answer and writes never do.
+        HangWrites,
+        /// Reads answer and writes get a 409.
+        RejectWrites,
+        /// Works, taking this long per call.
+        Slow(Duration),
     }
 
     type ForeignWrite = Box<dyn FnOnce(&mut Lease) + Send>;
@@ -714,11 +743,13 @@ mod tests {
     struct Stored {
         lease: Option<Lease>,
         version: u64,
+        written_at: Option<Instant>,
     }
 
     impl Stored {
         fn put(&mut self, mut lease: Lease) -> Lease {
             self.version += 1;
+            self.written_at = Some(Instant::now());
             lease.metadata.resource_version = Some(self.version.to_string());
             self.lease = Some(lease.clone());
             lease
@@ -756,10 +787,18 @@ mod tests {
 
         async fn handle(&self, req: http::Request<Body>) -> http::Response<Body> {
             let outage = *self.outage.lock();
+            let is_write = req.method() != http::Method::GET;
             match outage {
                 Outage::None => {}
                 Outage::Hang => return std::future::pending().await,
-                Outage::Unavailable => return status(503, "ServiceUnavailable"),
+                Outage::Unavailable(after) => {
+                    tokio::time::sleep(after).await;
+                    return status(503, "ServiceUnavailable");
+                }
+                Outage::HangWrites if is_write => return std::future::pending().await,
+                Outage::RejectWrites if is_write => return status(409, "Conflict"),
+                Outage::HangWrites | Outage::RejectWrites => {}
+                Outage::Slow(each) => tokio::time::sleep(each).await,
             }
             let (parts, body) = req.into_parts();
             let body = body.collect().await.expect("request body").to_bytes();
@@ -791,22 +830,32 @@ mod tests {
                 }
                 ("PUT", true) => {
                     let incoming: Lease = serde_json::from_slice(&body).expect("lease body");
-                    let mut stored = self.stored.lock();
-                    match stored.lease.as_ref().map(|l| &l.metadata.resource_version) {
-                        None => status(404, "NotFound"),
-                        Some(current) if *current != incoming.metadata.resource_version => {
-                            status(409, "Conflict")
+                    let answer = {
+                        let mut stored = self.stored.lock();
+                        match stored.lease.as_ref().map(|l| &l.metadata.resource_version) {
+                            None => status(404, "NotFound"),
+                            Some(current) if *current != incoming.metadata.resource_version => {
+                                status(409, "Conflict")
+                            }
+                            Some(_) => reply(200, &stored.put(incoming)),
                         }
-                        Some(_) => reply(200, &stored.put(incoming)),
-                    }
+                    };
+                    let delay = *self.write_answer_delay.lock();
+                    tokio::time::sleep(delay).await;
+                    answer
                 }
                 ("POST", false) => {
                     let incoming: Lease = serde_json::from_slice(&body).expect("lease body");
-                    let mut stored = self.stored.lock();
-                    if stored.lease.is_some() {
-                        return status(409, "AlreadyExists");
-                    }
-                    reply(201, &stored.put(incoming))
+                    let answer = {
+                        let mut stored = self.stored.lock();
+                        if stored.lease.is_some() {
+                            return status(409, "AlreadyExists");
+                        }
+                        reply(201, &stored.put(incoming))
+                    };
+                    let delay = *self.write_answer_delay.lock();
+                    tokio::time::sleep(delay).await;
+                    answer
                 }
                 _ => status(405, "MethodNotAllowed"),
             }
@@ -993,86 +1042,246 @@ mod tests {
         );
     }
 
+    /// (lease, renew, retry) in seconds. The defaults, the live broker's, and tight
+    /// ones `validate_timings` accepts, where a sloppy bound shows.
+    const TIMINGS: [(u64, u64, u64); 4] = [(15, 10, 2), (30, 20, 2), (15, 14, 1), (10, 8, 1)];
+
+    struct Leader {
+        cancel: CancellationToken,
+        elected: Arc<tokio::sync::Notify>,
+        lost: Arc<tokio::sync::Notify>,
+    }
+
+    fn campaign(server: &Arc<FakeApiServer>, (lease, renew, retry): (u64, u64, u64)) -> Leader {
+        let s = Duration::from_secs;
+        let leader = Leader {
+            cancel: CancellationToken::new(),
+            elected: Arc::new(tokio::sync::Notify::new()),
+            lost: Arc::new(tokio::sync::Notify::new()),
+        };
+        let (on_elected, on_lost) = (leader.elected.clone(), leader.lost.clone());
+        tokio::spawn(
+            server
+                .election("kaas-1")
+                .with_timings(s(lease), s(renew), s(retry))
+                .campaign(
+                    leader.cancel.clone(),
+                    move |_, _| on_elected.notify_one(),
+                    move || on_lost.notify_one(),
+                ),
+        );
+        leader
+    }
+
     /// A candidate campaigning against `server`, up to the point it's elected.
-    /// `lost` fires when it stops leading.
-    async fn leader(server: &Arc<FakeApiServer>) -> (CancellationToken, Arc<tokio::sync::Notify>) {
-        let elected = Arc::new(tokio::sync::Notify::new());
-        let lost = Arc::new(tokio::sync::Notify::new());
-        let cancel = CancellationToken::new();
-        let (on_elected, on_lost) = (elected.clone(), lost.clone());
-        tokio::spawn(server.election("kaas-1").campaign(
-            cancel.clone(),
-            move |_, _| on_elected.notify_one(),
-            move || on_lost.notify_one(),
-        ));
-        elected.notified().await;
-        (cancel, lost)
+    async fn leader(server: &Arc<FakeApiServer>, timings: (u64, u64, u64)) -> Leader {
+        let leader = campaign(server, timings);
+        leader.elected.notified().await;
+        leader
     }
 
     fn renewed_at(lease: &Lease) -> Option<MicroTime> {
         lease.spec.as_ref()?.renew_time.clone()
     }
 
+    /// How long after the last write that landed it stopped leading.
+    async fn led_past_the_last_write(server: &FakeApiServer, leader: &Leader) -> Duration {
+        tokio::time::timeout(Duration::from_secs(300), leader.lost.notified())
+            .await
+            .expect("it never gave up the lease");
+        let written_at = server.stored.lock().written_at.expect("it won a lease");
+        written_at.elapsed()
+    }
+
     /// gh #334: with every call hanging, the leader has to give up before anyone
     /// else can take the lease. It took 24 s against a 15 s lease.
     #[tokio::test(start_paused = true)]
     async fn a_hung_api_server_costs_the_lease_before_it_can_expire() {
-        let server = Arc::new(FakeApiServer::default());
-        let (_cancel, lost) = leader(&server).await;
+        for (lease, renew, retry) in TIMINGS {
+            let server = Arc::new(FakeApiServer::default());
+            let me = leader(&server, (lease, renew, retry)).await;
+            *server.outage.lock() = Outage::Hang;
 
+            let led = led_past_the_last_write(&server, &me).await;
+
+            assert!(
+                led <= Duration::from_secs(renew),
+                "{lease}/{renew}/{retry}: it led for {led:?} past its last renew"
+            );
+            me.cancel.cancel();
+        }
+    }
+
+    /// The bound holds whatever the outage looks like and wherever in the cycle it
+    /// starts. Errors that run almost to the deadline used to get a retry's sleep and
+    /// a minimum-length attempt on top, past the lease on tight timings.
+    #[tokio::test(start_paused = true)]
+    async fn no_outage_outlives_the_renew_window() {
+        let ms = Duration::from_millis;
+        for (lease, renew, retry) in TIMINGS {
+            let window = Duration::from_secs(renew);
+            let errors_then_hang = [ms(10), ms(70)].into_iter().flat_map(|latency| {
+                (0..renew * 1000)
+                    .step_by(397)
+                    .map(move |until| (Outage::Unavailable(latency), ms(until), Outage::Hang))
+            });
+            let outages = errors_then_hang
+                .chain([(Outage::HangWrites, ms(0), Outage::HangWrites)])
+                .chain([(Outage::RejectWrites, ms(0), Outage::RejectWrites)])
+                .chain([(
+                    Outage::Unavailable(ms(1)),
+                    ms(0),
+                    Outage::Unavailable(ms(1)),
+                )]);
+            for (first, until, then) in outages {
+                let server = Arc::new(FakeApiServer::default());
+                let me = leader(&server, (lease, renew, retry)).await;
+                *server.outage.lock() = first;
+                tokio::time::sleep(until).await;
+                *server.outage.lock() = then;
+
+                let led = led_past_the_last_write(&server, &me).await;
+
+                assert!(
+                    led <= window,
+                    "{lease}/{renew}/{retry}, switching at {until:?}: it led for {led:?}"
+                );
+                me.cancel.cancel();
+            }
+        }
+    }
+
+    /// The window counts from the start of the attempt that landed, not its end: the
+    /// lease was stamped in between. Slow calls then a hang.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_renew_does_not_extend_the_window() {
+        let server = Arc::new(FakeApiServer::default());
+        let me = leader(&server, (15, 10, 2)).await;
+        *server.outage.lock() = Outage::Slow(Duration::from_secs(2));
+        let renews = server.stored.lock().version;
+        while server.stored.lock().version == renews {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         *server.outage.lock() = Outage::Hang;
-        let started = Instant::now();
-        tokio::time::timeout(Duration::from_secs(60), lost.notified())
-            .await
-            .expect("it never gave up the lease");
+
+        let led = led_past_the_last_write(&server, &me).await;
+
+        // The write landed 2 s into the attempt, after a read that took 2 s.
+        assert!(
+            led <= Duration::from_secs(8),
+            "it led for {led:?} past a renew that started 2 s before it landed"
+        );
+    }
+
+    /// The first window counts from when the winning attempt started. It started when
+    /// the answer came back, so a slow answer then a hang ran for 18 s against a 15 s
+    /// lease.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_answer_to_the_acquire_counts_against_the_window() {
+        let server = Arc::new(FakeApiServer::default());
+        *server.write_answer_delay.lock() = Duration::from_secs(8);
+        let me = leader(&server, (15, 10, 2)).await;
+        *server.outage.lock() = Outage::Hang;
+
+        let led = led_past_the_last_write(&server, &me).await;
 
         assert!(
-            started.elapsed() < DEFAULT_LEASE_DURATION,
-            "it led for {:?}, past the lease",
-            started.elapsed()
+            led <= Duration::from_secs(15),
+            "it led for {led:?} past a lease stamped before the slow answer"
         );
+    }
+
+    /// An answer so slow the window is already over: nothing starts on that lease.
+    #[tokio::test(start_paused = true)]
+    async fn a_win_too_slow_to_use_starts_nothing() {
+        let server = Arc::new(FakeApiServer::default());
+        *server.write_answer_delay.lock() = Duration::from_secs(12);
+        let me = campaign(&server, (15, 10, 2));
+
+        // Past the answer, at 12 s.
+        assert!(
+            tokio::time::timeout(Duration::from_secs(13), me.elected.notified())
+                .await
+                .is_err(),
+            "it started on a lease with 3 s left and no renew to its name"
+        );
+        // Answers come back quickly now, so an attempt after the one in flight takes
+        // it for real.
+        *server.write_answer_delay.lock() = Duration::ZERO;
+        tokio::time::timeout(Duration::from_secs(30), me.elected.notified())
+            .await
+            .expect("it should win once answers are prompt");
     }
 
     /// The other side: a blip shorter than the window costs nothing, however long
     /// it has been leading, since each renew restarts the window.
     #[tokio::test(start_paused = true)]
     async fn a_brief_outage_keeps_the_lease() {
-        let server = Arc::new(FakeApiServer::default());
-        let (_cancel, lost) = leader(&server).await;
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        for outage in [Outage::Unavailable(Duration::ZERO), Outage::RejectWrites] {
+            let server = Arc::new(FakeApiServer::default());
+            let me = leader(&server, (15, 10, 2)).await;
+            tokio::time::sleep(Duration::from_secs(30)).await;
 
-        *server.outage.lock() = Outage::Unavailable;
-        tokio::time::sleep(Duration::from_secs(6)).await;
-        *server.outage.lock() = Outage::None;
-        let before = renewed_at(&server.lease());
+            *server.outage.lock() = outage;
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            *server.outage.lock() = Outage::None;
+            let before = renewed_at(&server.lease());
 
-        assert!(
-            tokio::time::timeout(Duration::from_secs(30), lost.notified())
-                .await
-                .is_err(),
-            "a 6 s outage cost the lease"
-        );
-        assert_ne!(renewed_at(&server.lease()), before, "it stopped renewing");
-        assert_eq!(holder(&server.lease()), Some("kaas-1"));
+            assert!(
+                tokio::time::timeout(Duration::from_secs(30), me.lost.notified())
+                    .await
+                    .is_err(),
+                "a 6 s outage cost the lease"
+            );
+            assert_ne!(renewed_at(&server.lease()), before, "it stopped renewing");
+            assert_eq!(holder(&server.lease()), Some("kaas-1"));
+            me.cancel.cancel();
+        }
     }
 
     /// A stall of the task itself, past the whole window, doesn't cost a lease
-    /// that's still ours: the next attempt still gets its minimum.
+    /// that's still ours: the next attempt still gets its minimum. A blip that was
+    /// over before the stall doesn't count against it.
     #[tokio::test(start_paused = true)]
     async fn a_stall_past_the_window_still_gets_an_attempt() {
         let server = Arc::new(FakeApiServer::default());
-        let (_cancel, lost) = leader(&server).await;
+        let me = leader(&server, (15, 10, 2)).await;
+        *server.outage.lock() = Outage::Unavailable(Duration::ZERO);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        *server.outage.lock() = Outage::None;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         let before = renewed_at(&server.lease());
 
         tokio::time::advance(DEFAULT_RENEW_DEADLINE + Duration::from_secs(2)).await;
 
         assert!(
-            tokio::time::timeout(Duration::from_secs(20), lost.notified())
+            tokio::time::timeout(Duration::from_secs(20), me.lost.notified())
                 .await
                 .is_err(),
             "the stall cost the lease"
         );
         assert_ne!(renewed_at(&server.lease()), before, "it stopped renewing");
+    }
+
+    /// After a stall that attempt is short: never past the lease's own gap beyond the
+    /// window, so a hang found by a stalled leader doesn't run on.
+    #[tokio::test(start_paused = true)]
+    async fn the_attempt_after_a_stall_is_capped_at_the_leases_gap() {
+        let server = Arc::new(FakeApiServer::default());
+        let me = leader(&server, (15, 14, 1)).await;
+        *server.outage.lock() = Outage::Hang;
+
+        tokio::time::advance(Duration::from_secs(14)).await;
+        let stalled_until = Instant::now();
+        tokio::time::timeout(Duration::from_secs(60), me.lost.notified())
+            .await
+            .expect("it never gave up the lease");
+
+        assert!(
+            stalled_until.elapsed() <= Duration::from_secs(1),
+            "the attempt ran {:?}, past the 1 s between the window and the lease",
+            stalled_until.elapsed()
+        );
     }
 
     #[test]
