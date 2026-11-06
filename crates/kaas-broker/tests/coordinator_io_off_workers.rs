@@ -27,7 +27,8 @@ use kaas_broker::txn_markers::{reconcile_pending_markers, sweep_transactions};
 use kaas_broker::{
     AddOffsetsToTxnHandler, AddPartitionsToTxnHandler, Broker, DeleteGroupsHandler,
     DescribeGroupsHandler, EndTxnHandler, InitProducerIdHandler, JoinGroupHandler,
-    OffsetCommitHandler, OffsetDeleteHandler, OffsetFetchHandler, TopicMeta, TopicRegistry,
+    OffsetCommitHandler, OffsetDeleteHandler, OffsetFetchHandler, ProducerIdAllocator, TopicMeta,
+    TopicRegistry, PID_BLOCK, PRODUCER_ID_DIR,
 };
 use kaas_codec::api::common::{write_array_len, write_str};
 use kaas_codec::api::{
@@ -562,6 +563,38 @@ async fn the_fence_on_a_rejoin_stays_off_the_workers() {
     parks_nothing(&gate, &task).await;
     task.await.unwrap();
     writer.join().unwrap();
+}
+
+/// An idempotent producer takes no lock in the txn store, but every 1000th PID
+/// persists the next block (gh #332). A FIFO stands in for the temp file: opening
+/// it to write blocks until something reads the other end.
+#[tokio::test]
+async fn a_new_pid_block_stays_off_the_workers() {
+    let c = cluster();
+    c.broker
+        .install_producer_id_allocator(Arc::new(ProducerIdAllocator::open(&c.root, 0).unwrap()));
+    for _ in 0..PID_BLOCK {
+        c.broker.next_producer_id();
+    }
+    let fifo = c.root.join(PRODUCER_ID_DIR).join("kaas-0.json.tmp");
+    mkfifo(&fifo);
+    let gate = Arc::new(Gate::default());
+    let stop = gate.clone();
+    let reader = std::thread::spawn(move || {
+        stop.wait();
+        let _ = std::fs::read(&fifo);
+    });
+    let mut body = BytesMut::new();
+    write_i16(&mut body, -1); // a null transactional id
+    write_i32(&mut body, 60_000);
+
+    let task = request(InitProducerIdHandler::new(c.broker.clone()), 0, body);
+    parks_nothing(&gate, &task).await;
+    let mut out = task.await.unwrap();
+    let resp = init_producer_id::decode_response(&mut out, 0).unwrap();
+    assert_eq!(resp.error_code, 0);
+    assert!(resp.producer_id > 0);
+    reader.join().unwrap();
 }
 
 // --- the reaper's tick ----------------------------------------------------

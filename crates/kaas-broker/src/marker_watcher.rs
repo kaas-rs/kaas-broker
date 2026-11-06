@@ -21,7 +21,6 @@
 //! [`crate::control_batch::build_control_batch`] and appends with
 //! `acks = -1`.
 
-use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -111,9 +110,10 @@ impl MarkerWatcher {
     }
 
     /// Single synchronous-style pass. Exposed so integration tests
-    /// can drive the watcher deterministically.
+    /// can drive the watcher deterministically. Its file work is `tokio::fs`,
+    /// so it stays off the scheduler workers (gh #332).
     pub async fn tick(&self) {
-        let entries = match fs::read_dir(&self.inbox) {
+        let mut entries = match tokio::fs::read_dir(&self.inbox).await {
             Ok(e) => e,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(e) => {
@@ -131,7 +131,7 @@ impl MarkerWatcher {
         // async applier work — avoids holding the directory iterator
         // across an await.
         let mut files: Vec<PathBuf> = Vec::new();
-        for e in entries.flatten() {
+        while let Ok(Some(e)) = entries.next_entry().await {
             if !e.file_name().to_string_lossy().ends_with(".json") {
                 continue;
             }
@@ -144,7 +144,7 @@ impl MarkerWatcher {
     }
 
     async fn process_one(&self, path: &std::path::Path) {
-        let data = match fs::read(path) {
+        let data = match tokio::fs::read(path).await {
             Ok(d) => d,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
             Err(e) => {
@@ -165,7 +165,7 @@ impl MarkerWatcher {
             Err(e) => {
                 let mut aside = path.as_os_str().to_owned();
                 aside.push(".bad");
-                match fs::rename(path, &aside) {
+                match tokio::fs::rename(path, &aside).await {
                     Ok(()) => tracing::error!(
                         file = %path.display(),
                         %e,
@@ -185,7 +185,7 @@ impl MarkerWatcher {
         };
         match self.applier.apply(&entry).await {
             ApplyOutcome::Applied => {
-                if let Err(e) = fs::remove_file(path) {
+                if let Err(e) = tokio::fs::remove_file(path).await {
                     tracing::warn!(
                         file = %path.display(),
                         %e,
@@ -206,6 +206,7 @@ mod tests {
     use super::*;
     use kaas_coordinator::{MarkerQueue, TxnTopic};
     use parking_lot::Mutex;
+    use std::fs;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[derive(Default)]
@@ -355,5 +356,43 @@ mod tests {
         q.enqueue("kaas-0", &entry(42, 3)).unwrap();
         w.tick().await;
         assert_eq!(ticks.load(Ordering::SeqCst), 2);
+    }
+
+    /// gh #332: a FIFO stands in for a slow volume: reading it blocks until
+    /// something opens the other end. On this one-thread runtime the sleep can't
+    /// end if the read is waiting on the worker.
+    #[tokio::test]
+    async fn a_slow_read_stays_off_the_workers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inbox = tmp.path().join("to-kaas-0");
+        fs::create_dir_all(&inbox).unwrap();
+        let fifo = inbox.join("1-0.json");
+        let made = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let body = serde_json::to_vec(&entry(1, 0)).unwrap();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            let parked = released.recv_timeout(Duration::from_secs(5)).is_err();
+            fs::write(&fifo, body).unwrap();
+            parked
+        });
+        let cap = Capturing::new(ApplyOutcome::Applied);
+        let w = MarkerWatcher::new(inbox, cap.clone());
+        let task = tokio::spawn(async move { w.tick().await });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let stalled = !task.is_finished();
+        let _ = release.send(());
+        task.await.unwrap();
+
+        assert!(
+            !writer.join().unwrap(),
+            "the read parked the scheduler worker"
+        );
+        assert!(stalled, "the pass never reached the read: proves nothing");
+        assert_eq!(cap.calls.lock().len(), 1, "the entry must still be applied");
     }
 }

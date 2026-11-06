@@ -101,12 +101,7 @@ impl Handler for InitProducerIdHandler {
                 // relaxed the gate (KIP-679) so a topic-WRITE-only
                 // principal can still produce. The real enforcement
                 // point is Produce's per-topic Write check.
-                init_producer_id::Response {
-                    throttle_time_ms: 0,
-                    error_code: 0,
-                    producer_id: self.broker.next_producer_id(),
-                    producer_epoch: 0,
-                }
+                self.fresh_pid().await
             }
             Some(txn_id) => {
                 // gh #199: Apache gates the transactional path on
@@ -139,6 +134,25 @@ impl Handler for InitProducerIdHandler {
 }
 
 impl InitProducerIdHandler {
+    /// A new PID at epoch 0. Off the workers: every 1000th persists the next
+    /// block, with its fsyncs (gh #332).
+    async fn fresh_pid(&self) -> init_producer_id::Response {
+        let broker = self.broker.clone();
+        match self
+            .broker
+            .coordinator_io(move || broker.next_producer_id())
+            .await
+        {
+            Some(producer_id) => init_producer_id::Response {
+                throttle_time_ms: 0,
+                error_code: 0,
+                producer_id,
+                producer_epoch: 0,
+            },
+            None => error_response(ERR_COORDINATOR_NOT_AVAILABLE),
+        }
+    }
+
     async fn handle_transactional(
         &self,
         txn_id: &str,
@@ -171,12 +185,7 @@ impl InitProducerIdHandler {
                     "InitProducerId received transactional.id but no TxnStateStore is wired; \
                      epoch fence on rejoin disabled (gh #22)",
                 );
-                return init_producer_id::Response {
-                    throttle_time_ms: 0,
-                    error_code: 0,
-                    producer_id: self.broker.next_producer_id(),
-                    producer_epoch: 0,
-                };
+                return self.fresh_pid().await;
             }
         };
         let broker_for_alloc = self.broker.clone();

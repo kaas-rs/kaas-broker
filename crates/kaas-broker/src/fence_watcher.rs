@@ -89,15 +89,25 @@ impl FenceWatcher {
     /// entry so a peer's pre-existing file (e.g. after our own
     /// restart) is applied without waiting a full interval.
     pub async fn run(self: Arc<Self>, cancel: CancellationToken) {
-        self.tick();
+        self.tick_off_workers().await;
         let mut t = interval(self.poll);
         // Skip the immediate tick `interval` always yields first.
         t.tick().await;
         loop {
             tokio::select! {
                 () = cancel.cancelled() => return,
-                _ = t.tick() => self.tick(),
+                _ = t.tick() => self.tick_off_workers().await,
             }
+        }
+    }
+
+    /// [`Self::tick`] on the blocking pool (gh #332). It reads files, and applying
+    /// a fence takes every open partition's mutex, which a committer holds across
+    /// an fsync.
+    async fn tick_off_workers(self: &Arc<Self>) {
+        let me = self.clone();
+        if let Err(err) = tokio::task::spawn_blocking(move || me.tick()).await {
+            tracing::warn!(%err, "fence watcher: a pass panicked; retrying next poll");
         }
     }
 
@@ -308,5 +318,53 @@ mod tests {
         let w = FenceWatcher::new(tmp.path().to_path_buf(), "kaas-0", capturing.clone());
         w.tick();
         assert_eq!(capturing.calls.lock().len(), 1);
+    }
+
+    /// gh #332: on this one-thread runtime the sleep can't end if the pass is
+    /// waiting on the worker, so the fencer gives up after 5 s and says so.
+    #[tokio::test]
+    async fn applying_a_fence_stays_off_the_workers() {
+        struct Stalled {
+            reached: std::sync::atomic::AtomicBool,
+            release: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
+            parked: std::sync::atomic::AtomicBool,
+        }
+        impl ProducerEpochFencer for Stalled {
+            fn fence_producer_epoch(&self, _: i64, _: i16) {
+                self.reached
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let released = self.release.lock().recv_timeout(Duration::from_secs(5));
+                if released.is_err() {
+                    self.parked.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        write_peer(tmp.path(), "from-kaas-1.json", &HashMap::from([(42, 3)]));
+        let (release, released) = std::sync::mpsc::channel();
+        let fencer = Arc::new(Stalled {
+            reached: Default::default(),
+            release: parking_lot::Mutex::new(released),
+            parked: Default::default(),
+        });
+        let w = Arc::new(FenceWatcher::new(
+            tmp.path().to_path_buf(),
+            "kaas-0",
+            fencer.clone(),
+        ));
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(w.run(cancel.clone()));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let reached = fencer.reached.load(std::sync::atomic::Ordering::SeqCst);
+        let _ = release.send(());
+        cancel.cancel();
+        task.await.unwrap();
+
+        assert!(
+            !fencer.parked.load(std::sync::atomic::Ordering::SeqCst),
+            "applying a fence parked the scheduler worker"
+        );
+        assert!(reached, "the fence never got applied: proves nothing");
     }
 }
