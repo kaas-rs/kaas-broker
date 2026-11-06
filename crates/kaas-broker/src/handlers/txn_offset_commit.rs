@@ -335,6 +335,20 @@ mod tests {
         assert!(staged.contains_key(&offset_key("t", 0)));
     }
 
+    /// gh #320: the ACL comes first, so a principal without rights can't use
+    /// the answer to learn which topics exist.
+    #[tokio::test]
+    async fn a_denied_unknown_topic_is_29_not_3() {
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        let (_t, b, _mgr) = broker_with_manager_and_auth(Arc::new(DenyNamedAuthorizer("ghost")));
+        let h = TxnOffsetCommitHandler::new(b);
+        let resp = call(&h, &request_for(vec![topic("ghost")])).await;
+        assert_eq!(
+            resp.topics[0].partitions[0].error_code,
+            ERR_TOPIC_AUTHZ_FAILED
+        );
+    }
+
     /// gh #318: a group id too long to store answers 24 and stages nothing.
     /// These offsets could never be committed, so the transaction could never
     /// finish: EndTxn answered 15 forever, and only a restart cleared it.

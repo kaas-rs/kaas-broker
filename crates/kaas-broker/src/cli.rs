@@ -545,17 +545,17 @@ fn default_listeners() -> &'static str {
 /// `cluster.local`. Returns `None` in local-dev mode so listeners fall
 /// back to their bind IP.
 pub fn derive_advertised_host() -> Option<String> {
-    let non_empty = |name: &str| env::var(name).ok().filter(|s| !s.is_empty());
-    pod_fqdn(
-        &non_empty("MY_POD_NAME")?,
-        &non_empty("KAAS_HEADLESS_SVC")?,
-        &non_empty("KAAS_NAMESPACE")?,
-        non_empty("KAAS_CLUSTER_DOMAIN").as_deref(),
-    )
+    advertised_host_from(|name| env::var(name).ok())
 }
 
-fn pod_fqdn(pod: &str, svc: &str, ns: &str, domain: Option<&str>) -> Option<String> {
-    let domain = domain.unwrap_or("cluster.local");
+fn advertised_host_from(env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let non_empty = |name: &str| env(name).filter(|s| !s.is_empty());
+    let (pod, svc, ns) = (
+        non_empty("MY_POD_NAME")?,
+        non_empty("KAAS_HEADLESS_SVC")?,
+        non_empty("KAAS_NAMESPACE")?,
+    );
+    let domain = non_empty("KAAS_CLUSTER_DOMAIN").unwrap_or_else(|| "cluster.local".to_owned());
     Some(format!("{pod}.{svc}.{ns}.svc.{domain}"))
 }
 
@@ -568,14 +568,21 @@ mod tests {
     /// don't resolve, though the chart sets the variable.
     #[test]
     fn the_advertised_host_follows_the_cluster_domain() {
-        assert_eq!(
-            pod_fqdn("kaas-0", "kaas-headless", "ns", Some("corp.example")).as_deref(),
-            Some("kaas-0.kaas-headless.ns.svc.corp.example")
-        );
-        assert_eq!(
-            pod_fqdn("kaas-0", "kaas-headless", "ns", None).as_deref(),
-            Some("kaas-0.kaas-headless.ns.svc.cluster.local")
-        );
+        let host = |domain: Option<&str>| {
+            advertised_host_from(|name| match name {
+                "MY_POD_NAME" => Some("kaas-0".to_owned()),
+                "KAAS_HEADLESS_SVC" => Some("kaas-headless".to_owned()),
+                "KAAS_NAMESPACE" => Some("ns".to_owned()),
+                "KAAS_CLUSTER_DOMAIN" => domain.map(str::to_owned),
+                _ => None,
+            })
+        };
+        let at = |domain: &str| Some(format!("kaas-0.kaas-headless.ns.svc.{domain}"));
+        assert_eq!(host(Some("corp.example")), at("corp.example"));
+        assert_eq!(host(None), at("cluster.local"));
+        assert_eq!(host(Some("")), at("cluster.local"));
+        // Local dev: no pod name, so listeners fall back to their bind IP.
+        assert_eq!(advertised_host_from(|_| None), None);
     }
 
     #[test]

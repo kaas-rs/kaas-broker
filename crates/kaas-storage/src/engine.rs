@@ -113,24 +113,26 @@ pub fn check_distinct_log_dirs(default_dir: &Path, extra: &[LogDirInfo]) -> Resu
     Ok(())
 }
 
-/// `p` with symlinks and `..` resolved, as far as it exists. The rest, which
-/// a mkdir hasn't made yet, is appended as written.
+/// `p` with symlinks and `..` resolved, component by component. What doesn't
+/// exist yet is kept as written, so a later `..` still undoes it, as it will
+/// once a mkdir has made the path: `missing/../data/x` is under `data`.
 fn real_path(p: &Path) -> PathBuf {
-    let mut missing = Vec::new();
-    let mut cur = p;
-    loop {
-        if let Ok(mut real) = std::fs::canonicalize(cur) {
-            real.extend(missing.iter().rev());
-            return real;
-        }
-        match (cur.parent(), cur.file_name()) {
-            (Some(parent), Some(name)) => {
-                missing.push(name);
-                cur = parent;
+    let mut out = PathBuf::new();
+    for component in p.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
             }
-            _ => return p.to_path_buf(),
+            part => {
+                out.push(part);
+                if let Ok(real) = std::fs::canonicalize(&out) {
+                    out = real;
+                }
+            }
         }
     }
+    out
 }
 
 /// Refuse a cluster-state dir inside a log dir (gh #320). The operator's sweep
@@ -143,13 +145,12 @@ pub fn check_cluster_dir_placement(
     data_dir: &Path,
     extra: &[LogDirInfo],
 ) -> Result<(), String> {
-    let real = real_path;
-    let cluster = real(cluster_dir);
-    if cluster == real(data_dir).join("__cluster") {
+    let cluster = real_path(cluster_dir);
+    if cluster == real_path(data_dir).join("__cluster") {
         return Ok(());
     }
     for root in std::iter::once(data_dir).chain(extra.iter().map(|d| d.path.as_path())) {
-        if cluster.starts_with(real(root)) {
+        if cluster.starts_with(real_path(root)) {
             return Err(format!(
                 "cluster-state dir {} is inside log dir {}, where the operator's sweep would \
                  delete it: use a path outside every log dir, or leave KAAS_CLUSTER_DIR unset",
@@ -507,6 +508,7 @@ mod distinct_log_dir_tests {
             fast.join("cp"),
             fast.join("__cluster"),
             tmp.path().join("cluster/../data/cp"),
+            tmp.path().join("nonexistent/../data/not/yet"),
         ] {
             let err = check_cluster_dir_placement(&bad, &data, &pool).unwrap_err();
             assert!(err.contains("inside log dir"), "{}: {err}", bad.display());

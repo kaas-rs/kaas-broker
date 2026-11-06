@@ -20,7 +20,7 @@ spec:
        on these lines: it would eat the newline before the `---` below. */}}
 {{- $data := trimSuffix "/" .Values.storage.mountPath }}
 {{- $cp := trimSuffix "/" .Values.storage.controlPlane.mountPath }}
-{{- if or (eq $cp $data) (hasPrefix (printf "%s/" $data) $cp) (hasPrefix "/vols/" $cp) }}
+{{- if or (eq $cp $data) (hasPrefix (printf "%s/" $data) $cp) (eq $cp "/vols") (hasPrefix "/vols/" $cp) }}
 {{- fail (printf "storage.controlPlane.mountPath %s must be outside the data dir (%s) and /vols: the operator's sweep would delete it" $cp $data) }}
 {{- end }}
 ---

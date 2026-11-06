@@ -579,6 +579,21 @@ async fn offset_commit_into_another_group_is_30() {
     );
 }
 
+/// gh #320: the ACL comes first, so a principal without rights can't use the
+/// answer to learn which topics exist.
+#[tokio::test(start_paused = true)]
+async fn offset_commit_of_a_denied_unknown_topic_is_29_not_3() {
+    let c = cluster();
+    let alice = alice_joins_and_commits(&c).await;
+    // Carol has the group and only the `payments` topic. Alice can read every
+    // topic, so she'd rightly get 3.
+    let resp = offset_commit_as(&c, CAROL, &alice, &[("no-such-topic", 0)]).await;
+    assert_eq!(
+        resp.topics[0].partitions[0].error_code,
+        ERR_TOPIC_AUTHZ_FAILED
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn find_coordinator_for_another_group_is_30() {
     let c = cluster();
