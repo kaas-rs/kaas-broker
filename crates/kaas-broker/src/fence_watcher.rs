@@ -176,24 +176,31 @@ impl FenceWatcher {
 
         let mut pending: Vec<(i64, i16)> = Vec::new();
         {
-            let mut applied = self.applied.lock();
-            let last = applied.entry(name.to_owned()).or_default();
+            let applied = self.applied.lock();
+            let last = applied.get(name);
             for (k, &epoch) in &peer_state {
                 let pid: i64 = match k.parse() {
                     Ok(p) => p,
                     Err(_) => continue,
                 };
-                if let Some(&existing) = last.get(&pid) {
+                if let Some(&existing) = last.and_then(|l| l.get(&pid)) {
                     if existing >= epoch {
                         continue;
                     }
                 }
                 pending.push((pid, epoch));
-                last.insert(pid, epoch);
             }
         }
+        // Recorded only once applied, so a pass that dies partway retries what it
+        // didn't reach on the next poll. A fence is idempotent. Recording first lost
+        // those for good (gh #332 verification).
         for (pid, epoch) in pending {
             self.fencer.fence_producer_epoch(pid, epoch);
+            self.applied
+                .lock()
+                .entry(name.to_owned())
+                .or_default()
+                .insert(pid, epoch);
         }
     }
 }
@@ -366,5 +373,49 @@ mod tests {
             "applying a fence parked the scheduler worker"
         );
         assert!(reached, "the fence never got applied: proves nothing");
+    }
+
+    /// A pass that dies partway retries what it didn't apply. They were recorded
+    /// before being applied, so the rest of that pass was lost for good, while the
+    /// log said it would retry.
+    #[test]
+    #[allow(clippy::panic)]
+    fn a_pass_that_dies_retries_what_it_did_not_apply() {
+        #[derive(Default)]
+        struct PanicsOnce {
+            panicked: std::sync::atomic::AtomicBool,
+            calls: parking_lot::Mutex<Vec<(i64, i16)>>,
+        }
+        impl ProducerEpochFencer for PanicsOnce {
+            fn fence_producer_epoch(&self, pid: i64, epoch: i16) {
+                if !self
+                    .panicked
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    panic!("the first fence fails");
+                }
+                self.calls.lock().push((pid, epoch));
+            }
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        write_peer(
+            tmp.path(),
+            "from-kaas-1.json",
+            &HashMap::from([(1, 1), (2, 1), (3, 1)]),
+        );
+        let fencer = Arc::new(PanicsOnce::default());
+        let w = FenceWatcher::new(tmp.path().to_path_buf(), "kaas-0", fencer.clone());
+
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.tick()));
+        assert!(died.is_err());
+        w.tick();
+
+        let mut calls = fencer.calls.lock().clone();
+        calls.sort();
+        assert_eq!(calls, vec![(1, 1), (2, 1), (3, 1)], "a fence was lost");
+
+        // Applied now, so another pass does nothing.
+        w.tick();
+        assert_eq!(fencer.calls.lock().len(), 3);
     }
 }
