@@ -90,6 +90,11 @@ impl Handler for DescribeGroupsHandler {
                 ) {
                     return error_group(id, ERR_GROUP_AUTHZ_FAILED);
                 }
+                // "Doesn't exist" has to be true: a file that can't be read isn't
+                // a dead group (gh #326).
+                if let Some(code) = mgr.as_ref().and_then(|m| m.group_load_error(&id)) {
+                    return error_group(id, code);
+                }
                 let snap = mgr
                     .as_ref()
                     .and_then(|m| m.describe_groups(std::slice::from_ref(&id)).pop().flatten());

@@ -113,13 +113,24 @@ impl Handler for OffsetFetchHandler {
                 groups: Vec::new(),
             }
         } else {
-            let (topics_resp, group_err) = fetch_group(
+            let (mut topics_resp, group_err) = fetch_group(
                 mgr.as_ref(),
                 &req.group_id,
                 req.topics.as_deref(),
                 &may_describe_topic,
                 &may_list_topic,
             );
+            // v1 has no top-level error field, so a group-level error goes on
+            // every partition (gh #326), as the ACL branch above does. Without
+            // it a client reads -1 with error 0: nothing committed.
+            if version < 2 && group_err != 0 {
+                topics_resp = req
+                    .topics
+                    .iter()
+                    .flatten()
+                    .map(|t| error_topic(t, group_err))
+                    .collect();
+            }
             offset_fetch::Response {
                 throttle_time_ms: 0,
                 topics: topics_resp,
@@ -159,6 +170,10 @@ fn fetch_group(
     may_describe_topic: &dyn Fn(&str) -> bool,
     may_list_topic: &dyn Fn(&str) -> bool,
 ) -> (Vec<offset_fetch::OffsetFetchTopicResponse>, i16) {
+    if let Some(code) = mgr.and_then(|m| m.group_load_error(group_id)) {
+        let rows = topics.unwrap_or_default();
+        return (rows.iter().map(|t| error_topic(t, 0)).collect(), code);
+    }
     let Some(topics) = topics else {
         return match mgr.and_then(|m| m.offset_fetch_all(group_id)) {
             None => (Vec::new(), ERR_NOT_COORDINATOR),

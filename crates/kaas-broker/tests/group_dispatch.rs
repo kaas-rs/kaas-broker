@@ -410,3 +410,171 @@ async fn an_unknown_topic_or_partition_is_3_and_is_not_stored() {
     let codes = send(commit(vec![("nope", 0)])).await;
     assert_eq!(codes, [("nope".to_owned(), 3)]);
 }
+
+/// One OffsetCommit of `t1/0`, answered 0.
+async fn commit_t1_0(broker: &Arc<Broker>, offset: i64, metadata: Option<&str>) {
+    let req = offset_commit::Request {
+        group_id: "g1".to_owned(),
+        generation_id: -1,
+        member_id: String::new(),
+        group_instance_id: None,
+        retention_time_ms: offset_commit::DEFAULT_RETENTION_TIME_MS,
+        topics: vec![offset_commit::OffsetCommitTopic {
+            name: "t1".to_owned(),
+            partitions: vec![offset_commit::OffsetCommitPartition {
+                partition_index: 0,
+                committed_offset: offset,
+                committed_leader_epoch: -1,
+                committed_metadata: metadata.map(str::to_owned),
+            }],
+        }],
+    };
+    let mut body = BytesMut::new();
+    offset_commit::encode_request(&mut body, &req, 8).unwrap();
+    let out = OffsetCommitHandler::new(broker.clone())
+        .handle(&conn(), 8, body.freeze())
+        .await
+        .unwrap();
+    let resp = offset_commit::decode_response(&mut out.freeze(), 8).unwrap();
+    assert_eq!(resp.topics[0].partitions[0].error_code, 0);
+}
+
+/// OffsetFetch of `t1/0` at `version`: the group-level error, then the
+/// partition's error, offset and metadata.
+async fn fetch_t1_0(broker: &Arc<Broker>, version: i16) -> (i16, i16, i64, Option<String>) {
+    let topics = vec![offset_fetch::OffsetFetchTopic {
+        name: "t1".to_owned(),
+        partition_indexes: vec![0],
+    }];
+    let req = if version >= 8 {
+        offset_fetch::Request {
+            groups: vec![offset_fetch::OffsetFetchGroup {
+                group_id: "g1".to_owned(),
+                topics: Some(topics),
+            }],
+            ..offset_fetch::Request::default()
+        }
+    } else {
+        offset_fetch::Request {
+            group_id: "g1".to_owned(),
+            topics: Some(topics),
+            ..offset_fetch::Request::default()
+        }
+    };
+    let mut body = BytesMut::new();
+    offset_fetch::encode_request(&mut body, &req, version).unwrap();
+    let out = OffsetFetchHandler::new(broker.clone())
+        .handle(&conn(), version, body.freeze())
+        .await
+        .unwrap();
+    let resp = offset_fetch::decode_response(&mut out.freeze(), version).unwrap();
+    let (group_error, topics) = if version >= 8 {
+        (resp.groups[0].error_code, resp.groups[0].topics.clone())
+    } else {
+        (resp.error_code, resp.topics.clone())
+    };
+    let p = &topics[0].partitions[0];
+    (
+        group_error,
+        p.error_code,
+        p.committed_offset,
+        p.metadata.clone(),
+    )
+}
+
+/// gh #326: a group whose file can't be read answers a retriable 14, at every
+/// version, and not "no offset": a consumer told -1 would reset per
+/// `auto.offset.reset`. v1 has no group-level field, so it goes on the partition.
+/// DescribeGroups and DeleteGroups can't call it dead either. Once the file can
+/// be read, the offset is still there.
+#[tokio::test]
+async fn an_unreadable_group_is_14_rather_than_no_offset() {
+    let tmp = tempfile::tempdir().unwrap();
+    commit_t1_0(&broker_with_manager(tmp.path()), 42, None).await;
+
+    let dir = tmp.path().join("__consumer_offsets");
+    let aside = tmp.path().join("aside");
+    std::fs::rename(&dir, &aside).unwrap();
+    std::fs::write(&dir, b"x").unwrap();
+
+    // A fresh broker over the same volume: nothing cached.
+    let cold = broker_with_manager(tmp.path());
+    assert_eq!(fetch_t1_0(&cold, 8).await.0, 14);
+    assert_eq!(fetch_t1_0(&cold, 5).await.0, 14);
+    let (_, partition_error, offset, _) = fetch_t1_0(&cold, 1).await;
+    assert_eq!((partition_error, offset), (14, -1));
+
+    let mgr = cold.coord_manager().unwrap();
+    assert_eq!(mgr.delete_group("g1"), 14);
+    assert_eq!(mgr.group_load_error("g1"), Some(14));
+    let describe = kaas_codec::api::describe_groups::Request {
+        groups: vec!["g1".to_owned()],
+        include_authorized_operations: false,
+    };
+    let mut body = BytesMut::new();
+    kaas_codec::api::describe_groups::encode_request(&mut body, &describe, 5).unwrap();
+    let out = kaas_broker::DescribeGroupsHandler::new(cold.clone())
+        .handle(&conn(), 5, body.freeze())
+        .await
+        .unwrap();
+    let described =
+        kaas_codec::api::describe_groups::decode_response(&mut out.freeze(), 5).unwrap();
+    assert_eq!(described.groups[0].error_code, 14);
+
+    std::fs::remove_file(&dir).unwrap();
+    std::fs::rename(&aside, &dir).unwrap();
+    assert_eq!(mgr.group_load_error("g1"), None);
+    for version in [8, 5, 1] {
+        let (group_error, partition_error, offset, _) = fetch_t1_0(&cold, version).await;
+        assert_eq!(
+            (group_error, partition_error, offset),
+            (0, 0, 42),
+            "v{version}"
+        );
+    }
+}
+
+/// gh #326: OffsetFetch v1 from a non-coordinator has nowhere to put a
+/// group-level 16, so it goes on the partition. It used to read as -1 with
+/// error 0: nothing committed.
+#[tokio::test]
+async fn offset_fetch_v1_from_a_non_coordinator_says_so_on_the_partition() {
+    struct Nobody;
+    impl kaas_coordinator::GroupAssignmentSource for Nobody {
+        fn owns_group(&self, _: &str) -> bool {
+            false
+        }
+        fn group_coordinator(&self, _: &str) -> Option<kaas_coordinator::BrokerId> {
+            Some("kaas-1".to_owned())
+        }
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let broker = broker_with_manager(tmp.path());
+    broker
+        .coord_manager()
+        .unwrap()
+        .set_group_assignment_source(Arc::new(Nobody));
+    let (_, partition_error, offset, _) = fetch_t1_0(&broker, 1).await;
+    assert_eq!((partition_error, offset), (16, -1));
+    assert_eq!(fetch_t1_0(&broker, 8).await.0, 16);
+}
+
+/// gh #326: a commit with null or empty metadata overwrites the old string, as in
+/// Apache. It used to keep it, so a fetch answered the new offset with the old
+/// metadata.
+#[tokio::test]
+async fn a_commit_without_metadata_clears_the_old_string() {
+    for empty in [None, Some("")] {
+        let tmp = tempfile::tempdir().unwrap();
+        let broker = broker_with_manager(tmp.path());
+        commit_t1_0(&broker, 100, Some("m100")).await;
+        assert_eq!(fetch_t1_0(&broker, 8).await.3.as_deref(), Some("m100"));
+
+        commit_t1_0(&broker, 200, empty).await;
+        let (_, _, offset, metadata) = fetch_t1_0(&broker, 8).await;
+        assert_eq!((offset, metadata), (200, None), "{empty:?}");
+        // On disk too.
+        let (_, _, offset, metadata) = fetch_t1_0(&broker_with_manager(tmp.path()), 8).await;
+        assert_eq!((offset, metadata), (200, None), "{empty:?}");
+    }
+}

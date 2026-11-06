@@ -461,6 +461,21 @@ impl Manager {
         }
     }
 
+    /// `COORDINATOR_LOAD_IN_PROGRESS` (14) if this broker coordinates the group
+    /// but can't read its offsets, which is retriable. A caller must check this
+    /// before reading "no offsets" as true (gh #326): a consumer told -1 resets
+    /// per `auto.offset.reset` and skips or re-reads data whose offset is still
+    /// there, and DeleteGroups would answer that the group doesn't exist.
+    pub fn group_load_error(&self, group_id: &str) -> Option<i16> {
+        const COORDINATOR_LOAD_IN_PROGRESS: i16 = 14;
+        if !self.is_coordinator(group_id) {
+            return None;
+        }
+        let err = self.offsets.check_readable(group_id).err()?;
+        tracing::warn!(group = group_id, %err, "offsets: could not load group file");
+        Some(COORDINATOR_LOAD_IN_PROGRESS)
+    }
+
     /// Per-(topic, partitions) committed offsets + metadata for a
     /// group. Returns both maps; the handler joins them by
     /// `offset_key`. `None` ↔ "broker not coordinator" so the
@@ -501,6 +516,9 @@ impl Manager {
         const GROUP_ID_NOT_FOUND: i16 = 69;
         if !self.is_coordinator(group_id) {
             return 16;
+        }
+        if let Some(code) = self.group_load_error(group_id) {
+            return code;
         }
         let has_state = self.groups.contains_key(group_id);
         let has_disk = self.offsets.has_offsets(group_id);

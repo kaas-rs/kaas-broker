@@ -66,7 +66,8 @@ An id too long for a file name (247 bytes after encoding) answers
 `INVALID_GROUP_ID` (24), a deviation: Apache has no such limit. A commit whose
 write fails answers `COORDINATOR_NOT_AVAILABLE` (15) rather than acking it, and
 OffsetFetch keeps answering what's on disk: the in-memory copy only moves after
-the write lands (gh #318).
+the write lands (gh #318). A commit with null or empty metadata clears the old
+string, as in Apache (gh #326).
 
 **Versions**: v2–v8 (flexible from v8)
 
@@ -119,7 +120,11 @@ Reads a group's committed positions back. Key 9.
 request (`groups[]`), and the handler resolves each group independently —
 per-group `NOT_COORDINATOR` for groups owned elsewhere. Lookups read the
 coordinator's in-memory cache, loaded from the group's file on first touch;
-partitions without a committed offset return the `-1` sentinel. A null topic
+partitions without a committed offset return the `-1` sentinel. If the file can't
+be read the answer is the retriable `COORDINATOR_LOAD_IN_PROGRESS` (14), not `-1`,
+which would make a consumer reset per `auto.offset.reset` (gh #326). DescribeGroups
+and DeleteGroups answer the same rather than call the group missing. v1 has no
+group-level error field, so a group-level error goes on every partition. A null topic
 list (v1–v7, or per group on v8) asks for every committed offset and gets one
 entry per partition the group has committed. This is how Kafka 4's AdminClient
 asks, so it is what `kafka-consumer-groups --describe` and `--shift-by` read.

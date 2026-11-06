@@ -137,13 +137,20 @@ struct Inner {
     metadata: HashMap<String, HashMap<String, String>>,
     /// gh #27 in-flight transactional offset commits keyed on
     /// `(group_id, producer_id)`. Memory-only.
-    pending: HashMap<PendingKey, HashMap<String, i64>>,
+    pending: HashMap<PendingKey, PendingOffsets>,
     /// Groups whose last write failed or was fenced. The cache still holds
     /// what was last known to be on disk, but a write that failed after its
     /// rename can have left the file ahead of it, so the gh #167
     /// skip-unchanged fast path must not fire for these: "unchanged" is only
     /// unchanged relative to the cache.
     dirty: std::collections::HashSet<String>,
+}
+
+/// What `TxnOffsetCommit` staged for one `(group, producer)`.
+#[derive(Debug, Default)]
+struct PendingOffsets {
+    offsets: HashMap<String, i64>,
+    metadata: HashMap<String, String>,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq, Clone)]
@@ -295,15 +302,27 @@ impl OffsetStore {
     /// Stage offsets from `TxnOffsetCommit` (key 28). They are NOT
     /// visible to `OffsetFetch` until `commit_pending` runs.
     pub fn store_pending(&self, group_id: &str, producer_id: i64, offsets: HashMap<String, i64>) {
+        self.store_pending_with_metadata(group_id, producer_id, offsets, HashMap::new());
+    }
+
+    /// [`Self::store_pending`] with each offset's metadata string, which is
+    /// committed along with it (gh #326). An empty value clears the entry, as
+    /// in [`Self::commit_with_metadata`].
+    pub fn store_pending_with_metadata(
+        &self,
+        group_id: &str,
+        producer_id: i64,
+        offsets: HashMap<String, i64>,
+        metadata: HashMap<String, String>,
+    ) {
         let key = PendingKey {
             group_id: group_id.to_owned(),
             producer_id,
         };
         let mut s = self.state.write();
         let slot = s.pending.entry(key).or_default();
-        for (k, v) in offsets {
-            slot.insert(k, v);
-        }
+        slot.offsets.extend(offsets);
+        slot.metadata.extend(metadata);
     }
 
     /// Materialise the staged offsets for `(group, pid)` as committed.
@@ -316,10 +335,16 @@ impl OffsetStore {
         // They stay staged until the commit is durable, so a failed write can
         // be retried (gh #318). Removing them first lost them, and the caller
         // had no way to know.
-        let Some(offsets) = self.state.read().pending.get(&key).cloned() else {
+        let Some((offsets, metadata)) = self
+            .state
+            .read()
+            .pending
+            .get(&key)
+            .map(|p| (p.offsets.clone(), p.metadata.clone()))
+        else {
             return Ok(());
         };
-        self.commit(group_id, offsets)?;
+        self.commit_with_metadata(group_id, offsets, metadata)?;
         self.state.write().pending.remove(&key);
         Ok(())
     }
@@ -342,7 +367,11 @@ impl OffsetStore {
             group_id: group_id.to_owned(),
             producer_id,
         };
-        self.state.read().pending.get(&key).cloned()
+        self.state
+            .read()
+            .pending
+            .get(&key)
+            .map(|p| p.offsets.clone())
     }
 
     // --- committed --------------------------------------------------
@@ -730,20 +759,26 @@ impl OffsetStore {
         Ok(())
     }
 
-    /// [`Self::ensure_loaded`] for the read paths, which answer from
-    /// whatever is cached if the file can't be read. Writers propagate
-    /// the error instead: rewriting a file they couldn't read would
-    /// erase it.
+    /// [`Self::ensure_loaded`] for a caller that holds no lock. It takes the
+    /// write lock if it has to read the file, or a cold fill could read the
+    /// file, lose a race with a purge or a delete, and put back what they
+    /// removed. The next commit would then write it out again (gh #318).
     ///
-    /// Takes the write lock if it has to read the file, or a cold fill could
-    /// read the file, lose a race with a purge or a delete, and put back what
-    /// they removed. The next commit would then write it out again (gh #318).
-    fn ensure_loaded_for_read(&self, group_id: &str) {
+    /// An error means the group's offsets may exist but can't be read. The
+    /// caller must not read that as "no offsets" (gh #326).
+    pub fn check_readable(&self, group_id: &str) -> io::Result<()> {
         if self.state.read().cache.contains_key(group_id) {
-            return;
+            return Ok(());
         }
         let _writer = self.write_lock(group_id);
-        if let Err(err) = self.ensure_loaded(group_id) {
+        self.ensure_loaded(group_id)
+    }
+
+    /// [`Self::check_readable`] for the read paths, which answer from whatever
+    /// is cached if the file can't be read. Anything acting on the answer has
+    /// checked first: see `Manager::group_load_error`.
+    fn ensure_loaded_for_read(&self, group_id: &str) {
+        if let Err(err) = self.check_readable(group_id) {
             tracing::warn!(group = group_id, %err, "offsets: could not load group file");
         }
     }
@@ -1432,6 +1467,38 @@ mod tests {
         s.delete("g").unwrap();
         assert!(!s.has_offsets("g"));
         assert_eq!(fetch_one(&store(tmp.path()), "g"), None);
+    }
+
+    /// gh #326: staged metadata is committed with its offset, and an empty value
+    /// clears what was there, as for a plain commit.
+    #[test]
+    fn staged_metadata_is_committed_with_its_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = store(tmp.path());
+        let spec = FetchSpec {
+            topic: "t1".to_owned(),
+            partitions: vec![0],
+        };
+        let metadata = |s: &OffsetStore| {
+            s.fetch_metadata("g", std::slice::from_ref(&spec))
+                .get("t1/0")
+                .cloned()
+        };
+        let stage = |value: &str| {
+            s.store_pending_with_metadata(
+                "g",
+                7,
+                one("t1", 0, 5),
+                HashMap::from([(offset_key("t1", 0), value.to_owned())]),
+            );
+            s.commit_pending("g", 7).unwrap();
+        };
+        stage("txn");
+        assert_eq!(metadata(&s).as_deref(), Some("txn"));
+        assert_eq!(metadata(&store(tmp.path())).as_deref(), Some("txn"));
+        stage("");
+        assert_eq!(metadata(&s), None);
+        assert_eq!(metadata(&store(tmp.path())), None);
     }
 
     /// gh #318: an id too long to have a file isn't a broken volume. Every

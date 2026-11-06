@@ -122,19 +122,27 @@ impl Handler for TxnOffsetCommitHandler {
                 .is_some_and(|m| (0..m.partition_count).contains(&partition))
         };
         let mut offsets: HashMap<String, i64> = HashMap::new();
+        let mut metadata: HashMap<String, String> = HashMap::new();
         for t in &req.topics {
             if denied.contains(t.name.as_str()) {
                 continue;
             }
             for p in &t.partitions {
                 if known(&t.name, p.partition_index) {
-                    offsets.insert(offset_key(&t.name, p.partition_index), p.committed_offset);
+                    let key = offset_key(&t.name, p.partition_index);
+                    offsets.insert(key.clone(), p.committed_offset);
+                    // As for OffsetCommit: empty clears (gh #326).
+                    metadata.insert(key, p.committed_metadata.clone().unwrap_or_default());
                 }
             }
         }
         if !offsets.is_empty() {
-            mgr.offsets
-                .store_pending(&req.group_id, req.producer_id, offsets);
+            mgr.offsets.store_pending_with_metadata(
+                &req.group_id,
+                req.producer_id,
+                offsets,
+                metadata,
+            );
         }
 
         write_response(version, &req, |topic, partition| {
@@ -312,6 +320,30 @@ mod tests {
                 committed_metadata: None,
             }],
         }
+    }
+
+    /// gh #326: a transactional commit carries its metadata, which used to be
+    /// dropped, leaving whatever an earlier commit had stored.
+    #[tokio::test]
+    async fn staged_metadata_reaches_the_commit() {
+        let (_t, b, mgr) = broker_with_manager_and_auth(Arc::new(kaas_auth::AllowAllAuthorizer));
+        let h = TxnOffsetCommitHandler::new(b);
+        let mut with_metadata = topic("t");
+        with_metadata.partitions[0].committed_metadata = Some("txn".to_owned());
+        let resp = call(&h, &request_for(vec![with_metadata])).await;
+        assert_eq!(resp.topics[0].partitions[0].error_code, 0);
+        mgr.offsets.commit_pending("g1", 42).unwrap();
+        let spec = kaas_coordinator::FetchSpec {
+            topic: "t".to_owned(),
+            partitions: vec![0],
+        };
+        let stored = mgr
+            .offsets
+            .fetch_metadata("g1", std::slice::from_ref(&spec));
+        assert_eq!(
+            stored.get(&offset_key("t", 0)).map(String::as_str),
+            Some("txn")
+        );
     }
 
     /// gh #320: a topic or partition that doesn't exist answers Apache's 3 and

@@ -96,11 +96,9 @@ impl Handler for OffsetCommitHandler {
                 }
                 let key = build_offset_key(&t.name, p.partition_index);
                 offsets.insert(key.clone(), p.committed_offset);
-                if let Some(m) = &p.committed_metadata {
-                    if !m.is_empty() {
-                        metadata.insert(key, m.clone());
-                    }
-                }
+                // Empty clears, so a commit with no metadata overwrites the old
+                // string, as in Apache (gh #326). It used to keep it.
+                metadata.insert(key, p.committed_metadata.clone().unwrap_or_default());
             }
         }
 
