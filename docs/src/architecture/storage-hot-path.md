@@ -306,7 +306,10 @@ A crash replays at most about 64 MiB of headers, or a whole log the first time
 it rebuilds from log start. Only headers are read, so a log with large batches
 costs one read per batch. The one thing not recovered: a cross-partition epoch
 fence lives in memory until the next snapshot, so a crash can lose it on a
-partition the producer's new session hasn't written to yet.
+partition the producer's new session hasn't written to yet. A real zombie is
+still refused, because its transactional batches are verified with the
+coordinator (see [transactions](./transactions.md)). Only a non-transactional
+batch under that producer id gets through (tracked as gh #347).
 
 The index is **sparse**: one `(rel_offset: i32, file_pos: i32)` entry
 every `index.interval.bytes` of log data (4 KiB default). Lookup
