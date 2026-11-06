@@ -377,7 +377,7 @@ impl KubeLeaseElection {
                 record_conflict("takeover");
                 info!(
                     identity = %self.identity,
-                    "controller lease taken by another candidate first (409); standing by"
+                    "lease taken by another candidate first (409); standing by"
                 );
                 Ok(None)
             }
@@ -412,13 +412,13 @@ impl KubeLeaseElection {
                 identity = %self.identity,
                 holder = holder_label(&holder),
                 epoch,
-                "controller lease no longer ours at release; leaving it"
+                "lease no longer ours at release; leaving it"
             ),
             Ok(LeaseWrite::Conflict) => {
                 record_conflict("release");
                 info!(
                     identity = %self.identity,
-                    "controller lease written by someone else before our release landed (409); \
+                    "lease written by someone else before our release landed (409); \
                      leaving it"
                 );
             }
@@ -504,7 +504,7 @@ impl KubeLeaseElection {
                 () = cancel.cancelled() => return,
                 epoch = self.acquire() => epoch,
             };
-            info!(epoch, identity = %self.identity, "controller lease acquired");
+            info!(epoch, identity = %self.identity, "lease acquired");
             let leader_token = cancel.child_token();
             on_acquired(epoch, leader_token.clone());
 
@@ -550,13 +550,13 @@ impl KubeLeaseElection {
                             identity = %self.identity,
                             new_holder = holder_label(&holder),
                             epoch,
-                            "controller lease lost to another holder"
+                            "lease lost to another holder"
                         );
                         break;
                     }
                     Ok(Ok(LeaseWrite::Gone)) => {
                         warn!(identity = %self.identity,
-                              "controller lease lost: the Lease object was deleted");
+                              "lease lost: the Lease object was deleted");
                         break;
                     }
                     Ok(Ok(LeaseWrite::Conflict)) => {
@@ -564,12 +564,12 @@ impl KubeLeaseElection {
                         let since = *first_err_at.get_or_insert_with(std::time::Instant::now);
                         if since.elapsed() > self.renew_deadline {
                             warn!(identity = %self.identity,
-                                  "controller lease kept changing under our renew past \
+                                  "lease kept changing under our renew past \
                                    renew_deadline; abdicating");
                             break;
                         }
                         warn!(identity = %self.identity,
-                              "controller lease written by someone else since our read (409); \
+                              "lease written by someone else since our read (409); \
                                re-reading next tick to check we still hold it");
                     }
                     Ok(Err(err)) => {
@@ -580,23 +580,21 @@ impl KubeLeaseElection {
                                 code,
                                 reason,
                                 %message,
-                                "controller lease renew failed past renew_deadline; abdicating"
+                                "lease renew failed past renew_deadline; abdicating"
                             );
                             break;
                         }
-                        warn!(code, reason, %message, "controller lease renew failed; retrying");
+                        warn!(code, reason, %message, "lease renew failed; retrying");
                     }
                     Err(_elapsed) => {
                         let since = *first_err_at.get_or_insert_with(std::time::Instant::now);
                         if since.elapsed() > self.renew_deadline {
-                            warn!(
-                                "controller lease renew timed out past renew_deadline; abdicating"
-                            );
+                            warn!("lease renew timed out past renew_deadline; abdicating");
                             break;
                         }
                         warn!(
                             budget_s = attempt_budget.as_secs(),
-                            "controller lease renew attempt timed out; retrying"
+                            "lease renew attempt timed out; retrying"
                         );
                     }
                 }

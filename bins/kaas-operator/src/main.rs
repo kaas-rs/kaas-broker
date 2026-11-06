@@ -4,7 +4,9 @@
 //! reconcilers (KafkaTopic, KafkaUser, KafkaCluster) against a
 //! namespace-scoped `kube::Client`, runs the leader-elected startup
 //! sweep, exposes `/healthz` + `/readyz` over axum, and shuts down
-//! cleanly on SIGTERM.
+//! cleanly on SIGTERM. Only the holder of the leader lease reconciles
+//! or sweeps; it renews the lease while it leads, and exits if it loses
+//! it (gh #329).
 //!
 //! Environment variables (chart-templated by
 //! `templates/operator-deployment.yaml` unless noted):
@@ -37,7 +39,7 @@ use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::{routing::get, Router};
 use futures::StreamExt;
-use kaas_controller::{KubeLeaseElection, LeaseElection};
+use kaas_controller::KubeLeaseElection;
 use kaas_operator_api::{KafkaCluster, KafkaTopic, KafkaUser};
 use kaas_operator_controllers::{
     kafkacluster_controller, kafkatopic_controller, kafkauser_controller, sweep,
@@ -61,6 +63,13 @@ const LEADER_LEASE: &str = "kaas-operator-leader";
 /// prior pass couldn't remove (FDs held) or that the operator missed
 /// while down.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(300);
+/// How long a SIGTERM waits for running reconciles before exiting anyway. Inside
+/// the pod's default 30 s `terminationGracePeriodSeconds`, with room for the rest
+/// of the shutdown.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(20);
+/// The API calls on the way out (the lease release, the last log line) get this
+/// each. The API server may be why we're stopping.
+const SHUTDOWN_API_BUDGET: Duration = Duration::from_secs(3);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -154,10 +163,14 @@ async fn main() -> Result<()> {
         .await
         .context("building kube::Client (no KUBECONFIG?)")?;
     healthy_flag.store(true, Ordering::Relaxed);
+    // Ready doesn't wait for leadership. A rollout surges the new pod and stops the
+    // old one only once the new one is Ready, so a standby that waited for the lease
+    // would wait for ever: the old pod keeps it until it's stopped (gh #329).
+    ready_flag.store(true, Ordering::Relaxed);
     info!("kube client connected");
 
     // Leader election. The startup sweep + reconcilers run on the
-    // elected pod only — multiple replicas are supported but only
+    // elected pod only: multiple replicas are supported but only
     // one drives the loop at a time.
     let identity = std::env::var("HOSTNAME").unwrap_or_else(|_| "kaas-operator-0".into());
     // Its wins aren't controller failovers (gh #290 verification).
@@ -171,9 +184,114 @@ async fn main() -> Result<()> {
     // Timings: KubeLeaseElection's defaults (15/10/2), the one source of
     // truth shared with the broker's controller Lease (gh #281).
     info!(%identity, lease = LEADER_LEASE, "waiting for leader-election");
-    let epoch = election.acquire().await;
-    info!(%epoch, %identity, "elected leader; starting reconcilers");
+    // Its own token, not `cancel`: a SIGTERM keeps the lease until the reconcilers
+    // have stopped, so no successor starts next to a running reconcile.
+    let election_cancel = CancellationToken::new();
+    let elected = CancellationToken::new();
+    let lost = Arc::new(AtomicBool::new(false));
+    let election_task = tokio::spawn(election.campaign(
+        election_cancel.clone(),
+        {
+            let elected = elected.clone();
+            move |epoch, _| {
+                info!(%epoch, "elected leader; starting reconcilers");
+                elected.cancel();
+            }
+        },
+        {
+            let election_cancel = election_cancel.clone();
+            let lost = lost.clone();
+            let cancel = cancel.clone();
+            move || {
+                if !election_cancel.is_cancelled() {
+                    lost.store(true, Ordering::SeqCst);
+                    cancel.cancel();
+                }
+            }
+        },
+    ));
 
+    let tasks = tokio::select! {
+        () = cancel.cancelled() => Vec::new(),
+        () = elected.cancelled() => start_reconcilers(
+            client.clone(),
+            namespace.clone(),
+            data_dir,
+            cluster_dir,
+            log_dirs,
+            cancel.clone(),
+        ),
+    };
+
+    // Wait until something asks us to stop. The reconcilers and the sweep
+    // stop on the same token.
+    cancel.cancelled().await;
+
+    // Another candidate may already be reconciling, so don't wait for anything.
+    // The reconcilers are idempotent, and the restart comes back as a candidate.
+    if lost.load(Ordering::SeqCst) {
+        error!(%identity, "lost the leader lease; exiting");
+        std::process::exit(1);
+    }
+
+    info!("shutdown signal received; waiting for reconcilers");
+    let drained = tokio::time::timeout(SHUTDOWN_GRACE, futures::future::join_all(tasks))
+        .await
+        .is_ok();
+    if !drained {
+        warn!(
+            grace_seconds = SHUTDOWN_GRACE.as_secs(),
+            "reconcilers still running after the shutdown grace; exiting anyway"
+        );
+    }
+
+    // Last, so the next leader doesn't wait out the lease, and doesn't start early.
+    election_cancel.cancel();
+    if tokio::time::timeout(SHUTDOWN_API_BUDGET, election_task)
+        .await
+        .is_err()
+    {
+        warn!("lease release timed out; it will expire on its own");
+    }
+
+    // The probe thread exits via the axum graceful shutdown once
+    // `cancel` fires; join it off the async runtime.
+    let _ = tokio::time::timeout(
+        SHUTDOWN_API_BUDGET,
+        tokio::task::spawn_blocking(move || probe_thread.join()),
+    )
+    .await;
+
+    // Flush pending OTLP pushes before the process dies.
+    if let Err(err) = providers.shutdown() {
+        warn!(%err, "observability shutdown reported error");
+    }
+    obs_cancel.cancel();
+
+    // Pre-discover topic count for a final log line: useful when
+    // chasing "did everything drain?" in pod logs.
+    let count = tokio::time::timeout(SHUTDOWN_API_BUDGET, topic_count(&client, &namespace)).await;
+    if let Ok(Ok(count)) = count {
+        info!(topic_count = count, "operator exiting cleanly");
+    } else {
+        info!("operator exiting cleanly");
+    }
+    // Returning would drop the runtime, which waits for any stuck blocking task.
+    if !drained {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Everything only the leader runs: the orphan sweep and the three reconcilers.
+fn start_reconcilers(
+    client: Client,
+    namespace: String,
+    data_dir: PathBuf,
+    cluster_dir: PathBuf,
+    log_dirs: Vec<kaas_storage::LogDirInfo>,
+    cancel: CancellationToken,
+) -> Vec<tokio::task::JoinHandle<()>> {
     // Orphan sweep: an initial pass at leader-election, then a slow
     // periodic re-run. gh #205 / NFS rule 2: the sweep is resumable —
     // a directory that can't be removed this pass (ENOTEMPTY while a
@@ -187,11 +305,15 @@ async fn main() -> Result<()> {
         .chain(log_dirs.iter().map(|d| d.path.clone()))
         .collect();
     let sweep_cluster_dir = cluster_dir.clone();
-    tokio::spawn(async move {
+    let sweep_cancel = cancel.clone();
+    let sweep_task = tokio::spawn(async move {
         let mut tick = tokio::time::interval(SWEEP_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
-            tick.tick().await;
+            tokio::select! {
+                () = sweep_cancel.cancelled() => return,
+                _ = tick.tick() => {}
+            }
             match sweep::sweep_topics(&sweep_client, &sweep_ns, &sweep_roots).await {
                 Ok(r) => {
                     if !r.removed.is_empty() {
@@ -231,10 +353,14 @@ async fn main() -> Result<()> {
         namespace.clone(),
     ));
 
+    // Stops starting reconciles on the token, and ends once the running ones are
+    // done (gh #329). Nothing stopped these streams, so a SIGTERM waited on them
+    // until the kubelet's SIGKILL.
     let topic_stream = Controller::new(
         Api::<KafkaTopic>::namespaced(client.clone(), &namespace),
         WatcherConfig::default().any_semantic(),
     )
+    .graceful_shutdown_on(cancel.clone().cancelled_owned())
     .run(
         kafkatopic_controller::reconcile_topic,
         kafkatopic_controller::error_policy,
@@ -245,6 +371,7 @@ async fn main() -> Result<()> {
         Api::<KafkaUser>::namespaced(client.clone(), &namespace),
         WatcherConfig::default().any_semantic(),
     )
+    .graceful_shutdown_on(cancel.clone().cancelled_owned())
     .run(
         kafkauser_controller::reconcile_user,
         kafkauser_controller::error_policy,
@@ -255,48 +382,22 @@ async fn main() -> Result<()> {
         Api::<KafkaCluster>::namespaced(client.clone(), &namespace),
         WatcherConfig::default().any_semantic(),
     )
+    .graceful_shutdown_on(cancel.clone().cancelled_owned())
     .run(
         kafkacluster_controller::reconcile_cluster,
         kafkacluster_controller::error_policy,
         cluster_ctx,
     );
 
-    // Flip ready after kube + initial discovery completes. The
-    // chart's readinessProbe gates on this.
-    ready_flag.store(true, Ordering::Relaxed);
-
     // Box::pin to satisfy the Unpin bound on drain_*; the
     // Controller stream borrows internal pin-projected state from
     // futures_util, so it's not Unpin on its own.
-    let topic_task = tokio::spawn(drain_topic(Box::pin(topic_stream), cancel.clone()));
-    let user_task = tokio::spawn(drain_user(Box::pin(user_stream), cancel.clone()));
-    let cluster_task = tokio::spawn(drain_cluster(Box::pin(cluster_stream), cancel.clone()));
-
-    // Wait until something asks us to stop. Reconciler tasks own
-    // their own shutdown via the cancel token; we just block until
-    // they all finish (or the user hits SIGTERM, which cancels them).
-    cancel.cancelled().await;
-    info!("shutdown signal received; waiting for reconcilers");
-
-    let _ = tokio::join!(topic_task, user_task, cluster_task);
-    // The probe thread exits via the axum graceful shutdown once
-    // `cancel` fires; join it off the async runtime.
-    let _ = tokio::task::spawn_blocking(move || probe_thread.join()).await;
-
-    // Flush pending OTLP pushes before the process dies.
-    if let Err(err) = providers.shutdown() {
-        warn!(%err, "observability shutdown reported error");
-    }
-    obs_cancel.cancel();
-
-    // Pre-discover topic count for a final log line — useful when
-    // chasing "did everything drain?" in pod logs.
-    if let Ok(count) = topic_count(&client, &namespace).await {
-        info!(topic_count = count, "operator exiting cleanly");
-    } else {
-        info!("operator exiting cleanly");
-    }
-    Ok(())
+    vec![
+        sweep_task,
+        tokio::spawn(drain_topic(Box::pin(topic_stream), cancel.clone())),
+        tokio::spawn(drain_user(Box::pin(user_stream), cancel.clone())),
+        tokio::spawn(drain_cluster(Box::pin(cluster_stream), cancel)),
+    ]
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -307,7 +408,7 @@ fn install_signal_handlers(cancel: CancellationToken) {
     let cancel_for_int = cancel.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            warn!("SIGINT received");
+            info!("SIGINT received");
             cancel_for_int.cancel();
         }
     });
@@ -316,7 +417,7 @@ fn install_signal_handlers(cancel: CancellationToken) {
         use tokio::signal::unix::{signal, SignalKind};
         if let Ok(mut term) = signal(SignalKind::terminate()) {
             term.recv().await;
-            warn!("SIGTERM received");
+            info!("SIGTERM received");
             cancel.cancel();
         }
     });
@@ -372,6 +473,16 @@ async fn spawn_probe_server(
 // generic to keep the trait-bound noise low; controller-runtime's
 // Stream::Item is the same shape per kind so the body is identical
 // modulo the CRD type.
+/// A stream ends on shutdown. Any other end stops the operator too.
+fn stream_ended(kind: &str, cancel: &CancellationToken) {
+    if cancel.is_cancelled() {
+        info!(kind, "reconciler stopped");
+    } else {
+        warn!(kind, "reconciler stream ended");
+        cancel.cancel();
+    }
+}
+
 async fn drain_topic<S>(mut stream: S, cancel: CancellationToken)
 where
     S: futures::Stream<
@@ -395,8 +506,7 @@ where
             Err(e) => tracing::warn!(kind = "KafkaTopic", error = %e, "reconcile error"),
         }
     }
-    warn!(kind = "KafkaTopic", "reconciler stream ended");
-    cancel.cancel();
+    stream_ended("KafkaTopic", &cancel);
 }
 
 async fn drain_user<S>(mut stream: S, cancel: CancellationToken)
@@ -422,8 +532,7 @@ where
             Err(e) => tracing::warn!(kind = "KafkaUser", error = %e, "reconcile error"),
         }
     }
-    warn!(kind = "KafkaUser", "reconciler stream ended");
-    cancel.cancel();
+    stream_ended("KafkaUser", &cancel);
 }
 
 async fn drain_cluster<S>(mut stream: S, cancel: CancellationToken)
@@ -449,8 +558,7 @@ where
             Err(e) => tracing::warn!(kind = "KafkaCluster", error = %e, "reconcile error"),
         }
     }
-    warn!(kind = "KafkaCluster", "reconciler stream ended");
-    cancel.cancel();
+    stream_ended("KafkaCluster", &cancel);
 }
 
 async fn topic_count(client: &Client, namespace: &str) -> Result<usize> {

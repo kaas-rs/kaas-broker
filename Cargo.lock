@@ -1588,6 +1588,8 @@ dependencies = [
  "kaas-storage",
  "kube",
  "rustls",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing",
