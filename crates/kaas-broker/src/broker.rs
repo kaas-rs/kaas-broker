@@ -456,7 +456,8 @@ impl Broker {
 
     /// Drop everything this broker holds for a deleted topic. Called
     /// from the topic watch's delete callback, after the topic has left
-    /// the registry, so no new request can touch it.
+    /// the registry, so no new request can touch it. The watch waits for
+    /// this before handling its next event, so it mustn't wait on the watch.
     pub async fn forget_deleted_topic(&self, topic: &str) {
         // gh #219: drop the topic's partitions from the engine
         // *without persisting*. Leaving it to the assignment recompute
@@ -480,8 +481,9 @@ impl Broker {
         // for the brief window before the cluster runtime installs it —
         // no coordinated groups exist then either.
         if let Some(mgr) = self.coord_manager() {
-            // Walks every group file on the volume, so not on a worker. Awaited,
-            // so a recreate on the same watch stream comes after it.
+            // Walks every group file on the volume, so not on a worker (gh #328).
+            // The topic watch awaits this whole call, so a recreate on the same
+            // stream comes after it (gh #331).
             let name = topic.to_owned();
             let (purged, failed) = self
                 .coordinator_io(move || mgr.purge_topic_offsets(&name))

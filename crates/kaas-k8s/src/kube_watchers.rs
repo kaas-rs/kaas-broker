@@ -17,6 +17,7 @@
 // `#![cfg(...)]` only repeats it and clippy flags it as
 // duplicated.
 
+use std::future::Future;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -332,7 +333,7 @@ pub struct TopicApply<'a> {
 /// gh #202 this returned `Ok(())` on stream end and the caller never
 /// restarted it, so topic tracking stopped silently and the registry
 /// served deleted topics indefinitely.
-pub async fn run_topic_watch<A, D, S>(
+pub async fn run_topic_watch<A, D, F, S>(
     client: Client,
     namespace: String,
     on_apply: A,
@@ -342,7 +343,8 @@ pub async fn run_topic_watch<A, D, S>(
 ) -> Result<(), KubeWatchError>
 where
     A: Fn(TopicApply<'_>) + Send + Sync + 'static,
-    D: Fn(&str) + Send + Sync + 'static,
+    D: Fn(&str) -> F + Send + Sync + 'static,
+    F: Future<Output = ()> + Send,
     S: Fn() + Send + Sync + 'static,
 {
     let api: Api<kaas_operator_api::KafkaTopic> = Api::namespaced(client, &namespace);
@@ -371,7 +373,7 @@ where
                             // long backoff into the next restart.
                             backoff = TOPIC_WATCH_BACKOFF_MIN;
                             let was_synced = state.synced;
-                            handle_topic_event(&on_apply, &on_delete, e, &mut state);
+                            handle_topic_event(&on_apply, &on_delete, e, &mut state).await;
                             // gh #241: fire once, on the first completed
                             // list. From here on, a topic missing from
                             // the registry means "not delivered yet",
@@ -409,14 +411,19 @@ where
 /// once `status.volumeAssignments` shows the move complete.
 pub const MIGRATE_TO_VOLUME_ANNOTATION: &str = "kaas.rs/migrate-to-volume";
 
-fn handle_topic_event<A, D>(
+/// A delete's callback finishes before this returns, and so before the watch
+/// handles the next event (gh #331). A recreate under the same name arrives on
+/// this stream, so it can't be applied while the old incarnation is being
+/// forgotten.
+async fn handle_topic_event<A, D, F>(
     on_apply: &A,
     on_delete: &D,
     event: Event<kaas_operator_api::KafkaTopic>,
     state: &mut TopicWatchState,
 ) where
     A: Fn(TopicApply<'_>),
-    D: Fn(&str),
+    D: Fn(&str) -> F,
+    F: Future<Output = ()>,
 {
     match event {
         Event::Apply(t) | Event::InitApply(t) => {
@@ -477,7 +484,7 @@ fn handle_topic_event<A, D>(
             if name.is_empty() {
                 return;
             }
-            on_delete(name);
+            on_delete(name).await;
             state.known.remove(name);
         }
         Event::Init => {
@@ -493,7 +500,7 @@ fn handle_topic_event<A, D>(
             };
             for stale in state.known.difference(&relist) {
                 debug!(topic = stale.as_str(), "topic watch: retracting on relist");
-                on_delete(stale);
+                on_delete(stale).await;
             }
             state.known = relist;
             // gh #241: only now is the registry's *absence* of a topic
@@ -507,6 +514,8 @@ fn handle_topic_event<A, D>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::executor::block_on;
+    use futures::FutureExt;
     use k8s_openapi::api::discovery::v1::{Endpoint, EndpointConditions, EndpointPort};
     use kube::api::ObjectMeta;
 
@@ -613,9 +622,12 @@ mod tests {
         let mut state = TopicWatchState::default();
         {
             let on_apply = |_: TopicApply<'_>| {};
-            let on_delete = |n: &str| deleted.borrow_mut().push(n.to_owned());
+            let on_delete = |n: &str| {
+                deleted.borrow_mut().push(n.to_owned());
+                std::future::ready(())
+            };
             for evt in events {
-                handle_topic_event(&on_apply, &on_delete, evt, &mut state);
+                block_on(handle_topic_event(&on_apply, &on_delete, evt, &mut state));
             }
         }
         deleted.into_inner()
@@ -629,9 +641,9 @@ mod tests {
         {
             let on_apply =
                 |a: TopicApply<'_>| applied.borrow_mut().push((a.name.to_owned(), a.partitions));
-            let on_delete = |_: &str| {};
+            let on_delete = |_: &str| std::future::ready(());
             for evt in events {
-                handle_topic_event(&on_apply, &on_delete, evt, &mut state);
+                block_on(handle_topic_event(&on_apply, &on_delete, evt, &mut state));
             }
         }
         applied.into_inner()
@@ -721,7 +733,7 @@ mod tests {
                 seen.borrow_mut()
                     .push((a.name.to_owned(), a.topic_id.map(str::to_owned)));
             };
-            let on_delete = |_: &str| {};
+            let on_delete = |_: &str| std::future::ready(());
 
             let unstamped = topic("t1", 1);
             let mut stamped = topic("t2", 1);
@@ -738,7 +750,7 @@ mod tests {
                 Event::Apply(stamped),
                 Event::Apply(empty),
             ] {
-                handle_topic_event(&on_apply, &on_delete, evt, &mut state);
+                block_on(handle_topic_event(&on_apply, &on_delete, evt, &mut state));
             }
         }
         assert_eq!(
@@ -759,20 +771,25 @@ mod tests {
     fn synced_latches_on_the_first_completed_list() {
         let mut state = TopicWatchState::default();
         let on_apply = |_: TopicApply<'_>| {};
-        let on_delete = |_: &str| {};
+        let on_delete = |_: &str| std::future::ready(());
 
         // A plain Apply, with no list around it, proves nothing.
-        handle_topic_event(
+        block_on(handle_topic_event(
             &on_apply,
             &on_delete,
             Event::Apply(topic("t1", 1)),
             &mut state,
-        );
+        ));
         assert!(!state.synced, "an Apply alone is not a completed list");
 
         // An InitDone with no Init is a cut-short relist — also not a
         // completed list (same guard that keeps it from retracting).
-        handle_topic_event(&on_apply, &on_delete, Event::InitDone, &mut state);
+        block_on(handle_topic_event(
+            &on_apply,
+            &on_delete,
+            Event::InitDone,
+            &mut state,
+        ));
         assert!(!state.synced, "InitDone without Init must not latch");
 
         for e in [
@@ -780,12 +797,17 @@ mod tests {
             Event::InitApply(topic("t1", 1)),
             Event::InitDone,
         ] {
-            handle_topic_event(&on_apply, &on_delete, e, &mut state);
+            block_on(handle_topic_event(&on_apply, &on_delete, e, &mut state));
         }
         assert!(state.synced);
 
         // A later stream restart must not un-sync it.
-        handle_topic_event(&on_apply, &on_delete, Event::Init, &mut state);
+        block_on(handle_topic_event(
+            &on_apply,
+            &on_delete,
+            Event::Init,
+            &mut state,
+        ));
         assert!(state.synced, "a fresh relist must not clear synced");
     }
 
@@ -803,5 +825,42 @@ mod tests {
             Event::InitDone,
         ]);
         assert_eq!(deleted, vec!["t2".to_owned()]);
+    }
+
+    /// gh #331: the next event waits for a delete's callback, both a plain delete
+    /// and a relist's retraction. The offset purge rides that callback, and it
+    /// must not race a recreate's commits: it would erase them, and the new
+    /// incarnation's consumer would read -1 and reset.
+    #[test]
+    fn the_next_event_waits_for_a_delete_to_finish() {
+        let cases = [
+            (None, Event::Delete(topic("t", 1))),
+            (Some(Event::Init), Event::InitDone),
+        ];
+        for (before, event) in cases {
+            let (release, released) = futures::channel::oneshot::channel::<()>();
+            let released = released.shared();
+            let on_apply = |_: TopicApply<'_>| {};
+            let on_delete = |_: &str| {
+                let released = released.clone();
+                async move {
+                    let _ = released.await;
+                }
+            };
+            let mut state = TopicWatchState::default();
+            let setup = std::iter::once(Event::Apply(topic("t", 1))).chain(before);
+            for e in setup {
+                block_on(handle_topic_event(&on_apply, &on_delete, e, &mut state));
+            }
+
+            let mut handling =
+                Box::pin(handle_topic_event(&on_apply, &on_delete, event, &mut state));
+            assert!(
+                handling.as_mut().now_or_never().is_none(),
+                "the watch moved on before the delete callback finished"
+            );
+            release.send(()).expect("the callback is still waiting");
+            block_on(handling);
+        }
     }
 }

@@ -432,18 +432,20 @@ async fn main() -> Result<()> {
                         Some(_) => {} // re-list echo; nothing changed
                     }
                 },
-                move |name| {
+                move |name: &str| {
                     topics_delete.remove(name);
-                    // Engine partitions (gh #219), committed group
-                    // offsets (gh #240) and traffic series (gh #261). The
-                    // spawn resolves in microseconds while a recreate's
-                    // take-over is gated behind an assignment recompute
-                    // + watch (~1 s), so the drop lands first with a
-                    // wide margin.
+                    notify_delete.notify(kaas_controller::AssignmentReason::TopicDeleted);
+                    // Engine partitions (gh #219), committed group offsets
+                    // (gh #240) and traffic series (gh #261). The watch
+                    // awaits this, so a recreate on the same stream comes
+                    // after it (gh #331). As a detached spawn, a recreate
+                    // could be applied mid-purge, and the purge then erased
+                    // the new incarnation's commits. Until it's applied the
+                    // registry doesn't know the topic, so a commit answers
+                    // 3, which clients retry.
                     let broker = broker_delete.clone();
                     let topic = name.to_string();
-                    tokio::spawn(async move { broker.forget_deleted_topic(&topic).await });
-                    notify_delete.notify(kaas_controller::AssignmentReason::TopicDeleted);
+                    async move { broker.forget_deleted_topic(&topic).await }
                 },
                 // gh #241: the first completed list makes the
                 // registry's absences meaningful — before it, an
