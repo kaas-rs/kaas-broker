@@ -2,7 +2,7 @@
 
 The kube-derive CRD types — the source `cargo xtask gen-crds` renders into `deploy/crds/` and the Helm chart.
 
-Four CRD types, one module each: `kafkacluster.rs` (external-listener
+Three CRD types, one module each: `kafkacluster.rs` (external-listener
 plumbing, plus the storage / internal-listener / gateway / service config
 shapes), `kafkatopic.rs` (partitions + `spec.config` + `Status.TopicID`,
 plus `status.volumeAssignments` and the `kaas.rs/migrate-to-volume`

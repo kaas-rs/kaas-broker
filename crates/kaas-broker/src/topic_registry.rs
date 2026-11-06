@@ -63,7 +63,7 @@ pub struct TopicRegistry {
     /// `volume_assignments`, plus one of its own: `TopicMeta.topic_id`
     /// is what the Metadata handler serves on the wire, and filling it
     /// in would flip kaas from advertising nil topic IDs to real ones
-    /// — that is gh #105's call to make, not this gate's.
+    /// — that is gh #346's call to make, not this gate's.
     topic_ids: RwLock<HashMap<String, String>>,
     /// gh #241: has the `KafkaTopic` watch completed at least one full
     /// list? Until it has, this registry knows nothing and must not be

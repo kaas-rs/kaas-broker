@@ -162,9 +162,10 @@ what actually starts the transaction.
 
 **Versions**: v0–v3 (flexible from v3).
 
-A partition that doesn't exist answers `UNKNOWN_TOPIC_OR_PARTITION` (3) and the
-others in the request `OPERATION_NOT_ATTEMPTED` (55), and nothing is added, as in
-Apache (gh #314). EndTxn writes a marker to each recorded partition, so this also
+A topic without `WRITE` answers `TOPIC_AUTHORIZATION_FAILED` (29), and a partition
+that doesn't exist answers `UNKNOWN_TOPIC_OR_PARTITION` (3). The others in the
+request answer `OPERATION_NOT_ATTEMPTED` (55), and nothing is added, as in Apache
+(gh #314). EndTxn writes a marker to each recorded partition, so this also
 keeps a transaction from creating one. A recorded partition whose topic has since
 been deleted has nothing to mark and is skipped; one the assignment hasn't caught
 up to stays prepared for the reconcile.

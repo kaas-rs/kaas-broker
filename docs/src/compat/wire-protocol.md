@@ -4,9 +4,12 @@ Length-prefixed frames, KIP-482 flexible versions with tagged fields, and byte-o
 
 Point an unmodified Kafka client at kaas — Java, librdkafka, franz-go,
 the stock shell tools — and everything it sends and receives passes
-through the codec described here. The codec's standing claim: every
-registered API key and version encodes and decodes **byte-identically**
-against fixtures captured from Apache Kafka 3.7. The rest of Part II
+through the codec described here. Every API module round-trips its versions
+through the codec, and header versions are pinned to Apache's values. A round
+trip can't catch a bug the encoder and decoder share, so the wire claims that
+matter are also pinned against Apache's values or a real socket, and one
+captured request is decoded as a fixture (a Java client's LeaveGroup v5). The
+rest of Part II
 substantiates compatibility surface by surface; this page covers the
 layer all of those surfaces share.
 

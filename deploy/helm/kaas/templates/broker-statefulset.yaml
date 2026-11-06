@@ -8,10 +8,9 @@ spec:
   serviceName: {{ include "kaas.headlessName" . }}
   # All brokers are identical — no startup ordering needed.
   podManagementPolicy: Parallel
-  # gh #208: pace rolling updates so the controller doesn't replace the
-  # next broker before this one has actually taken over its partitions.
-  # /readyz currently flips at listener-bind, so this wait is what gives
-  # takeover time to complete. Mitigation, not the honest-readiness fix.
+  # gh #208: extra margin on rolling updates. /readyz already holds a pod
+  # unready until takeover completes, so this is a safety margin rather
+  # than the mechanism.
   {{- with .Values.broker.minReadySeconds }}
   minReadySeconds: {{ . }}
   {{- end }}

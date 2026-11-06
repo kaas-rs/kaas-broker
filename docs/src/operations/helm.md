@@ -52,9 +52,10 @@ Two behaviours to know before enabling an external listener:
   operator currently understands a single external listener.
 - External listeners use **per-broker hostnames on one SAN-per-broker
   certificate** (works with HTTP-01 ACME; one DNS record per broker).
-  cert-manager rotates the single Secret in place and brokers hot-reload it
-  without a restart. Scaling `replicaCount` re-reconciles the Certificate's
-  SAN list.
+  cert-manager rotates the single Secret in place, but brokers read it only
+  at startup, so a rotated certificate takes effect when the pods restart:
+  roll them before the old one expires (tracked as gh #343). Scaling
+  `replicaCount` re-reconciles the Certificate's SAN list.
 
 ## Cluster-wide authorization
 
@@ -85,7 +86,8 @@ section).
 - `broker.minReadySeconds` (default 60) — how long a freshly Ready broker
   must stay Ready before the rollout proceeds to the next pod.
 - `broker.retentionCheckIntervalSeconds` (default 300) — the retention
-  sweep interval; `0` disables the sweep.
+  sweep interval. The chart can't set `0` yet (tracked as gh #342); to keep a
+  topic's data, set its `retentionMs: -1`.
 - `broker.maxMessageBytes` (default 1048588) — Apache's
   `message.max.bytes`, the cap on one Produce batch.
 - `broker.fsyncMaxLatencyMs` (default 30000) — fsync watchdog deadline;

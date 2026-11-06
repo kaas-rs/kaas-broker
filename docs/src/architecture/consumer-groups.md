@@ -182,7 +182,7 @@ else's fsync on a worker would stall every connection that worker drives.
   under the lock: `OffsetStore::set_partition_source` (gh #335). A commit
   that waits out a delete *and* a recreate can still write the dead
   incarnation's offset; closing that needs offsets that know their topic's
-  incarnation (gh #105).
+  incarnation (gh #346).
 - Off the workers: `Broker::coordinator_io` and `txn_store_io` in
   `crates/kaas-broker/src/broker.rs`, bounded by `COORDINATOR_IO_THREADS`
   (gh #328, gh #332).

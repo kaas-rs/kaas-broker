@@ -11,7 +11,7 @@ Two layers:
   owns the `<user>-kafka-credentials` Secret; the gh #104 pre-derived
   passthrough enables zero-downtime rotation), `kafkacluster_controller.rs`
   (cert-manager Certificates, per-broker Services, Gateway TLSRoutes — all
-  with OwnerReferences; also idempotently creates the per-cluster
+  with OwnerReferences).
 
 - **Helpers** — `credentials.rs` + `acls.rs` (the file materializers),
   `sweep.rs` (the leader-elected orphan sweep — an initial pass at leader

@@ -57,7 +57,7 @@ credibility test.
 | KIP-368 | re-auth on a live connection; `session_lifetime_ms` advertised + deadline enforced on `oauth` listeners; same-principal guard | a broker-wide `connections.max.reauth.ms` for SCRAM/PLAIN sessions; disconnect (vs in-band 58) past the deadline | [KIP-368](kip/kip-368.md) |
 | KIP-394 | `MEMBER_ID_REQUIRED` error code defined | the v4+ two-step join handshake — `join()` still takes the legacy assign-inline path | [KIP-394](kip/kip-394.md) |
 | KIP-447 | `TxnOffsetCommit` staging, offset settlement in `EndTxn`, `TxnOffsetCommit` v3 on the wire | cross-broker completion, so offsets only apply when the group and transaction coordinators are the same broker; generation, member and producer-epoch checks on `TxnOffsetCommit` | [KIP-447](kip/kip-447.md) |
-| KIP-516 | operator mints `Status.TopicID` (v4 UUID, never rotated) | broker-side wire propagation — the production topic watch inserts the all-zero sentinel, so Metadata serves nil topic IDs | [KIP-516](kip/kip-516.md) |
+| KIP-516 | operator mints `Status.TopicID` (v4 UUID, never rotated) | broker-side wire propagation — the production topic watch inserts the all-zero sentinel, so Metadata serves nil topic IDs (tracked as gh #346) | [KIP-516](kip/kip-516.md) |
 | KIP-554 | wire keys 50/51 served — describe answers from the live credential store, alter rotates via the `KafkaUser` CR | SCRAM-SHA-256 (kaas is SHA-512-only); wire-side credential *deletion* (refused — the lifecycle stays on the CR) | [KIP-554](kip/kip-554.md) |
 
 ## Deliberate non-goals (8)

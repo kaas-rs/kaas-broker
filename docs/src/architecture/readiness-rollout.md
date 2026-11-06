@@ -26,7 +26,7 @@ separates them, so the broker publishes two:
 | signal | means | computed from | consumed by |
 |---|---|---|---|
 | **`serving`** | takeover of every assigned partition is complete | the assigned set in `assignment.json` vs the partitions open in the storage engine | `/readyz` |
-| **`healthy`** | the main (request) runtime is still scheduling tasks | a 1 s liveness tick on the main runtime | the controller's alive set, via the heartbeat |
+| **`healthy`** | the main (request) runtime is still scheduling tasks | a liveness tick refreshed by a 1 s idle loop and by every completed request, and stale after 5 s of neither | the controller's alive set, via the heartbeat |
 
 The crucial subtlety: **`serving` cannot detect a wedge.** When the
 main runtime seizes up — the observed failure was both worker threads
@@ -38,6 +38,7 @@ tick → it goes stale → the broker stops reporting `healthy`.
 
 ```
 /readyz = listeners-bound
+        AND external TLS has a hostname  (it can't advertise itself otherwise)
         AND main runtime alive           (not wedged)
         AND (cluster ? serving : true)   (takeover complete)
 ```

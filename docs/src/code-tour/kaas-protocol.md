@@ -27,8 +27,9 @@ the auth engine is selected per listener
 proper error-code response with the client's correlation ID — connections
 are not dropped for policy failures.
 
-**Where the boundary sits**: kaas-protocol depends on `kaas-codec` and
-`kaas-auth`; it knows nothing about storage or Kubernetes. Handlers are
+**Where the boundary sits**: kaas-protocol depends on `kaas-codec`,
+`kaas-auth`, `kaas-observability` and, only for `StorageError`, `kaas-storage`;
+it knows nothing about Kubernetes. Handlers are
 registered into the dispatcher by `bins/kaas` — the crate defines the
 `Handler` seam, not the handlers.
 

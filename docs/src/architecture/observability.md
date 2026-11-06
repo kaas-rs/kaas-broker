@@ -59,7 +59,8 @@ stall cleared — exactly when you needed them most.
 Both are served on port 8080:
 
 - **`/readyz`** is the kubelet readiness probe, and it is honest:
-  listeners bound, the main runtime alive, and — in cluster mode —
+  listeners bound, a hostname pattern for any external TLS port, the main
+  runtime alive, and — in cluster mode —
   every partition the assignment gives this broker open in the storage
   engine, i.e. takeover complete. It is served from a dedicated thread
   and runtime, never the main runtime it reports on, so a wedged broker

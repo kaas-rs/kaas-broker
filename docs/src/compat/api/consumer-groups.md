@@ -25,7 +25,8 @@ the next coordinator reads the same file. The coordinator loads a group's file
 into memory the first time anything touches the group: a join, a fetch, a
 commit, a delete. A group that has been idle since the coordinator restarted
 or the group moved therefore still reads, commits and deletes against its
-on-disk offsets. A join reloads the file outright (`Manager::get_or_create`);
+on-disk offsets. The first join that materialises a group reloads the file
+outright (`Manager::get_or_create`), and later joins don't;
 any other first touch fills in only a group that isn't cached yet, so a
 racing commit is never overwritten by the older file.
 
@@ -96,8 +97,6 @@ on an idle group wiped the group's other topics.
   validated against the group state machine — no `ILLEGAL_GENERATION`,
   `UNKNOWN_MEMBER_ID`, or `FENCED_INSTANCE_ID` fencing on the commit path. A
   zombie commit from an evicted member is accepted.
-- Commits are best-effort durable: a disk-write failure is logged but still
-  reported as success (`Manager::offset_commit`).
 - `committed_leader_epoch` (v6+) is decoded but not persisted; fetches always
   return `-1` for it.
 
@@ -225,6 +224,9 @@ evicted at round completion; static members
   legacy pre-v4 path, explicitly marked as a follow-up in the group
   coordinator's join path. Clients work fine (they simply skip
   a retry), but Apache's ghost-member protection is absent.
+- An unknown non-empty `member_id` is admitted as a new member, where Apache
+  answers `UNKNOWN_MEMBER_ID` (25) and the client resets its id (tracked as
+  gh #344).
 - [KIP-345](../kip/kip-345.md) is partial: `group.instance.id` is plumbed
   through join/sync/heartbeat/leave and static members survive the non-rejoin
   eviction, but there is **no `FENCED_INSTANCE_ID` fencing** — two members

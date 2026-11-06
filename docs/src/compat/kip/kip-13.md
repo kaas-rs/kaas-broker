@@ -42,8 +42,7 @@ The Produce and Fetch handlers call the checker on every request
 result straight into the response's `throttle_time_ms`. Quotas fire
 regardless of whether authorization is enabled — they are orthogonal axes
 ([Listeners, auth, quotas](../../architecture/listeners-auth.md#quotas)).
-On brokers with only anonymous listeners a `NoQuotaChecker` stands in
-(ANONYMOUS has no quota config to enforce against).
+A `NoQuotaChecker` stands in only under `KAAS_AUTH_DISABLED=true`.
 
 **Where kaas does less than Apache**: the broker computes and returns
 `throttle_time_ms` but never mutes the connection after responding. That
@@ -61,6 +60,6 @@ back-to-back drains must yield strictly increasing throttle),
 `set_user_quota_live_updates_existing_bucket`.
 
 Against a live cluster, `scripts/kafka-configs.sh` drives the quota CRUD
-surface (`--alter` / `--describe` user quotas, all four Apache quota keys)
-and ends with a live throttle probe that pushes an unbounded offered rate
-through the Apache `kafka-producer-perf-test` tool against a 10 MB/s cap.
+surface: `--alter` / `--describe` user quotas, the three supported keys, and
+the refusal of `controller_mutation_rate`. Throttling itself is covered by
+`produce_exceeds_quota_returns_throttle` in `bins/kaas/tests/auth_smoke.rs`.

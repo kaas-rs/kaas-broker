@@ -38,7 +38,7 @@ Two Helm behaviors worth knowing before overriding anything:
 | `ports.health` | `8080` | Health/readiness HTTP (fixed). |
 | `ports.heartbeat` | `9094` | Inter-broker heartbeat gRPC (fixed, in-cluster only). |
 | `resources` | 500m/1Gi – 2/4Gi | Requests/limits. For benchmarking, note the memory limit also caps page cache under cgroup v2 — a tight limit costs cold-read throughput. |
-| `readinessGate.enabled` | `true` | Adds the `kaas.rs/PartitionsReady` pod readiness gate: a pod joins Service endpoints only once its partition directories exist. Disable only for bare-bones smoke tests. |
+| `readinessGate.enabled` | `true` | Adds the `kaas.rs/PartitionsReady` pod readiness gate: a pod joins Service endpoints only once the broker has applied its first `assignment.json`. Disable only for bare-bones smoke tests. |
 
 ### `broker.podSecurityContext`
 
@@ -80,8 +80,8 @@ leader-election Lease is separate and not configurable: it is fixed at
 
 | Key | Default | Kafka equivalent | Meaning |
 |---|---|---|---|
-| `flushIntervalMessages` | `1` | `log.flush.interval.messages` | The durability dial. `1` = fsync every record (honest `acks=all`; kaas has no replication, so fsync is the *only* durability mechanism). `N` = up to N−1 records lost per partition on crash. `0` = fsync only at segment roll. Overridable per topic via `flush.messages`. See [performance](./performance.md) for what this costs. |
-| `retentionCheckIntervalSeconds` | `300` | `log.retention.check.interval.ms` | Retention sweep cadence — retention **is enforced** (7-day default for unconfigured topics). `0` disables the sweep entirely. Leader-gated; the active segment is never reclaimed. |
+| `flushIntervalMessages` | `1` | `log.flush.interval.messages` | The durability dial. `1` = fsync every record (honest `acks=all`; kaas has no replication, so fsync is the *only* durability mechanism). `N` = up to N−1 records lost per partition on crash. The broker also accepts `0` (fsync only at segment roll), but the chart can't set it yet: `0` renders as `1` (tracked as gh #342). Overridable per topic via `flush.messages`, where `0` does work. See [performance](./performance.md) for what this costs. |
+| `retentionCheckIntervalSeconds` | `300` | `log.retention.check.interval.ms` | Retention sweep cadence — retention **is enforced** (7-day default for unconfigured topics). The broker treats `0` as no sweep, but the chart can't set it yet: `0` renders as `300` (tracked as gh #342). To keep a topic's data, set its `retentionMs: -1`. Leader-gated; the active segment is never reclaimed. |
 | `maxMessageBytes` | `1048588` | `message.max.bytes` | Cap on one Produce batch (Apache's default: 1 MiB + header overhead). Oversized batches get `MESSAGE_TOO_LARGE`. Raise together with consumer `fetch.max.bytes`. |
 | `fsyncMaxLatencyMs` | `30000` | — | Fsync watchdog — the stuck-storage tripwire. Every acked produce fsyncs (at the default flush interval), and a hung NFS server makes that fsync block *forever*, not fail: appenders queue behind the partition lock and producers time out with no error naming the cause. Past this deadline the append instead fails with a **retriable** error and the broker's health state reports storage as stalled, so clients retry and `/healthz` points at the substrate. Apache has no equivalent because ISR failover covers a broker with a hung disk; kaas has no replicas, so failing fast is the fallback. On healthy storage it never fires (fsyncs run in the tens of milliseconds). `0` disables it, for substrates whose legitimate worst-case fsync latency exceeds any sane deadline. |
 | `txnState.numSlots` | `50` | `transaction.state.log.num.partitions` | Transaction-state slot-file count, cluster-wide. Changing it on a live cluster re-shards slot ownership; drain transactional producers first. |
@@ -192,7 +192,7 @@ the model; this is the field reference. Defaults ship four entries:
 | `port` | Unique per entry. |
 | `type` | `internal` (headless-Service DNS) or `external` (per-broker plumbing below). |
 | `tls` | Independent of authentication; `tls: true` + `type: none` is opportunistic TLS. |
-| `authentication.type` | `none` / `scram-sha-512` / `plain` / `mtls` / `oauth`. `mtls` requires `tls: true`; SASL PLAIN and OAUTHBEARER are *refused* over non-TLS connections at runtime (they carry reusable credentials). Anonymous listeners skip ACL evaluation entirely unless `auth.requireSasl` arms them. |
+| `authentication.type` | `none` / `scram-sha-512` / `plain` / `mtls` / `oauth`. `mtls` requires `tls: true`; SASL PLAIN and OAUTHBEARER are *refused* over non-TLS connections at runtime (they carry reusable credentials). Anonymous connections are `User:ANONYMOUS`, which ACLs deny by default under `authorization.type: simple`; `auth.requireSasl` makes those listeners demand SASL instead. |
 | `clientCA.existingSecret` / `key` | Internal TLS listeners only (default key `ca.crt`): the Secret holding the CA that signs client certificates. Only *this* listener then requires a client certificate — SCRAM or OAuth listeners on the same broker keep accepting certificate-less clients, the way Apache Kafka's per-listener `listener.name.<name>.ssl.client.auth` works. Required for an internal `mtls` listener (the template fails without it); the external listener uses its own `clientCA.enabled` block below. |
 
 ### `external`-type extras
@@ -227,7 +227,7 @@ Strimzi's `KafkaListenerAuthenticationOAuth` field names, verbatim:
 | Key | Default | Meaning |
 |---|---|---|
 | `type` | `""` | `""` = no authorization (Strimzi's "missing = no restrictions"). `simple` = ACL enforcement from the operator-managed ACL file. Cluster-wide — authentication stays per-listener, and quotas fire regardless of this setting (orthogonal axes). |
-| `superUsers` | `[]` | Principals that bypass ACL evaluation (early-allow). Matched verbatim: bare names for SCRAM/OAuth principals, `CN=…` for mTLS subjects. |
+| `superUsers` | `[]` | Principals that bypass ACL evaluation (early-allow). Full principal strings, matched verbatim: `User:alice`, not `alice`, which never matches. An mTLS principal is `User:` plus its mapped name, by default the certificate's CN. |
 
 ## Implementation notes (for contributors)
 

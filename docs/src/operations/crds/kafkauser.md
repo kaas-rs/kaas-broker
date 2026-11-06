@@ -47,7 +47,7 @@ The principal name is `User:<metadata.name>` — here `User:orders-service`.
 
 | `type` | Meaning |
 |---|---|
-| `scram-sha-512` | SASL/SCRAM credential. With no `password` ref, the operator generates a stable 32-char password and publishes it in the output Secret `<user>-kafka-credentials` (named in `status.secret`). Point `password.name`/`password.key` at your own Secret to bring a password instead. |
+| `scram-sha-512` | SASL/SCRAM credential. With no `password` ref, the operator generates a stable 32-char password and publishes it in the output Secret `<user>-kafka-credentials` (named in `status.secret`). Point `password.name`/`password.key` at your own Secret to bring a password instead; the output Secret is still written, holding that password. A pre-derived `scram` block skips it. |
 | `tls` | mTLS principal. The operator stamps the certificate CN from `certificateRef` as the principal. |
 | `kubernetes-serviceaccount` | ServiceAccount-JWT principal via `serviceAccountRef`. |
 
@@ -120,17 +120,17 @@ The **one deliberate naming divergence from Strimzi**:
 |---|---|---|
 | `producerMaxByteRatePerBroker` | `producerByteRate` | Kafka quotas are enforced **per broker** (KIP-13): with N brokers the effective cluster-wide ceiling is N × the value. Strimzi's name reads cluster-wide; the kaas name says what actually happens. |
 | `consumerMaxByteRatePerBroker` | `consumerByteRate` | Same. |
-| `requestPercentage` | `requestPercentage` | Unchanged (0–100). |
+| `requestPercentage` | `requestPercentage` | Unchanged (0–100). Stored and reported, but not enforced. |
 
-The semantics are identical to Strimzi/Apache — only the names differ.
-Quotas are enforced whether or not authorization is enabled; they are
+The byte-rate semantics are identical to Strimzi/Apache — only the names
+differ. They are enforced whether or not authorization is enabled; the two are
 orthogonal axes.
 
 ## Status
 
 | Field | Meaning |
 |---|---|
-| `secret` | Name of the generated credentials Secret, for SCRAM users whose password the operator minted. |
+| `secret` | Name of the output credentials Secret, for SCRAM users without a pre-derived `scram` block. |
 | `conditions` | `Ready`; a user referencing a missing password Secret parks unready until the Secret appears. |
 
 `kubectl get kafkausers` prints `Auth type` and `Ready`.

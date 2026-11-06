@@ -8,9 +8,10 @@ of `KafkaTopic` custom resources,
 the operator reconciles the CR into on-disk state, and the broker observes the
 result through its topic watcher — see
 [Kubernetes integration](../../architecture/kubernetes.md). In dev mode
-(`MY_POD_NAME` unset, no kube client) the CR writer is a stub that refuses
-every write, so the mutating APIs answer `CLUSTER_AUTHORIZATION_FAILED` (31)
-with the message `broker is not running in cluster mode`.
+(`MY_POD_NAME` unset, no kube client) no CR writer is installed, so the mutating
+APIs answer `CLUSTER_AUTHORIZATION_FAILED` (31) with the message `broker is not
+running in cluster mode`. The exception is DeleteTopics, which removes the topic
+from the registry and succeeds.
 
 ## CreateTopics
 
@@ -241,6 +242,8 @@ Everything else (`BROKER_LOGGER` included) gets a per-resource
   target).
 - `BROKER_LOGGER` is unsupported and answers `UNSUPPORTED_VERSION` (35),
   where Apache serves log4j levels (tracked as gh #338).
+- A `BROKER` resource is answered with no ACL check, where Apache requires
+  `DescribeConfigs` on the cluster (tracked as gh #345).
 
 **Source**: `crates/kaas-broker/src/handlers/describe_configs.rs`,
 `crates/kaas-broker/src/topic_config_defaults.rs`.
@@ -264,7 +267,8 @@ operator's reconciler enforces the same guard as backstop. A missing CR is
 `CLUSTER_AUTHORIZATION_FAILED` (31). The operator creates the new partition
 directories on reconcile and the broker serves them after its watcher fires —
 expansion is asynchronous, same as topic creation. `validate_only` (v1+)
-short-circuits before the patch.
+short-circuits after the authorization and writer checks, before the CR is
+read, so it reports success even for a nonexistent topic or a shrink.
 
 **Deviations from Apache 3.7**:
 

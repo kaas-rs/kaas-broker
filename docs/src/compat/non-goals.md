@@ -129,6 +129,7 @@ correctness gap.
 The Apache inter-broker/controller keys (LeaderAndIsr, StopReplica,
 UpdateMetadata, ControlledShutdown, the KRaft quorum and Envelope
 family) don't exist in kaas at all — there is no replication protocol to
-drive and no quorum to speak. kaas brokers coordinate through exactly
-two channels: the heartbeat gRPC stream and files on the shared volume
+drive and no quorum to speak. Apart from the Kubernetes API (the controller
+Lease and the peer-endpoint watch), kaas brokers coordinate through exactly two
+channels: the heartbeat gRPC stream and files on the shared volume
 ([Controller](../architecture/controller.md)).

@@ -110,6 +110,8 @@ mid-deletion are skipped.
 **Deviations from Apache 3.7**:
 
 - Dev mode reports success with zero matches, without touching anything.
+- CRs are rewritten one at a time, so a failure partway answers an error even
+  though earlier CRs have already changed.
 
 **Source**: `crates/kaas-broker/src/handlers/acls.rs`,
 `crates/kaas-broker/src/acl_cr_writer.rs` (`delete_acls`),
@@ -142,7 +144,8 @@ wire from "no quotas configured", mirroring Apache.
 - Only the `user` entity axis exists. `client-id` / `ip` components, and the
   `DEFAULT` match type (`<default>` user entity), return an **empty result**
   rather than an error — kaas users are CR-instantiated, so there is no
-  default entity.
+  default entity. A filter combining `user` with `client-id` ignores the
+  `client-id` component.
 - Quota values are **per-broker** ([KIP-13](../kip/kip-13.md)) — same
   semantics as Apache, but worth restating: with N brokers the cluster-wide
   ceiling is N × the reported value. The CR field names
@@ -261,9 +264,10 @@ derives the RFC 5802 stored/server keys and patches them into
 `KafkaUser.spec.authentication.scram`. The operator materialises the change
 into `credentials.json` on reconcile and every broker hot-reloads it, so
 the rotation is **asynchronous** (typically a few seconds) and cluster-wide.
-The CR's `authentication.type` must be `scram-sha-512` or unset — rotating a
-`tls` user's SCRAM credential would silently flip its auth mechanism, so that
-answers `INVALID_REQUEST` (42). Empty salt/saltedPassword also answer
+The CR needs an `authentication` block whose `type` is `scram-sha-512` or empty.
+Rotating a `tls` user's SCRAM credential would silently flip its auth mechanism,
+and an authorization-only user has no credential to rotate, so both answer
+`INVALID_REQUEST` (42). Empty salt/saltedPassword also answer
 `UNACCEPTABLE_CREDENTIAL` (93).
 
 **Deviations from Apache 3.7**:

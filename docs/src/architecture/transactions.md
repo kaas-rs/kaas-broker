@@ -185,7 +185,9 @@ transaction's partitions keep a pinned last stable offset until it heals.
 Self-led markers are written *before* the queue entries, so a
 coordinator crash mid-dispatch never loses the local marker. A retried
 `EndTxn` overwrites the same `{pid}-{epoch}.json` file — the queue is
-idempotent by naming. Consumers in `read_committed` only see the
+idempotent by naming. A re-drive does append self-led markers again, which is
+harmless: control batches have no sequence numbers, and consumers don't react
+to a second marker. Consumers in `read_committed` only see the
 transaction's records once these markers land (the fetch path clamps to
 the last stable offset).
 

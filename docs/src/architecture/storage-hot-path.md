@@ -30,7 +30,7 @@ sequenceDiagram
     C->>L: Produce (RecordBatch bytes)
     L->>L: read_frame → decode_request_header
     L->>H: dispatch by api_key<br/>(per-listener pre-auth gate)
-    H->>H: ACL Write? · topic exists? · batch structure?<br/>do I lead it? · heartbeat fresh (self-fence)?<br/>size, CRC and header fields valid?
+    H->>H: transactional batches: Write on the transactional.id?<br/>ACL Write? · topic exists? · batch structure?<br/>do I lead it? · heartbeat fresh (self-fence)?<br/>size, CRC and header fields valid?
     Note over H: any gate fails → its own error, e.g.<br/>TOPIC_AUTHORIZATION_FAILED (29) /<br/>NOT_LEADER_OR_FOLLOWER (6) / CORRUPT_MESSAGE (2)
     H->>P: engine.append(topic, partition, epoch, acks, bytes)
     activate P
@@ -61,7 +61,8 @@ verbatim on disk. A duplicate writes nothing, but at `acks=all` it still
 waits for any flush outstanding, so a client retrying on a new connection
 can't be acked ahead of the original's fsync. The quota check runs once
 per request over the summed byte count, after the appends, and feeds
-`throttle_time_ms`.
+`throttle_time_ms`. An `acks=0` request gets no response, and its connection
+is closed instead if any partition failed.
 
 ## A Fetch request, end to end
 
@@ -317,7 +318,9 @@ gh #275).
 every batch waits for a group-commit fsync cycle) mirrors Apache
 Kafka's `log.flush.interval.messages`. Raising it trades durability for
 throughput by letting the committer skip cycles until N messages are
-pending — same semantics, same trade, as Apache. On NFS substrates
+pending — same semantics, same trade, as Apache. A topic can override it
+with `flushMessages` in `spec.config`, where `0` means fsync only at segment
+roll. On NFS substrates
 where the COMMIT round-trip dominates, this and the group-commit
 coalescing are the two levers that matter (see
 [Performance](../operations/performance.md)).

@@ -14,9 +14,9 @@ Idempotent producer, transaction and group handlers are covered by `crates/kaas-
 
 `list_offsets.rs` answers the earliest and latest sentinels. Timestamp-to-offset resolution is still stubbed to `(-1,-1)` in `kaas-storage/src/disk.rs`.
 
-## TopicID propagation (gh #105, KIP-516)
+## TopicID propagation (gh #346, KIP-516)
 
-Every `KafkaTopic`'s `Status.TopicID` carries a v4-shape UUID, generated cryptographically in `crates/kaas-operator-controllers/src/kafkatopic_controller.rs` on first reconcile and **never rotated** (Apache's contract: re-created topics get distinct IDs). The *intended* state flow — topic watcher stashes `Status.TopicID` → topic registry surfaces it → Metadata v10+ writes the 16 raw bytes — is only partially wired: the production topic watch (`run_topic_watch` in `kube_watchers.rs`, wired from `bins/kaas/src/main.rs`) inserts registry entries with the all-zero sentinel, so **Metadata currently serves nil topic IDs for every topic** and clients fall back to name-based lookups. Wiring the ID through (and `CreateTopics` v7+ carrying the UUID in its response) is open follow-up.
+Every `KafkaTopic`'s `Status.TopicID` carries a v4-shape UUID, generated cryptographically in `crates/kaas-operator-controllers/src/kafkatopic_controller.rs` on first reconcile and **never rotated** (Apache's contract: re-created topics get distinct IDs). The *intended* state flow — topic watcher stashes `Status.TopicID` → topic registry surfaces it → Metadata v10+ writes the 16 raw bytes — is only partially wired: the production topic watch (`run_topic_watch` in `kube_watchers.rs`, wired from `bins/kaas/src/main.rs`) inserts registry entries with the all-zero sentinel, so **Metadata currently serves nil topic IDs for every topic** and clients fall back to name-based lookups. Wiring the ID through (and `CreateTopics` v7+ carrying the UUID in its response) is open (gh #346; gh #105 was closed without it).
 
 ## Fetch sessions (gh #4)
 

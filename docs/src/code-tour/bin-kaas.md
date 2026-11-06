@@ -6,7 +6,7 @@ The broker entrypoint: dispatcher registration, env wiring, the cluster runtime,
 where every seam the library crates expose gets a production
 implementation plugged in.
 
-**`main.rs`**: parses `KAAS_LISTENERS` (default: one plain listener on
+**`main.rs`**: parses `KAAS_LISTENERS` (default: one listener named `internal` on
 `0.0.0.0:9092`), selects storage (`KAAS_DATA_DIR` set → disk engine;
 unset → in-memory dev mode), builds the per-listener auth engines and the
 cluster-wide authorizer/quota checker, registers every handler with the

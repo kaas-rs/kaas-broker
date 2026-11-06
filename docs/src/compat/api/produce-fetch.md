@@ -73,6 +73,11 @@ fsync — one `sync_all()` cycle serves every concurrent appender —
 with `KAAS_FLUSH_INTERVAL_MESSAGES` (default 1) as the durability dial,
 overridable per topic via the `flush.messages` topic config.
 
+Engine failures that aren't a protocol answer map like this: a stalled
+partition, one being migrated, or a directory still stamped by a previous
+topic incarnation answers the retriable `LEADER_NOT_AVAILABLE` (5), and an I/O
+failure answers `KAFKA_STORAGE_ERROR` (56).
+
 The produce quota is checked once per request over the summed record bytes,
 after the appends, and feeds `throttle_time_ms` in the response. A request
 refused by the transactional-id gate appended nothing and isn't charged.
@@ -83,8 +88,8 @@ gets to refresh its metadata (gh #200).
 
 **Deviations from Apache 3.7**:
 
-- The `message.max.bytes` cap is the fixed Apache default — the per-topic
-  `max.message.bytes` config override is not consulted.
+- The `message.max.bytes` cap is broker-wide (`broker.maxMessageBytes`, default
+  Apache's 1048588); the per-topic `max.message.bytes` override is not consulted.
 - `log_append_time_ms` is always `-1`: the broker never stamps append time,
   so `message.timestamp.type=LogAppendTime` semantics are not implemented.
 - The v8+ `record_errors` / `error_message` fields are never populated —
@@ -152,6 +157,8 @@ path stays possible; today it is a future optimisation, not what ships.
 - **No long-poll**: `max_wait_ms` and `min_bytes` are decoded but ignored.
   An empty fetch returns immediately instead of parking until data arrives or
   the wait expires; clients simply re-poll.
+- The request-level `max_bytes` is decoded but ignored. Only
+  `partition_max_bytes` caps each partition, so a response can exceed it.
 - The leader-epoch fields (`current_leader_epoch`, `last_fetched_epoch`) are
   not validated — kaas never returns `FENCED_LEADER_EPOCH` or
   `UNKNOWN_LEADER_EPOCH`, and KIP-320 truncation detection does not apply
@@ -279,14 +286,16 @@ answered once.
   broker-side observation plumbing exists, yet the watcher callback that
   feeds the topic registry inserts `[0; 16]`.
   [KIP-516](../kip/kip-516.md) is partial: minted operator-side, not yet
-  propagated to the Metadata response.
+  propagated to the Metadata response (tracked as gh #346).
 - `leader_epoch` is always `0` (v7+ field) — clients that cache epochs for
   truncation detection get a constant.
 - Auto-creation (`auto.create.topics.enable`, chart
   `autoCreateTopics.enabled`, gh #242) mints a `KafkaTopic` CR and answers
   `LEADER_NOT_AVAILABLE` (5) until the operator materializes it. It needs
   `Create` on the cluster or on the topic, as in Apache and as CreateTopics
-  does (gh #280; the cluster-wide grant wasn't consulted before).
+  does (gh #280; the cluster-wide grant wasn't consulted before). It refuses a
+  `__`-prefixed name with `UNKNOWN_TOPIC_OR_PARTITION` (3), and a name that fails
+  Apache's topic-name rules answers `INVALID_TOPIC_EXCEPTION` (17).
 - `rack` is always null and `is_internal` always false — kaas advertises no
   internal topics (there is no on-wire `__consumer_offsets`).
 - v11+ is not registered; clients negotiate down to v10 via ApiVersions.

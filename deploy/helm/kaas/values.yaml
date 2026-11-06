@@ -43,23 +43,13 @@ operator:
 broker:
   replicaCount: 3
   clusterID: kaas-local
-  # gh #208 mitigation. During a rolling update the StatefulSet must
-  # observe a pod continuously Ready for this many seconds before it
-  # proceeds to the next pod. Today /readyz flips at listener-bind
-  # (~20 ms), well before the pod has taken over its assigned
-  # partitions, so without this the controller kills pod N+1 while
-  # pod N is still recovering — two brokers effectively out at once.
-  #
-  # Because the (dishonest) readiness lands the pod in the alive set
-  # immediately, the pod DOES get assigned and take over during this
-  # window — so the wait is what actually lets takeover finish before
-  # the next pod dies. A readiness flap (e.g. the probe timing out
-  # under takeover load) resets the timer, which is the intended
-  # behaviour. This is a mitigation, not the fix: honest readiness
-  # gated on takeover completion is the real work (gh #208).
-  #
-  # 60 s covers takeover of a normal partition set on healthy storage.
-  # Raise it on slow shared storage where recovery scans take longer.
+  # gh #208. During a rolling update the StatefulSet must observe a pod
+  # continuously Ready for this many seconds before it proceeds to the
+  # next pod. /readyz is serving-gated, so a pod isn't Ready until
+  # takeover of its assigned partitions is complete, and this wait is a
+  # safety margin rather than the mechanism. A readiness flap (e.g. the
+  # probe timing out under takeover load) resets the timer, which is the
+  # intended behaviour.
   minReadySeconds: 60
   ports:
     health: 8080
@@ -104,10 +94,10 @@ broker:
     fsGroup: 0
     fsGroupChangePolicy: OnRootMismatch
   readinessGate:
-    # Adds the kaas.rs/PartitionsReady readinessGate to broker pods. Required
-    # whenever the broker's ReadinessUpdater is expected to gate Endpoints
-    # membership on initial partition acquisition. Disable for bare-bones smoke
-    # tests where you just want the pod Ready as soon as the listener is up.
+    # Adds the kaas.rs/PartitionsReady readinessGate to broker pods. The broker
+    # patches the condition True the first time it applies an assignment.json.
+    # Disable for bare-bones smoke tests where you just want the pod Ready as
+    # soon as the listener is up.
     enabled: true
 
   # v3 cluster-controller Lease (Phase 4). One Lease per cluster; the
@@ -129,6 +119,8 @@ broker:
   #               storage substrate's write cache is power-fail safe.
   #   0           — disable message-driven flushing entirely. Fsync only
   #               at segment roll. Maximum throughput, weakest durability.
+  #               The chart can't set this yet: `0` renders as 1 (gh #342).
+  #               A topic's own `flushMessages: 0` does work.
   flushIntervalMessages: 1
 
   # gh #250: how often the retention cleaner sweeps owned partitions and
@@ -137,9 +129,9 @@ broker:
   # `log.retention.check.interval.ms` (same 5-minute default).
   #
   # Only the partition's leader reaps, and the active segment is never
-  # reclaimed — that stays DeleteRecords' job. `0` disables the sweep,
-  # which means nothing reclaims disk except DeleteRecords and topic
-  # deletion.
+  # reclaimed — that stays DeleteRecords' job. The broker treats `0` as
+  # "no sweep", but the chart can't set it yet: `0` renders as 300
+  # (gh #342). To keep a topic's data, set its `retentionMs: -1`.
   retentionCheckIntervalSeconds: 300
 
   # gh #253: Apache's message.max.bytes — the broker-wide cap on one
@@ -399,9 +391,9 @@ listeners:
   - name: plain
     # Plaintext in-cluster listener. Use the per-broker headless DNS
     # to reach it: `<pod>.<headlessSvc>.<ns>.svc.<clusterDomain>:9092`.
-    # Anonymous + no ACL evaluation (anonymous listeners short-circuit
-    # the cluster authorizer's ACL path — only quotas run, and they're
-    # no-ops for User:ANONYMOUS).
+    # Anonymous connections are User:ANONYMOUS and go through the cluster
+    # authorizer like any other principal, so under authorization.type:
+    # simple they're denied unless an ACL grants User:ANONYMOUS.
     port: 9092
     type: internal
     tls: false
@@ -525,11 +517,11 @@ clusterDomain: cluster.local
 # tracked separately and slot into the same Authorizer interface
 # without further refactor.
 #
-# `superUsers` is a list of principal names that bypass ACL
-# evaluation entirely (early-allow). Match verbatim against
-# Principal.Name — use `CN=foo` for mTLS subjects and bare names
-# for SCRAM principals. Useful for operator-internal accounts and
-# break-glass.
+# `superUsers` is a list of full principal strings that bypass ACL
+# evaluation entirely (early-allow), matched verbatim: `User:alice`,
+# not `alice`, which never matches. An mTLS principal is `User:` plus
+# its mapped name, by default the certificate's CN. Useful for
+# operator-internal accounts and break-glass.
 authorization:
   type: ""           # "" | "simple"
   superUsers: []
@@ -537,5 +529,5 @@ authorization:
   # Example:
   #   type: simple
   #   superUsers:
-  #     - alice
-  #     - CN=operator
+  #     - User:alice
+  #     - User:operator

@@ -15,11 +15,11 @@ disk and topic deletion loops forever.
 
 kaas's answer extends its single-writer-per-partition model to file
 descriptors: **only a partition's current leader holds open log and
-index handles**. Every other broker knows the segments as metadata
-only — size, base offset, and leader epoch, all readable from the
-filename without opening the file. Handles are opened on takeover and
-dropped on relinquish or close; even opening a partition at broker
-startup only *stats* the segment files.
+index handles**. Every other broker holds nothing open for that partition.
+Handles are opened on takeover and dropped on relinquish or close, and even
+on the leader, opening a partition opens only the active segment's handles.
+Closed segments stay as metadata: base offset and leader epoch from the
+filename, and size from a stat.
 
 The payoff is day-to-day, not just in failure cases: segment retention,
 `DeleteRecords`, and segment-roll cleanup all unlink files on the
@@ -153,7 +153,8 @@ is the next chapter: [The RWX substrate contract](./nfs-substrate.md).
 
 - The leader-only FD rule is gh #76: `TakeoverDriver` calls the
   engine's take-over, which opens handles before recovery; relinquish
-  closes them. Partition open at startup stats without opening.
+  closes them. `Partition::open` opens the active segment's handles;
+  closed segments stay metadata-only (`list_segments`).
 - `abandon_topic` ≠ `relinquish` (gh #219) — don't "unify" them:
   abandon must close handles and persist **nothing**, or a late close
   writes the dead incarnation's HWM and dedupe window into a recreated

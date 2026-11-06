@@ -246,8 +246,8 @@ mapping to its CN.
 
 ## Quotas
 
-The quota checker defaults to no-op and switches to real token buckets
-when auth is enabled. Two properties matter:
+Quotas use real token buckets on every listener, whatever its authentication
+type, unless `KAAS_AUTH_DISABLED=true` swaps in a no-op. Two properties matter:
 
 - **Quotas are orthogonal to authorization** — they fire even with
   authorization off, and per KIP-13 they are **per-broker**: with N

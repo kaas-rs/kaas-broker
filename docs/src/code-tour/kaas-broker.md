@@ -32,7 +32,8 @@ to Kubernetes (CreateTopics/CreatePartitions/IncrementalAlterConfigs and
 Metadata auto-topic-creation → `KafkaTopic`, Create/DeleteAcls →
 `KafkaUser`, AlterUserScramCredentials → `KafkaUser.spec.authentication.scram`
 — KIP-554, gh #252). None of them is installed without a kube client, where
-the topic admin APIs answer `CLUSTER_AUTHORIZATION_FAILED` (31). The quota
+most topic admin APIs answer `CLUSTER_AUTHORIZATION_FAILED` (31) and DeleteTopics
+only removes the topic from the registry. The quota
 admin API writes no CR: it changes the serving broker's enforcer in memory.
 
 **Handlers**: one module per API key under `handlers/`. The per-key

@@ -37,7 +37,7 @@ helm install my-kaas oci://ghcr.io/kaas-rs/charts/kaas-broker \
 The chart is published as an OCI artifact to GHCR. No `helm repo add` needed.
 
 The chart bundles its CRDs under `crds/`, so Helm installs them automatically on
-first install. The chart is always pushed under the name `kaas` (from
+first install. The chart is always pushed under the name `kaas-broker` (from
 `Chart.yaml`); pre-release tags (`vX.Y.Z-*`) only rename the *images* to their
 `*-preview` variants — the image helpers derive that suffix from the tag, so no
 repository override is needed:
@@ -66,7 +66,7 @@ CRDs, apply them explicitly before `helm upgrade`:
 ```bash
 # Pull the new chart version locally, then apply the CRDs it ships:
 helm pull oci://ghcr.io/kaas-rs/charts/kaas-broker --version 0.3.63-preview --untar
-kubectl apply -f kaas/crds/
+kubectl apply -f kaas-broker/crds/
 
 # Or apply them straight from the repo at a specific ref:
 REF=v0.3.63-preview
@@ -94,7 +94,7 @@ NFSv4-class semantics works.
 | StorageClass | Status | Notes |
 |---|---|---|
 | **CephFS (Rook / ceph-csi)** | ✅ Production | Strong same-directory rename atomicity; recommended. |
-| **csi-driver-nfs / NFSv4.1 server** | ✅ Production | Use `nconnect=4-8` and `acregmax=1` for sub-second mtime freshness on assignment.json polling. |
+| **csi-driver-nfs / NFSv4.1 server** | ✅ Production | Use `acregmax=1` for sub-second mtime freshness on assignment.json polling; `nconnect` is covered below. |
 | **AWS EFS / Azure Files Premium NFS / GCP Filestore** | ✅ Production | All offer NFSv4-class semantics. |
 | **Longhorn / OpenEBS RWX** | ✅ Production | Block-backed RWX. |
 | **Local / hostPath** | ✅ Single-pod dev | Not RWX; only works with `broker.replicaCount: 1`. |
@@ -192,8 +192,9 @@ the optional `bootstrapHostname`. Both choices are deliberate:
   rotation churn for no gain — every broker pod mounts the same
   Secret, and the in-process TLS listener picks the right SNI from
   the cert's SAN list. cert-manager rotates this single Secret
-  in-place; the broker fsnotify-watches the mount and hot-reloads
-  without a pod restart.
+  in-place, but the broker reads it only at startup, so a rotated
+  certificate takes effect when the pod restarts. Roll the brokers
+  before the old one expires (gh #343).
 
 If you scale `broker.replicaCount` up at runtime, the operator
 re-reconciles the `KafkaCluster` CR and updates the Certificate's
@@ -221,9 +222,9 @@ See `values.yaml` for the full set of tunables. Common overrides:
 | `listeners[]` | plain/external/authed/oauth | Strimzi-shape listener array (gh #126): per-entry `name`, `port`, `type`, `tls`, `authentication.type`, `enabled` — see values.yaml comments. `authentication.type: oauth` (gh #42) adds `validIssuerUri`, `jwksEndpointUri`, `userNameClaim`, `fallbackUserNameClaim`, `checkAudience`+`clientId`, `jwksRefreshSeconds`, `maxSecondsWithoutReauthentication` (Strimzi field names, passed to the broker verbatim) |
 | `authorization.type` | `""` | Cluster-wide authorization: `""` (off) or `simple` (ACL-based) |
 | `authorization.superUsers` | `[]` | Principals that bypass ACL evaluation |
-| `broker.flushIntervalMessages` | 1 | `KAAS_FLUSH_INTERVAL_MESSAGES` durability dial |
+| `broker.flushIntervalMessages` | 1 | `KAAS_FLUSH_INTERVAL_MESSAGES` durability dial; `0` renders as 1 for now (gh #342) |
 | `broker.minReadySeconds` | 60 | StatefulSet `minReadySeconds`: how long a freshly Ready broker must stay Ready before the rollout proceeds |
-| `broker.retentionCheckIntervalSeconds` | 300 | Retention sweep interval (Apache `log.retention.check.interval.ms`); `0` disables the sweep |
+| `broker.retentionCheckIntervalSeconds` | 300 | Retention sweep interval (Apache `log.retention.check.interval.ms`); `0` renders as 300 for now (gh #342) |
 | `broker.maxMessageBytes` | 1048588 | Apache `message.max.bytes` — broker-wide cap on one Produce batch (gh #253) |
 | `broker.fsyncMaxLatencyMs` | 30000 | fsync watchdog deadline; `0` disables (gh #256) |
 | `broker.controllerLease.durationSeconds` | 15 | Cluster-controller Lease lifetime; lower = faster failover, more etcd writes |

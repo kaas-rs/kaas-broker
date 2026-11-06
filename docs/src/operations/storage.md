@@ -46,15 +46,16 @@ Set on the StorageClass (`mountOptions`), not the PVC:
 ```yaml
 mountOptions:
   - nfsvers=4.1
-  - nconnect=8    # parallel TCP connections; faster concurrent fsyncs
+  - nconnect=8    # parallel TCP connections; see below before relying on it
   - acregmax=1    # sub-second attribute-cache expiry
   - hard          # block on server unavailability instead of EIO
 ```
 
 `acregmax=1` matters most: brokers poll `assignment.json`'s mtime as the
 failover signal, and NFS's default 60 s attribute cache would delay every
-controller failover by up to a minute. `nconnect` raises throughput when
-multiple brokers fsync concurrently.
+controller failover by up to a minute. `nconnect` only helps if RPCs are
+waiting for a free transport slot: if `bklog_u` in `mountstats` is 0, it buys
+nothing (see "On `nconnect`" in the chart's README).
 
 One reclaim-policy caution: keep the data PV on `reclaimPolicy: Retain`
 (or the chart's kept PVCs — all three PVC classes carry
@@ -88,3 +89,7 @@ unbounded — comparable durability semantics to a single Apache broker.
 The recorded benchmarks ([performance](./performance.md)) run the
 default honest fsync (interval 1). NFS COMMIT latency dominates either
 way; this dial decides how often you pay it.
+
+A topic can override the dial with `flushMessages` in `spec.config`, where `0`
+means fsync only at segment roll. The chart can't set the broker-wide value to
+`0` yet (tracked as gh #342).

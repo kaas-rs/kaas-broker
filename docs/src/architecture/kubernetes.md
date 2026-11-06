@@ -188,11 +188,11 @@ within minutes, rather than synchronously with the delete.
 ## Readiness gate
 
 Broker pods declare the `kaas.rs/PartitionsReady` readiness gate; the
-broker patches its own pod condition once the partition directories it
-needs exist on the volume — keeping a broker out of Service endpoints
-until the storage it serves from is actually in place.
+broker patches its own pod condition the first time it applies an
+`assignment.json`, retrying with backoff until the patch lands. That keeps a
+broker out of Service endpoints until it has heard from the controller once.
 
-That gate is the *storage-provisioned* precondition. The full readiness
+The gate flips once and says nothing about storage. The full readiness
 answer — `/readyz` returning 200 only once the broker is actually
 serving its assigned partitions, and the controller's alive set
 tracking main-runtime liveness rather than pod readiness — is its own
@@ -210,4 +210,6 @@ pacing](./readiness-rollout.md).
   which also removed the earlier `KafkaACL` / `KafkaUserGroup` CRs.
 - Broker RBAC is `deploy/helm/kaas/templates/broker-rbac.yaml` — check
   it whenever a new admin write path lands.
-- The readiness-gate patcher is `crates/kaas-k8s/src/readiness.rs`.
+- The gate is flipped from `bins/kaas/src/cluster.rs` through
+  `kube_watchers::patch_readiness`; the condition name is in
+  `crates/kaas-k8s/src/readiness.rs`.
