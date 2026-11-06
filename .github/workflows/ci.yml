@@ -79,6 +79,15 @@ jobs:
       - name: Docs drift gate
         run: cargo xtask check-docs-drift
 
+      # Renders the chart and parses every document, because `helm template`
+      # and `helm lint` don't, while kustomize and so ArgoCD do. A stray `-}}`
+      # once passed all of them and stopped a deploy (gh #320).
+      - uses: azure/setup-helm@v5
+        with:
+          version: 'v3.14.0'
+      - name: Chart YAML gate
+        run: cargo xtask check-chart
+
   docker:
     runs-on: arc-runner-set
     steps:

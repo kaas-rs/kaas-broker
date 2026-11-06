@@ -1,5 +1,5 @@
 //! Repo-wide chores: `gen-proto`, `gen-crds`, `check-crd-drift`,
-//! `gen-api-matrix`, `check-docs-drift`, `fmt-check`, `ci`, `docs`.
+//! `gen-api-matrix`, `check-docs-drift`, `check-chart`, `fmt-check`, `ci`, `docs`.
 //!
 //! `gen-crds` (Phase 7) walks the four `kube-derive` types in
 //! `kaas-operator-api`, canonicalises the generated YAML to drop the
@@ -18,6 +18,7 @@ use kaas_operator_api::{KafkaCluster, KafkaTopic, KafkaUser};
 use kube::CustomResourceExt;
 
 mod api_matrix;
+mod chart;
 
 fn main() -> Result<()> {
     let task = env::args().nth(1).unwrap_or_default();
@@ -27,13 +28,22 @@ fn main() -> Result<()> {
         "check-crd-drift" => check_crd_drift(),
         "gen-api-matrix" => api_matrix::generate(&repo_root()?),
         "check-docs-drift" => check_docs_drift(),
+        "check-chart" => {
+            let args: Vec<String> = env::args().skip(2).collect();
+            let values = match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+                [] => None,
+                ["--values", file] => Some(file),
+                _ => bail!("usage: check-chart [--values FILE]"),
+            };
+            chart::check(&repo_root()?, values)
+        }
         "fmt-check" => run(&["cargo", "fmt", "--check"]),
         "ci" => ci(),
         "docs" => docs(),
         other => Err(anyhow::anyhow!(
             "unknown xtask: {other:?}. \
              try: gen-proto | gen-crds | check-crd-drift | gen-api-matrix | \
-             check-docs-drift | fmt-check | ci | docs [--serve]"
+             check-docs-drift | check-chart [--values FILE] | fmt-check | ci | docs [--serve]"
         )),
     }
 }

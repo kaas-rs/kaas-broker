@@ -32,6 +32,7 @@ cargo xtask gen-crds                                     # regenerate deploy/crd
 cargo xtask check-crd-drift                              # CI gate: gen-crds then git diff --exit-code
 cargo xtask gen-api-matrix                               # regenerate docs/src/compat/api-matrix.md from the codec registry
 cargo xtask check-docs-drift                             # CI gate: gen-api-matrix + git diff + book source-path scan
+cargo xtask check-chart [--values FILE]                  # CI gate: render the chart and parse every document; helm template and helm lint don't
 cargo xtask docs                                         # mdbook build docs (--serve for live preview)
 ```
 
@@ -41,7 +42,7 @@ cargo xtask docs                                         # mdbook build docs (--
 
 `.github/workflows/ci.yml` runs three jobs in parallel:
 
-- `rust` — `cargo fmt --check` + `cargo clippy -D warnings` + `cargo test --workspace --all-features` + `cargo build --release --workspace --bins` + `cargo xtask check-crd-drift` + `cargo xtask check-docs-drift`.
+- `rust` — `cargo fmt --check` + `cargo clippy -D warnings` + `cargo test --workspace --all-features` + `cargo build --release --workspace --bins` + `cargo xtask check-crd-drift` + `cargo xtask check-docs-drift` + `cargo xtask check-chart`.
 - `docker` — buildx of `bins/kaas/Dockerfile` and `bins/kaas-operator/Dockerfile`, no push.
 - `helm` — `helm lint deploy/helm/kaas` + `helm template`.
 

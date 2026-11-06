@@ -16,12 +16,13 @@ spec:
 {{- if .Values.storage.controlPlane.enabled }}
 {{- /* gh #320: the operator's sweep deletes any directory in a log dir that
        isn't a topic, so the cluster state can't live inside one. The broker and
-       operator refuse this at boot too; this fails it at render time. */ -}}
-{{- $data := trimSuffix "/" .Values.storage.mountPath -}}
-{{- $cp := trimSuffix "/" .Values.storage.controlPlane.mountPath -}}
-{{- if or (eq $cp $data) (hasPrefix (printf "%s/" $data) $cp) (hasPrefix "/vols/" $cp) -}}
-{{- fail (printf "storage.controlPlane.mountPath %s must be outside the data dir (%s) and /vols: the operator's sweep would delete it" $cp $data) -}}
-{{- end -}}
+       operator refuse this at boot too; this fails it at render time. No `-}}`
+       on these lines: it would eat the newline before the `---` below. */}}
+{{- $data := trimSuffix "/" .Values.storage.mountPath }}
+{{- $cp := trimSuffix "/" .Values.storage.controlPlane.mountPath }}
+{{- if or (eq $cp $data) (hasPrefix (printf "%s/" $data) $cp) (hasPrefix "/vols/" $cp) }}
+{{- fail (printf "storage.controlPlane.mountPath %s must be outside the data dir (%s) and /vols: the operator's sweep would delete it" $cp $data) }}
+{{- end }}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
