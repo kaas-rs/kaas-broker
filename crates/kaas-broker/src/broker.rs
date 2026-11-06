@@ -318,6 +318,12 @@ impl Broker {
     ///
     /// [`Manager`]: kaas_coordinator::Manager
     pub fn install_coord_manager(&self, mgr: Arc<Manager>) {
+        let topics = self.topics.clone();
+        mgr.offsets.set_partition_source(move |topic, partition| {
+            topics
+                .get(topic)
+                .is_some_and(|m| (0..m.partition_count).contains(&partition))
+        });
         *self.coord_manager.write() = Some(mgr);
     }
 

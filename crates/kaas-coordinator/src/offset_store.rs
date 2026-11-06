@@ -226,6 +226,8 @@ pub struct OffsetStore {
     /// group ownership), absent in dev/tests (zero stamp: fence
     /// effectively off, matching the single-writer reality there).
     fence_source: RwLock<Option<Box<dyn Fn() -> FenceStamp + Send + Sync>>>,
+    /// Does this partition exist? See [`Self::set_partition_source`].
+    partition_source: RwLock<Option<PartitionSource>>,
     /// Serialises each group's writers, striped so it stays bounded. A writer
     /// holds its stripe across read cache, write file, update cache. The cache
     /// only moves after the write lands (gh #318), so without this two
@@ -233,6 +235,8 @@ pub struct OffsetStore {
     /// second write would drop the first one's offsets.
     write_locks: Vec<Mutex<()>>,
 }
+
+type PartitionSource = Box<dyn Fn(&str, i32) -> bool + Send + Sync>;
 
 /// How many stripes [`OffsetStore::write_locks`] has.
 const WRITE_LOCK_STRIPES: u64 = 64;
@@ -253,6 +257,7 @@ impl OffsetStore {
             root: root.into(),
             state: RwLock::new(Inner::default()),
             fence_source: RwLock::new(None),
+            partition_source: RwLock::new(None),
             write_locks: (0..WRITE_LOCK_STRIPES).map(|_| Mutex::new(())).collect(),
         }
     }
@@ -271,6 +276,28 @@ impl OffsetStore {
     /// to overwrite a file stamped by a newer one.
     pub fn set_fence_source(&self, src: impl Fn() -> FenceStamp + Send + Sync + 'static) {
         *self.fence_source.write() = Some(Box::new(src));
+    }
+
+    /// Install the check that keeps an offset from outliving its topic (gh #335).
+    ///
+    /// A request checks its topic exists, then waits for the group's write lock, and
+    /// a delete can land between the two: the purge visits the group and moves on, and
+    /// the commit then writes an offset for a topic that's gone, which a recreate
+    /// inherits. So a commit asks again under the lock. A delete takes the topic out
+    /// of the registry before it purges, so one that sees the topic has the lock
+    /// first and gets purged, and one that gets the lock later sees it gone.
+    pub fn set_partition_source(&self, src: impl Fn(&str, i32) -> bool + Send + Sync + 'static) {
+        *self.partition_source.write() = Some(Box::new(src));
+    }
+
+    /// Does `key`'s partition exist? True with no source installed, or a key this
+    /// can't parse.
+    fn partition_exists(&self, key: &str) -> bool {
+        let source = self.partition_source.read();
+        match (source.as_ref(), parse_offset_key(key)) {
+            (Some(exists), Some((topic, partition))) => exists(topic, partition),
+            _ => true,
+        }
     }
 
     fn current_fence(&self) -> FenceStamp {
@@ -319,10 +346,20 @@ impl OffsetStore {
             group_id: group_id.to_owned(),
             producer_id,
         };
+        // Under the same lock as `purge_topic`'s drop, so an offset staged as its
+        // topic is deleted is either refused here or dropped there (gh #335).
         let mut s = self.state.write();
         let slot = s.pending.entry(key).or_default();
-        slot.offsets.extend(offsets);
-        slot.metadata.extend(metadata);
+        slot.offsets.extend(
+            offsets
+                .into_iter()
+                .filter(|(k, _)| self.partition_exists(k)),
+        );
+        slot.metadata.extend(
+            metadata
+                .into_iter()
+                .filter(|(k, _)| self.partition_exists(k)),
+        );
     }
 
     /// Materialise the staged offsets for `(group, pid)` as committed.
@@ -332,6 +369,9 @@ impl OffsetStore {
             group_id: group_id.to_owned(),
             producer_id,
         };
+        // Read under the lock, so a purge can't drop them between the read and the
+        // write (gh #335).
+        let _writer = self.write_lock(group_id);
         // They stay staged until the commit is durable, so a failed write can
         // be retried (gh #318). Removing them first lost them, and the caller
         // had no way to know.
@@ -344,9 +384,16 @@ impl OffsetStore {
         else {
             return Ok(());
         };
-        self.commit_with_metadata(group_id, offsets, metadata)?;
+        self.commit_locked(group_id, offsets, metadata)?;
         self.state.write().pending.remove(&key);
         Ok(())
+    }
+
+    /// The groups holding staged offsets. A purge has to reach these too: one with
+    /// no file and no members has nothing else to show for itself.
+    pub fn groups_with_pending(&self) -> Vec<String> {
+        let s = self.state.read();
+        s.pending.keys().map(|k| k.group_id.clone()).collect()
     }
 
     /// Drop staged offsets for `(group, pid)` without materialising.
@@ -393,10 +440,22 @@ impl OffsetStore {
         offsets: HashMap<String, i64>,
         metadata: HashMap<String, String>,
     ) -> io::Result<()> {
+        let _writer = self.write_lock(group_id);
+        self.commit_locked(group_id, offsets, metadata)
+    }
+
+    /// [`Self::commit_with_metadata`] for a caller holding the group's write lock.
+    fn commit_locked(
+        &self,
+        group_id: &str,
+        mut offsets: HashMap<String, i64>,
+        mut metadata: HashMap<String, String>,
+    ) -> io::Result<()> {
         if !group_id_fits(group_id) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, GroupIdTooLong));
         }
-        let _writer = self.write_lock(group_id);
+        offsets.retain(|k, _| self.partition_exists(k));
+        metadata.retain(|k, _| self.partition_exists(k));
         // The merge below rewrites the whole file from the cache entry,
         // so an entry that doesn't hold the file yet would erase every
         // offset this commit doesn't name.
@@ -660,8 +719,21 @@ impl OffsetStore {
     /// one's committed offsets — and if the new log is shorter, every
     /// consumer in the group parks past its end and idles forever, with
     /// no error raised on either side.
+    ///
+    /// A transaction's staged offsets on the topic go too, as in Apache's
+    /// `GroupMetadata.removeOffsets`, or the commit would write them out afterwards
+    /// (gh #335).
     pub fn purge_topic(&self, group_id: &str, topic: &str) -> io::Result<usize> {
         let _writer = self.write_lock(group_id);
+        {
+            let mut s = self.state.write();
+            for (key, staged) in s.pending.iter_mut() {
+                if key.group_id == group_id {
+                    staged.offsets.retain(|k, _| !key_has_topic(k, topic));
+                    staged.metadata.retain(|k, _| !key_has_topic(k, topic));
+                }
+            }
+        }
         // Cached path. The cache only holds what reached the disk, so for a
         // group this broker coordinates it is the authority.
         let cached = {

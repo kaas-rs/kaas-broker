@@ -596,6 +596,7 @@ impl Manager {
     pub fn purge_topic_offsets(&self, topic: &str) -> (usize, Vec<String>) {
         let mut ids = self.offsets.group_ids_on_disk();
         ids.extend(self.groups.iter().map(|kv| kv.key().clone()));
+        ids.extend(self.offsets.groups_with_pending());
         ids.sort();
         ids.dedup();
 
