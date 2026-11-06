@@ -815,8 +815,9 @@ impl TxnStateStore {
     /// re-appended a control batch to every partition on every retry.
     ///
     /// Showing the offsets before the markers are durable is safe. `Prepare*` is
-    /// the decision: the transaction can only finish in that direction, and the
-    /// data stays invisible to `read_committed` until its marker lands.
+    /// the decision: the transaction can only finish in that direction. The cost
+    /// is that while the offset write keeps failing, no marker lands, so the
+    /// transaction's partitions keep a pinned LSO until it heals.
     ///
     /// Idempotent, and a no-op unless the entry is prepared in this direction.
     pub fn settle_offsets(&self, txn_id: &str, pid: i64, epoch: i16, commit: bool) -> Result<()> {

@@ -263,6 +263,9 @@ the marker applies. Only once every marker is durable does
 the hook fires per recorded group (commit materialises the offsets
 `TxnOffsetCommit` staged, abort discards them), so a failing offset write places
 no markers (gh #318). That's safe because `Prepare*` already decided the direction.
+The cost: while the write keeps failing, for instance on a full control-plane volume,
+no marker lands, so `read_committed` consumers of those partitions wait on the LSO
+until it heals.
 A group that has moved off this broker drops its staged offsets instead of writing
 them. Any dispatch failure, or a commit's offset write failing, answers the retriable
 `COORDINATOR_NOT_AVAILABLE` (15) and leaves the entry prepared. A producer retry
