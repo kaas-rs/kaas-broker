@@ -201,8 +201,8 @@ export CLIENT_PROPS
 # --consumer.config, --config-file, …) are folded into the one
 # --command-config file after CLIENT_PROPS, so the script's own settings
 # win on conflict and each tool still sees a single config flag.
-# kafka-e2e-latency's legacy positional form takes the properties file as
-# its optional 6th argument instead.
+# kafka-e2e-latency's positional form, the only one 3.7 has, takes the
+# properties file as its optional 6th argument instead.
 REAL_KAFKA_BIN="$KAFKA_BIN"
 KAFKA_BIN="$TMP/bin"
 mkdir -p "$KAFKA_BIN"
