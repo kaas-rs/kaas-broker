@@ -27,6 +27,13 @@
 //! its header. A bad CRC was acked and later truncated every acked record
 //! behind it on recovery, and a second batch reused offsets.
 //!
+//! A transaction's first batch on a partition is verified with its
+//! coordinator (KIP-890 part 1, gh #299), as `ReplicaManager.appendRecords`
+//! does: the partition must be part of an ongoing transaction at this producer
+//! id and epoch. Without it, a delayed retry after an abort, or a producer that
+//! never called AddPartitionsToTxn, opens a transaction nothing ever closes,
+//! which pins the last stable offset for every read_committed consumer.
+//!
 //! The header's other fields are checked too, as Apache's
 //! `analyzeAndValidateRecords` and `LogValidator.validateBatch` do
 //! (gh #305), because the append path advances the high watermark by
@@ -40,6 +47,7 @@ use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use kaas_auth::{Operation, Principal, Resource};
 use kaas_codec::api::produce;
+use kaas_coordinator::TxnStateError;
 use kaas_protocol::{ConnState, Handler, HandlerError, Reply};
 use kaas_storage::StorageError;
 use parking_lot::Mutex;
@@ -64,7 +72,13 @@ const ERR_RECORD_LIST_TOO_LARGE: i16 = 18;
 /// The production wiring overrides via [`ProduceHandler::with_max_message_bytes`]
 /// from `KAAS_MAX_MESSAGE_BYTES` (gh #253).
 const DEFAULT_MAX_MESSAGE_BYTES: usize = 1_048_588;
+/// What Apache answers when it can't reach a verdict on a transactional batch,
+/// because a coordinator is busy or absent: the producer retries this.
+const ERR_NOT_ENOUGH_REPLICAS: i16 = 19;
 const ERR_TOPIC_AUTHORIZATION_FAILED: i16 = 29;
+const ERR_INVALID_REQUEST: i16 = 42;
+const ERR_INVALID_TXN_STATE: i16 = 48;
+const ERR_INVALID_PRODUCER_ID_MAPPING: i16 = 49;
 const ERR_INVALID_REQUIRED_ACKS: i16 = 21;
 const ERR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED: i16 = 53;
 const ERR_UNSUPPORTED_COMPRESSION_TYPE: i16 = 76;
@@ -165,7 +179,15 @@ impl Handler for ProduceHandler {
                         ERR_TRANSACTIONAL_ID_AUTHORIZATION_FAILED,
                     )
                 } else {
-                    self.append_one(&principal, &t.name, p, acks, version).await
+                    self.append_one(
+                        &principal,
+                        req.transactional_id.as_deref(),
+                        &t.name,
+                        p,
+                        acks,
+                        version,
+                    )
+                    .await
                 };
                 partition_responses.push(pr);
             }
@@ -233,9 +255,51 @@ impl ProduceHandler {
         })
     }
 
+    /// Apache's `maybeStartTransactionVerificationForPartitions`: ask the
+    /// coordinator about a transaction's first batch on this partition. Returns
+    /// what [`StorageEngine::append_verified`] needs, or the code to answer.
+    ///
+    /// [`StorageEngine::append_verified`]: kaas_storage::StorageEngine::append_verified
+    async fn verify_txn_batch(
+        &self,
+        transactional_id: Option<&str>,
+        topic: &str,
+        partition: i32,
+        producer_id: i64,
+        producer_epoch: i16,
+    ) -> Result<Option<u64>, i16> {
+        let engine = &self.broker.engine;
+        let Some(token) = engine.begin_txn_verification(topic, partition, producer_id) else {
+            return Ok(None);
+        };
+        // Installed before the listeners start, so this is only ever a test.
+        let verdict = match self.broker.txn_state() {
+            Some(store) => {
+                // A transactional batch can't get this far without an id: the
+                // request was refused with 53 up front.
+                let txn_id = transactional_id.unwrap_or_default().to_owned();
+                let topic = topic.to_owned();
+                self.broker
+                    .txn_store_io(&store, move |s| {
+                        s.verify_partition(&txn_id, producer_id, producer_epoch, &topic, partition)
+                    })
+                    .await
+            }
+            None => Err(TxnStateError::Concurrent),
+        };
+        match verdict {
+            Ok(()) => Ok(Some(token)),
+            Err(err) => {
+                engine.cancel_txn_verification(topic, partition, producer_id, token);
+                Err(txn_verification_error_code(&err))
+            }
+        }
+    }
+
     async fn append_one(
         &self,
         principal: &Principal,
+        transactional_id: Option<&str>,
         topic: &str,
         p: &produce::PartitionData,
         acks: i16,
@@ -359,12 +423,35 @@ impl ProduceHandler {
             .coordinator()
             .and_then(|c| c.current_epoch(topic, p.index))
             .unwrap_or_else(|| self.broker.local_lease.current_epoch());
-        match self
-            .broker
-            .engine
-            .append(topic, p.index, epoch, acks, records)
-            .await
-        {
+
+        // Only a batch with a producer id takes part, as in Apache: a
+        // transactional bit with no producer id opens nothing (gh #305).
+        let producer_id = batch_producer_id(&records);
+        let appended = if batch_attributes(&records) & ATTR_TRANSACTIONAL != 0 && producer_id >= 0 {
+            let verification = match self
+                .verify_txn_batch(
+                    transactional_id,
+                    topic,
+                    p.index,
+                    producer_id,
+                    batch_producer_epoch(&records),
+                )
+                .await
+            {
+                Ok(verification) => verification,
+                Err(code) => return error_partition_bumped(topic, p.index, code),
+            };
+            self.broker
+                .engine
+                .append_verified(topic, p.index, epoch, acks, records, verification)
+                .await
+        } else {
+            self.broker
+                .engine
+                .append(topic, p.index, epoch, acks, records)
+                .await
+        };
+        match appended {
             Ok(base_offset) => {
                 let log_start = self
                     .broker
@@ -446,6 +533,28 @@ fn batch_base_offset(b: &[u8]) -> i64 {
 }
 fn batch_attributes(b: &[u8]) -> i16 {
     i16::from_be_bytes([b[21], b[22]])
+}
+fn batch_producer_id(b: &[u8]) -> i64 {
+    i64::from_be_bytes([b[43], b[44], b[45], b[46], b[47], b[48], b[49], b[50]])
+}
+fn batch_producer_epoch(b: &[u8]) -> i16 {
+    i16::from_be_bytes([b[51], b[52]])
+}
+
+/// How Produce answers a coordinator's refusal, in the two steps Apache takes:
+/// `AddPartitionsToTxnManager` turns `PRODUCER_FENCED` into
+/// `INVALID_PRODUCER_EPOCH`, and `ReplicaManager` turns anything that isn't a
+/// verdict into `NOT_ENOUGH_REPLICAS`, which the producer retries.
+fn txn_verification_error_code(err: &TxnStateError) -> i16 {
+    match err {
+        TxnStateError::EmptyTxnId => ERR_INVALID_REQUEST,
+        TxnStateError::UnknownProducer => ERR_INVALID_PRODUCER_ID_MAPPING,
+        TxnStateError::EpochFenced => ERR_INVALID_PRODUCER_EPOCH,
+        TxnStateError::InvalidState => ERR_INVALID_TXN_STATE,
+        TxnStateError::Concurrent | TxnStateError::Io(_) | TxnStateError::Decode(_) => {
+            ERR_NOT_ENOUGH_REPLICAS
+        }
+    }
 }
 
 /// Apache's `LogValidator.validateBatch` for a client's v2 batch:
@@ -538,6 +647,7 @@ fn map_error(topic: &str, index: i32, err: &StorageError) -> produce::PartitionR
         StorageError::OutOfOrderSequence => ERR_OUT_OF_ORDER_SEQUENCE_NUMBER,
         StorageError::DuplicateSequence => ERR_DUPLICATE_SEQUENCE_NUMBER,
         StorageError::InvalidProducerEpoch => ERR_INVALID_PRODUCER_EPOCH,
+        StorageError::InvalidTxnState => ERR_INVALID_TXN_STATE,
         StorageError::UnknownTopicOrPartition => ERR_UNKNOWN_TOPIC_OR_PARTITION,
         StorageError::RecordBatchTooLarge => ERR_RECORD_LIST_TOO_LARGE,
         StorageError::Stalled => ERR_LEADER_NOT_AVAILABLE,
@@ -566,6 +676,7 @@ mod tests {
     };
     use kaas_codec::primitives::{write_i16, write_i32};
     use kaas_codec::tagged;
+    use kaas_coordinator::TxnStateStore;
     use kaas_storage::{MemoryStorage, StorageEngine};
     use std::net::SocketAddr;
     use std::str::FromStr;
@@ -691,11 +802,13 @@ mod tests {
         )));
         let anon = Principal::anonymous();
         for topic in ["known", "missing"] {
-            let r = denied.append_one(&anon, topic, &part(0), -1, 9).await;
+            let r = denied.append_one(&anon, None, topic, &part(0), -1, 9).await;
             assert_eq!(r.error_code, ERR_TOPIC_AUTHORIZATION_FAILED, "{topic}");
         }
         let allowed = ProduceHandler::new(broker_with_topic("known", 1));
-        let r = allowed.append_one(&anon, "known", &part(999), -1, 9).await;
+        let r = allowed
+            .append_one(&anon, None, "known", &part(999), -1, 9)
+            .await;
         assert_eq!(r.error_code, ERR_UNKNOWN_TOPIC_OR_PARTITION);
     }
 
@@ -710,7 +823,7 @@ mod tests {
             records: Some(batch(0, -1, -1)),
         };
         let r = h
-            .append_one(&Principal::anonymous(), "known", &part, -1, 9)
+            .append_one(&Principal::anonymous(), None, "known", &part, -1, 9)
             .await;
         assert_eq!(r.error_code, 10);
     }
@@ -803,12 +916,191 @@ mod tests {
         );
         assert_eq!((appended(&b, "orders"), appended(&b, "audit")), (0, 0));
 
-        // Allowed: both land.
+        // Allowed, and in the transaction: both land.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(TxnStateStore::open(tmp.path(), 0).unwrap());
+        b.install_txn_state(store.clone());
+        let (pid, epoch) = store.get_or_allocate("payments-tx", || 7).unwrap();
+        store
+            .add_partitions("payments-tx", pid, epoch, &txn_topic("orders"), 1)
+            .unwrap();
         assert_eq!(
             produce_two(&b, Some("payments-tx"), txn(), plain()).await,
             [0, 0]
         );
         assert_eq!((appended(&b, "orders"), appended(&b, "audit")), (1, 1));
+    }
+
+    fn txn_topic(topic: &str) -> Vec<kaas_coordinator::TxnTopic> {
+        vec![kaas_coordinator::TxnTopic {
+            topic: topic.to_owned(),
+            partitions: vec![0],
+        }]
+    }
+
+    /// A transactional batch at this producer id, epoch and sequence.
+    fn txn_batch(producer_id: i64, epoch: i16, base_sequence: i32) -> Bytes {
+        let mut b = batch(ATTR_TRANSACTIONAL, producer_id, base_sequence).to_vec();
+        b[51..53].copy_from_slice(&epoch.to_be_bytes());
+        let crc = kaas_codec::crc::compute(&b[21..]);
+        b[17..21].copy_from_slice(&crc.to_be_bytes());
+        Bytes::from(b)
+    }
+
+    /// The first code a transactional batch to `orders` gets, sent alone.
+    async fn produce_txn(b: &Arc<Broker>, txn_id: &str, records: Bytes) -> i16 {
+        let part = produce::PartitionData {
+            index: 0,
+            records: Some(records),
+        };
+        ProduceHandler::new(b.clone())
+            .append_one(
+                &Principal::anonymous(),
+                Some(txn_id),
+                "orders",
+                &part,
+                -1,
+                9,
+            )
+            .await
+            .error_code
+    }
+
+    /// gh #299: Apache's `handleVerifyPartitionsInTransaction`, then the two
+    /// conversions on the way back to the producer (`AddPartitionsToTxnManager`,
+    /// `ReplicaManager`). Each refusal appends nothing, so the last stable offset
+    /// can't move.
+    #[tokio::test]
+    async fn a_batch_outside_its_transaction_gets_apaches_codes() {
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        let b = txn_broker(Arc::new(DenyNamedAuthorizer("nobody")));
+        // No store means no verdict, and the producer retries.
+        assert_eq!(produce_txn(&b, "tx", txn_batch(7, 0, 0)).await, 19);
+
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(TxnStateStore::open(tmp.path(), 0).unwrap());
+        b.install_txn_state(store.clone());
+
+        // A transactional id with no producer behind it.
+        assert_eq!(produce_txn(&b, "tx", txn_batch(7, 0, 0)).await, 49);
+        let (pid, epoch) = store.get_or_allocate("tx", || 7).unwrap();
+        // Another producer's id under this transactional id.
+        assert_eq!(produce_txn(&b, "tx", txn_batch(8, 0, 0)).await, 49);
+        // An earlier session. A fence is PRODUCER_FENCED at the coordinator,
+        // but a producer expects 47 here.
+        assert_eq!(
+            produce_txn(&b, "tx", txn_batch(pid, epoch + 1, 0)).await,
+            47
+        );
+        // Never called AddPartitionsToTxn, the issue's first case.
+        assert_eq!(produce_txn(&b, "tx", txn_batch(pid, epoch, 0)).await, 48);
+        // Added a different partition.
+        store
+            .add_partitions("tx", pid, epoch, &txn_topic("audit"), 1)
+            .unwrap();
+        assert_eq!(produce_txn(&b, "tx", txn_batch(pid, epoch, 0)).await, 48);
+        // An empty transactional id is an INVALID_REQUEST at the coordinator.
+        assert_eq!(produce_txn(&b, "", txn_batch(pid, epoch, 0)).await, 42);
+        assert_eq!(appended(&b, "orders"), 0);
+
+        // A transition under way is no verdict yet.
+        store
+            .add_partitions("tx", pid, epoch, &txn_topic("orders"), 1)
+            .unwrap();
+        store.prepare_end_txn("tx", pid, epoch, false).unwrap();
+        assert_eq!(produce_txn(&b, "tx", txn_batch(pid, epoch, 0)).await, 19);
+
+        // The issue's second case: a delayed batch after the transaction aborted.
+        store.complete_end_txn("tx", pid, epoch, false).unwrap();
+        assert_eq!(produce_txn(&b, "tx", txn_batch(pid, epoch, 0)).await, 48);
+        assert_eq!(appended(&b, "orders"), 0);
+
+        // And the producer's next transaction works.
+        store
+            .add_partitions("tx", pid, epoch, &txn_topic("orders"), 1)
+            .unwrap();
+        assert_eq!(produce_txn(&b, "tx", txn_batch(pid, epoch, 0)).await, 0);
+        assert_eq!(appended(&b, "orders"), 1);
+    }
+
+    /// A transactional bit with no producer id opens nothing (gh #305), so
+    /// there's nothing to verify, as in Apache's `hasProducerId` filter.
+    #[tokio::test]
+    async fn a_transactional_bit_without_a_producer_id_isnt_verified() {
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        let b = txn_broker(Arc::new(DenyNamedAuthorizer("nobody")));
+        let records = batch(ATTR_TRANSACTIONAL, -1, -1);
+        assert_eq!(produce_txn(&b, "tx", records).await, 0);
+    }
+
+    /// gh #299 end to end on the real engine, where the gate lives: the delayed
+    /// retry from the issue, which pinned the LSO for good. The coordinator would
+    /// refuse it, so this also checks the store, the gate and a restart agree.
+    #[tokio::test]
+    async fn a_delayed_retry_cant_pin_the_last_stable_offset() {
+        use crate::handlers::test_authz::DenyNamedAuthorizer;
+        use kaas_storage::{DiskStorageEngine, PartitionConfig, RealFs};
+
+        let data = tempfile::tempdir().unwrap();
+        let cluster = tempfile::tempdir().unwrap();
+        let open_broker = || {
+            let topics = Arc::new(TopicRegistry::new());
+            topics.insert(TopicMeta {
+                name: "orders".to_owned(),
+                partition_count: 1,
+                topic_id: [0; 16],
+            });
+            let engine: Arc<dyn StorageEngine> = Arc::new(DiskStorageEngine::new(
+                Arc::new(RealFs::new()),
+                data.path().to_path_buf(),
+                PartitionConfig::default(),
+            ));
+            let b = Arc::new(Broker::with_auth(
+                engine,
+                topics,
+                "test",
+                0,
+                Arc::new(DenyNamedAuthorizer("nobody")),
+                Arc::new(kaas_auth::NoQuotaChecker),
+            ));
+            let store = Arc::new(TxnStateStore::open(cluster.path(), 0).unwrap());
+            b.install_txn_state(store.clone());
+            (b, store)
+        };
+        let (b, store) = open_broker();
+        let stable = |b: &Arc<Broker>| {
+            let hwm = b.engine.high_watermark("orders", 0).unwrap();
+            let lso = b.engine.last_stable_offset("orders", 0).unwrap();
+            (hwm, lso)
+        };
+
+        let (pid, epoch) = store.get_or_allocate("tx", || 7).unwrap();
+        store
+            .add_partitions("tx", pid, epoch, &txn_topic("orders"), 1)
+            .unwrap();
+        assert_eq!(produce_txn(&b, "tx", txn_batch(pid, epoch, 0)).await, 0);
+        assert_eq!(produce_txn(&b, "tx", txn_batch(pid, epoch, 1)).await, 0);
+        assert_eq!(stable(&b), (2, 0));
+
+        // The abort: the coordinator's state, then its marker.
+        store.prepare_end_txn("tx", pid, epoch, false).unwrap();
+        let marker = Bytes::from(crate::control_batch::build_control_batch(
+            pid, epoch, false, 0,
+        ));
+        b.engine.append("orders", 0, 0, -1, marker).await.unwrap();
+        store.complete_end_txn("tx", pid, epoch, false).unwrap();
+        assert_eq!(stable(&b), (3, 3));
+
+        // The retry that needs no malice, only a slow network.
+        assert_eq!(produce_txn(&b, "tx", txn_batch(pid, epoch, 2)).await, 48);
+        assert_eq!(stable(&b), (3, 3), "still nothing pinned");
+
+        // The issue's check was that this survives a restart.
+        b.engine.relinquish("orders", 0).await.unwrap();
+        let (b, _store) = open_broker();
+        b.engine.create_partition("orders", 0).await.unwrap();
+        assert_eq!(stable(&b), (3, 3));
+        b.engine.relinquish("orders", 0).await.unwrap();
     }
 
     /// Control: no transactional batch, no transactional-id check, even
@@ -1042,7 +1334,7 @@ mod tests {
                 })),
             };
             let r = h
-                .append_one(&Principal::anonymous(), "known", &part, -1, version)
+                .append_one(&Principal::anonymous(), None, "known", &part, -1, version)
                 .await;
             assert_eq!(r.error_code, want, "v{version}");
         }
@@ -1111,7 +1403,7 @@ mod tests {
             records: Some(batch(0, -1, -1)),
         };
         for acks in [2, -2] {
-            let r = h.append_one(&anon, "known", &good, acks, 9).await;
+            let r = h.append_one(&anon, None, "known", &good, acks, 9).await;
             assert_eq!(r.error_code, 21, "acks {acks}");
         }
         let null = produce::PartitionData {
@@ -1119,7 +1411,9 @@ mod tests {
             records: None,
         };
         assert_eq!(
-            h.append_one(&anon, "known", &null, -1, 9).await.error_code,
+            h.append_one(&anon, None, "known", &null, -1, 9)
+                .await
+                .error_code,
             -1
         );
         assert_eq!(h.broker.engine.high_watermark("known", 0).unwrap_or(0), 0);

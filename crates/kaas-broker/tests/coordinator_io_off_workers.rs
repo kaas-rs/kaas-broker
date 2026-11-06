@@ -27,13 +27,13 @@ use kaas_broker::txn_markers::{reconcile_pending_markers, sweep_transactions};
 use kaas_broker::{
     AddOffsetsToTxnHandler, AddPartitionsToTxnHandler, Broker, DeleteGroupsHandler,
     DescribeGroupsHandler, EndTxnHandler, InitProducerIdHandler, JoinGroupHandler,
-    OffsetCommitHandler, OffsetDeleteHandler, OffsetFetchHandler, ProducerIdAllocator, TopicMeta,
-    TopicRegistry, PID_BLOCK, PRODUCER_ID_DIR,
+    OffsetCommitHandler, OffsetDeleteHandler, OffsetFetchHandler, ProduceHandler,
+    ProducerIdAllocator, TopicMeta, TopicRegistry, PID_BLOCK, PRODUCER_ID_DIR,
 };
 use kaas_codec::api::common::{write_array_len, write_str};
 use kaas_codec::api::{
     delete_groups, describe_groups, end_txn, init_producer_id, join_group, offset_commit,
-    offset_delete, offset_fetch,
+    offset_delete, offset_fetch, produce,
 };
 use kaas_codec::primitives::{write_i16, write_i32, write_i64, write_i8};
 use kaas_coordinator::offset_store::FenceStamp;
@@ -518,6 +518,52 @@ async fn end_txn_waiting_on_the_store_stays_off_the_workers() {
     parks_nothing(&held.gate, &task).await;
     task.await.unwrap();
     held.thread.join().unwrap();
+}
+
+/// gh #299: verifying a transaction's first batch on a partition is on the
+/// produce path, so it reads the slot without the store's mutex, which another
+/// transaction can hold across an fsync. Not just off the worker: this finishes
+/// while the mutex is held.
+#[tokio::test]
+async fn verifying_a_transactional_batch_doesnt_wait_on_the_store() {
+    let c = cluster();
+    let (pid, epoch) = c.store.get_or_allocate(TXN, || 1000).unwrap();
+    let topics = [kaas_coordinator::TxnTopic {
+        topic: TOPIC.to_owned(),
+        partitions: vec![0],
+    }];
+    c.store
+        .add_partitions(TXN, pid, epoch, &topics, 100)
+        .unwrap();
+    let held = hold_txn_store(&c);
+
+    let mut records = kaas_broker::build_control_batch(pid, epoch, true, 0);
+    records[21..23].copy_from_slice(&0x0010i16.to_be_bytes()); // transactional
+    records[53..57].copy_from_slice(&0i32.to_be_bytes()); // first sequence
+    let crc = kaas_codec::crc::compute(&records[21..]);
+    records[17..21].copy_from_slice(&crc.to_be_bytes());
+
+    let mut body = BytesMut::new();
+    kaas_codec::api::common::write_nullable_str(&mut body, Some(TXN), false).unwrap();
+    write_i16(&mut body, -1); // acks
+    write_i32(&mut body, 1000); // timeout
+    write_array_len(&mut body, 1, false).unwrap();
+    write_str(&mut body, TOPIC, false).unwrap();
+    write_array_len(&mut body, 1, false).unwrap();
+    write_i32(&mut body, 0); // partition
+    write_i32(&mut body, i32::try_from(records.len()).unwrap());
+    body.extend_from_slice(&records);
+
+    let task = request(ProduceHandler::new(c.broker.clone()), 8, body);
+    let mut out = tokio::time::timeout(WATCHDOG, task)
+        .await
+        .expect("produce waited on the txn store's mutex")
+        .unwrap();
+    held.gate.open();
+    held.thread.join().unwrap();
+
+    let resp = produce::decode_response(&mut out, 8).unwrap();
+    assert_eq!(resp.responses[0].partition_responses[0].error_code, 0);
 }
 
 /// A rejoin over an `Ongoing` transaction finishes the abort itself.

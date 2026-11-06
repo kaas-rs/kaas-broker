@@ -186,7 +186,8 @@ repeated on every requested partition; the Java client picks any one.
 - Apache 3.7 additionally serves v4 — the KIP-890 phase-1 batched shape
   its brokers use for server-side verification. kaas stops at v3, which
   is the version client producers negotiate; nothing client-visible is
-  missing.
+  missing. A partition leader verifies by reading the coordinator's slot
+  file on the shared volume instead (see [KIP-890](../kip/kip-890.md)).
 - None known otherwise; an invalid transition is unreachable here, bad
   states map to 49/90/51.
 

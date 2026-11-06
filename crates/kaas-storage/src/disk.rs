@@ -360,6 +360,47 @@ impl DiskStorageEngine {
             .map(|e| e.value().clone())
     }
 
+    /// An append with its write latency and per-topic traffic recorded.
+    /// `verification` is `Some` for a client's transactional batch.
+    async fn append_recorded(
+        &self,
+        topic: &str,
+        partition: i32,
+        epoch: u32,
+        acks: i16,
+        batch: Bytes,
+        verification: Option<Option<u64>>,
+    ) -> Result<i64, StorageError> {
+        let started = std::time::Instant::now();
+        let batch_len = batch.len();
+        // gh #218: derive the record count from the batch header
+        // (`lastOffsetDelta + 1`) before the batch is consumed. This is
+        // byte-opacity-safe — it reads header metadata, not record
+        // contents — and matches the offset accounting `Partition::append`
+        // does for the high-watermark, so the metric tracks the same
+        // records the log commits. A header too short to parse falls back
+        // to 1 (never a real produce batch).
+        let record_count = crate::segment::parse_batch_offsets(&batch)
+            .map(|(_base, last_offset_delta, _ts)| i64::from(last_offset_delta) + 1)
+            .unwrap_or(1);
+        let p = self.ensure_open(topic, partition).await?;
+        let out = match verification {
+            Some(verification) => p.append_verified(epoch, acks, batch, verification).await,
+            None => p.append(epoch, acks, batch).await,
+        };
+        let m = kaas_observability::metrics::global();
+        m.write_latency.record(started.elapsed().as_secs_f64(), &[]);
+        // Per-topic Produce accounting: real record count + real bytes.
+        if out.is_ok() {
+            m.topic_traffic.record_produce(
+                topic,
+                record_count,
+                i64::try_from(batch_len).unwrap_or(0),
+            );
+        }
+        out
+    }
+
     /// Close every open partition (drain committers, persist state,
     /// release FDs). Used by the SIGTERM drain path (gh #61 + gh #139).
     pub async fn relinquish_all(&self) -> Result<(), StorageError> {
@@ -388,31 +429,37 @@ impl StorageEngine for DiskStorageEngine {
         acks: i16,
         batch: Bytes,
     ) -> Result<i64, StorageError> {
-        let started = std::time::Instant::now();
-        let batch_len = batch.len();
-        // gh #218: derive the record count from the batch header
-        // (`lastOffsetDelta + 1`) before the batch is consumed. This is
-        // byte-opacity-safe — it reads header metadata, not record
-        // contents — and matches the offset accounting `Partition::append`
-        // does for the high-watermark, so the metric tracks the same
-        // records the log commits. A header too short to parse falls back
-        // to 1 (never a real produce batch).
-        let record_count = crate::segment::parse_batch_offsets(&batch)
-            .map(|(_base, last_offset_delta, _ts)| i64::from(last_offset_delta) + 1)
-            .unwrap_or(1);
-        let p = self.ensure_open(topic, partition).await?;
-        let out = p.append(epoch, acks, batch).await;
-        let m = kaas_observability::metrics::global();
-        m.write_latency.record(started.elapsed().as_secs_f64(), &[]);
-        // Per-topic Produce accounting: real record count + real bytes.
-        if out.is_ok() {
-            m.topic_traffic.record_produce(
-                topic,
-                record_count,
-                i64::try_from(batch_len).unwrap_or(0),
-            );
+        self.append_recorded(topic, partition, epoch, acks, batch, None)
+            .await
+    }
+
+    fn begin_txn_verification(&self, topic: &str, partition: i32, pid: i64) -> Option<u64> {
+        // A partition that isn't open has no open transaction. The append
+        // reopens it with no record of this token and refuses the batch, which
+        // is right for a partition that just moved.
+        match self.partitions.get(&(topic.to_owned(), partition)) {
+            Some(p) => p.begin_txn_verification(pid),
+            None => Some(0),
         }
-        out
+    }
+
+    fn cancel_txn_verification(&self, topic: &str, partition: i32, pid: i64, token: u64) {
+        if let Some(p) = self.partitions.get(&(topic.to_owned(), partition)) {
+            p.cancel_txn_verification(pid, token);
+        }
+    }
+
+    async fn append_verified(
+        &self,
+        topic: &str,
+        partition: i32,
+        epoch: u32,
+        acks: i16,
+        batch: Bytes,
+        verification: Option<u64>,
+    ) -> Result<i64, StorageError> {
+        self.append_recorded(topic, partition, epoch, acks, batch, Some(verification))
+            .await
     }
 
     async fn read(

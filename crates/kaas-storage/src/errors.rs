@@ -27,6 +27,13 @@ pub enum StorageError {
     #[error("duplicate sequence number")]
     DuplicateSequence,
 
+    /// A client's transactional batch with no open transaction on this
+    /// partition and no live verification from the coordinator: the transaction
+    /// ended while it was on its way (gh #299). Appending it would open a
+    /// transaction nothing ever closes. Wire error 48.
+    #[error("transactional batch outside an ongoing transaction")]
+    InvalidTxnState,
+
     /// The fsync watchdog (gh #95) deadline elapsed. Subsequent Append
     /// calls fail fast until the engine drops the partition.
     #[error("storage stalled")]

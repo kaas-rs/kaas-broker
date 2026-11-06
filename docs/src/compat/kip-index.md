@@ -23,7 +23,7 @@ no other way to report it — see [KIP-700](kip/kip-700.md).
 > remain config plumbing without an enforcing compactor — though the
 > delete-policy retention cleaner now runs (gh #250).
 
-## Implemented (13)
+## Implemented (14)
 
 | KIP | What it is | kaas page |
 |---|---|---|
@@ -40,6 +40,7 @@ no other way to report it — see [KIP-700](kip/kip-700.md).
 | KIP-546 | Client-quota admin APIs (keys 48/49) | [KIP-546](kip/kip-546.md) |
 | KIP-700 | `DescribeCluster` admin API (key 60) | [KIP-700](kip/kip-700.md) |
 | KIP-800 | Join/leave reason strings | [KIP-800](kip/kip-800.md) |
+| KIP-890 | Part 1: Produce verifies a transaction's first batch on a partition with its coordinator | [KIP-890](kip/kip-890.md) |
 
 ## Partial (11)
 

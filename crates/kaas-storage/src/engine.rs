@@ -242,6 +242,37 @@ pub trait StorageEngine: Send + Sync + 'static {
         batch: Bytes,
     ) -> Result<i64, StorageError>;
 
+    /// Start verifying a client's transactional batch (KIP-890 part 1, gh #299),
+    /// Apache's `maybeStartTransactionVerification`. `None` means `pid` already
+    /// has an open transaction here, so there's nothing to ask the coordinator.
+    /// Otherwise ask it, and hand the token to [`Self::append_verified`] if it
+    /// says yes or [`Self::cancel_txn_verification`] if it doesn't. This engine
+    /// default has no gate to arm: it always asks.
+    fn begin_txn_verification(&self, _topic: &str, _partition: i32, _pid: i64) -> Option<u64> {
+        Some(0)
+    }
+
+    /// The coordinator refused: forget the token from
+    /// [`Self::begin_txn_verification`].
+    fn cancel_txn_verification(&self, _topic: &str, _partition: i32, _pid: i64, _token: u64) {}
+
+    /// [`Self::append`] for a client's transactional batch, refusing with
+    /// [`StorageError::InvalidTxnState`] if the transaction ended after
+    /// `verification` was issued. That check is under the partition lock, so a
+    /// marker can't slip in between: a batch that loses this race would open a
+    /// transaction nothing ever closes.
+    async fn append_verified(
+        &self,
+        topic: &str,
+        partition: i32,
+        epoch: u32,
+        acks: i16,
+        batch: Bytes,
+        _verification: Option<u64>,
+    ) -> Result<i64, StorageError> {
+        self.append(topic, partition, epoch, acks, batch).await
+    }
+
     /// Read raw RecordBatch bytes starting at `start_offset` for up to
     /// `max_bytes` of payload. Returns the concatenated bytes of all
     /// batches whose last_offset is `>= start_offset`, until the cap

@@ -174,6 +174,27 @@ flowchart TD
     watcher -.-> apply["applies marker as control-batch append<br/>to partitions it leads, then deletes the file"]
 ```
 
+### A batch can't open a transaction the coordinator doesn't know of
+
+Before a transaction's first batch lands on a partition, its leader checks the
+batch against the transaction state (KIP-890 part 1). The partition must be in
+an ongoing transaction at that producer id and epoch. Without the check, a
+retry delayed past an abort, or a producer that never called
+`AddPartitionsToTxn`, opens a transaction nothing ever closes: no marker is
+coming, so the last stable offset stays pinned and every `read_committed`
+consumer of the partition stops there, across restarts.
+
+Apache asks the coordinator over RPC. kaas reads the coordinator's slot file off
+the shared volume. The coordinator writes it before it answers
+`AddPartitionsToTxn`, so close-to-open consistency makes the answer visible to
+any leader, and no broker-to-broker RPC is needed.
+
+The answer alone isn't enough, because the transaction can end while it travels.
+So the leader issues a token first, and the append checks it under the partition
+lock. Any append from that producer clears the token, including a marker, so a
+batch that a marker overtook is refused with `INVALID_TXN_STATE`. The first batch
+that lands opens the transaction, and later ones pass on that without asking.
+
 The offsets settle right after the prepare, before any marker, and that
 step can fail: a commit whose offsets didn't reach the disk stays prepared
 with its groups and answers the retriable error. Settling first means a

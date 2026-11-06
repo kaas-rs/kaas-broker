@@ -856,6 +856,15 @@ struct PartitionInner {
     /// marker is still live in the log. Drives the Fetch response's
     /// `AbortedTransactions[]` list. Evicted as `log_start` advances.
     aborted_txns: AbortedTxnIndex,
+    /// Verifications under way, by producer (KIP-890 part 1, gh #299): Apache's
+    /// `VerificationGuard`. See [`Partition::append_verified`]. Any append from
+    /// the producer clears its entry. So the first batch of its transaction does,
+    /// and so does a marker, which is what makes a verification older than that
+    /// marker worthless.
+    txn_verifications: HashMap<i64, u64>,
+    /// Makes each token unique, so a stale one can't match a later verification
+    /// for the same producer (the ABA case in Apache's comment on this gate).
+    last_txn_verification: u64,
 }
 
 impl PartitionInner {
@@ -1162,6 +1171,8 @@ impl Partition {
             producer_states: restored.producer_states,
             open_txns: restored.open_txns,
             aborted_txns: restored.aborted_txns,
+            txn_verifications: HashMap::new(),
+            last_txn_verification: 0,
         }));
         let initial_snapshot = snapshot_of(&inner.lock());
 
@@ -1386,9 +1397,68 @@ impl Partition {
         }
     }
 
+    /// See [`crate::StorageEngine::begin_txn_verification`]. Producers verifying
+    /// at once share a token, so one batch's append doesn't invalidate the next:
+    /// the first to land opens the transaction, and the others pass on that.
+    pub fn begin_txn_verification(&self, pid: i64) -> Option<u64> {
+        let mut guard = self.inner.lock();
+        if guard.open_txns.contains(pid) {
+            return None;
+        }
+        let inner = &mut *guard;
+        if let Some(token) = inner.txn_verifications.get(&pid) {
+            return Some(*token);
+        }
+        inner.last_txn_verification += 1;
+        inner
+            .txn_verifications
+            .insert(pid, inner.last_txn_verification);
+        Some(inner.last_txn_verification)
+    }
+
+    /// See [`crate::StorageEngine::cancel_txn_verification`].
+    pub fn cancel_txn_verification(&self, pid: i64, token: u64) {
+        let mut guard = self.inner.lock();
+        if guard.txn_verifications.get(&pid) == Some(&token) {
+            guard.txn_verifications.remove(&pid);
+        }
+    }
+
     /// Append a raw RecordBatch under `epoch`. Returns the assigned
     /// `base_offset` (or the cached one for an idempotent duplicate).
     pub async fn append(&self, epoch: u32, acks: i16, batch: Bytes) -> Result<i64, StorageError> {
+        self.append_gated(epoch, acks, batch, None).await
+    }
+
+    /// [`Self::append`] for a client's transactional batch, under Apache's gate
+    /// (`UnifiedLog.analyzeAndValidateProducerState`). The batch needs an open
+    /// transaction from its producer here, or the token from a verification no
+    /// append has overtaken. `verification` is what
+    /// [`Self::begin_txn_verification`] returned.
+    ///
+    /// The coordinator's yes isn't enough on its own, because the transaction
+    /// can end while the answer travels. The batch would land after the marker,
+    /// opening a transaction nothing ever closes, and pin the last stable offset
+    /// for every read_committed consumer. So the last word is here, under the
+    /// partition lock, where a marker can't get in between.
+    pub async fn append_verified(
+        &self,
+        epoch: u32,
+        acks: i16,
+        batch: Bytes,
+        verification: Option<u64>,
+    ) -> Result<i64, StorageError> {
+        self.append_gated(epoch, acks, batch, Some(verification))
+            .await
+    }
+
+    async fn append_gated(
+        &self,
+        epoch: u32,
+        acks: i16,
+        batch: Bytes,
+        gate: Option<Option<u64>>,
+    ) -> Result<i64, StorageError> {
         // Pre-lock parse so we don't hold the mutex during this work.
         let prod_info: Option<BatchProducerInfo> = if batch.len() >= 57 {
             parse_batch_producer_info(&batch).ok()
@@ -1445,6 +1515,17 @@ impl Partition {
                     Outcome::InvalidEpoch => return Err(StorageError::InvalidProducerEpoch),
                     Outcome::Accept => accepted = true,
                     Outcome::NotIdempotent => {}
+                }
+            }
+
+            // After the duplicate check, as in Apache: a retry of a batch
+            // already in the log isn't opening anything.
+            if let (Some(verification), Some(info)) = (gate, prod_info) {
+                let pid = info.producer_id;
+                let verified = verification
+                    .is_some_and(|token| guard.txn_verifications.get(&pid) == Some(&token));
+                if !verified && !guard.open_txns.contains(pid) {
+                    return Err(StorageError::InvalidTxnState);
                 }
             }
 
@@ -1580,6 +1661,9 @@ impl Partition {
                 &mut inner.open_txns,
                 &mut inner.aborted_txns,
             );
+            if let Some(info) = prod_info {
+                inner.txn_verifications.remove(&info.producer_id);
+            }
 
             // Decide whether to fire a flush request.
             let trigger = cfg.flush_interval_messages > 0
@@ -3552,6 +3636,155 @@ pub(crate) mod tests {
         current.covers.epoch = 4;
         write_periodic_state(&fs, tmp.path(), &Mutex::new(false), &current);
         assert_eq!(snapshot_covers(&fs, tmp.path()), Some(current.covers));
+    }
+
+    /// The race the gate exists for (gh #299). The coordinator says yes, the
+    /// transaction ends while the answer travels, and the batch lands after the
+    /// marker. Without the gate it opens a transaction nothing ever closes.
+    #[test]
+    fn a_verification_a_marker_overtook_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            let token = p.begin_txn_verification(7).expect("no transaction yet");
+            p.append(0, -1, build_marker_batch(7, false)).await.unwrap();
+
+            let late = build_txn_data_batch(7, 1);
+            assert!(matches!(
+                p.append_verified(0, -1, late, Some(token)).await,
+                Err(StorageError::InvalidTxnState)
+            ));
+            assert_eq!(p.last_stable_offset(), p.high_watermark());
+            assert!(open_entries(&p).is_empty());
+            p.close().await.unwrap();
+        });
+    }
+
+    /// Apache's ABA case: the old answer is still in flight when the producer's
+    /// next transaction starts verifying, so a matching producer id isn't enough.
+    #[test]
+    fn a_stale_verification_doesnt_pass_for_the_next_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            let stale = p.begin_txn_verification(7).unwrap();
+            p.append(0, -1, build_marker_batch(7, false)).await.unwrap();
+            let current = p.begin_txn_verification(7).unwrap();
+            assert_ne!(stale, current);
+
+            assert!(matches!(
+                p.append_verified(0, -1, build_txn_data_batch(7, 1), Some(stale))
+                    .await,
+                Err(StorageError::InvalidTxnState)
+            ));
+            assert_eq!(
+                p.append_verified(0, -1, build_txn_data_batch(7, 1), Some(current))
+                    .await
+                    .unwrap(),
+                1
+            );
+            p.close().await.unwrap();
+        });
+    }
+
+    /// Phase 2 of the gate: once the transaction is open nothing is asked of the
+    /// coordinator, so the produce path pays for this once per transaction per
+    /// partition. If it ends in the meantime, the batch still can't get through.
+    #[test]
+    fn only_the_first_batch_of_a_transaction_verifies() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            let token = p.begin_txn_verification(7).unwrap();
+            p.append_verified(0, -1, build_txn_data_batch_seq(7, 1, 0), Some(token))
+                .await
+                .unwrap();
+            assert_eq!(p.begin_txn_verification(7), None, "already open");
+            p.append_verified(0, -1, build_txn_data_batch_seq(7, 1, 1), None)
+                .await
+                .unwrap();
+
+            p.append(0, -1, build_marker_batch(7, true)).await.unwrap();
+            assert!(matches!(
+                p.append_verified(0, -1, build_txn_data_batch_seq(7, 1, 2), None)
+                    .await,
+                Err(StorageError::InvalidTxnState)
+            ));
+            assert_eq!(p.last_stable_offset(), p.high_watermark());
+            p.close().await.unwrap();
+        });
+    }
+
+    /// In-flight batches from one producer verify at once. The first to land
+    /// mustn't invalidate the others.
+    #[test]
+    fn concurrent_verifications_share_a_token() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            let first = p.begin_txn_verification(7).unwrap();
+            assert_eq!(p.begin_txn_verification(7), Some(first));
+            p.append_verified(0, -1, build_txn_data_batch_seq(7, 1, 0), Some(first))
+                .await
+                .unwrap();
+            p.append_verified(0, -1, build_txn_data_batch_seq(7, 1, 1), Some(first))
+                .await
+                .unwrap();
+            assert_eq!(p.high_watermark(), 2);
+            p.close().await.unwrap();
+        });
+    }
+
+    /// A retry of a batch already in the log opens nothing, so it's answered from
+    /// the window, as in Apache, whatever the gate would say.
+    #[test]
+    fn a_duplicate_is_answered_before_the_gate() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            let batch = build_txn_data_batch_seq(7, 1, 0);
+            let token = p.begin_txn_verification(7).unwrap();
+            assert_eq!(
+                p.append_verified(0, -1, batch.clone(), Some(token))
+                    .await
+                    .unwrap(),
+                0
+            );
+            p.append(0, -1, build_marker_batch(7, true)).await.unwrap();
+            assert_eq!(p.append_verified(0, -1, batch, None).await.unwrap(), 0);
+            assert_eq!(p.high_watermark(), 2);
+            p.close().await.unwrap();
+        });
+    }
+
+    /// A refused verification leaves nothing behind, so a stream of bad producer
+    /// ids can't grow the map.
+    #[test]
+    fn a_cancelled_verification_is_forgotten() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            let token = p.begin_txn_verification(7).unwrap();
+            p.cancel_txn_verification(7, token);
+            assert!(p.inner.lock().txn_verifications.is_empty());
+            assert!(matches!(
+                p.append_verified(0, -1, build_txn_data_batch(7, 1), Some(token))
+                    .await,
+                Err(StorageError::InvalidTxnState)
+            ));
+
+            // A stale cancel doesn't take a newer verification with it.
+            let newer = p.begin_txn_verification(7).unwrap();
+            p.cancel_txn_verification(7, token);
+            assert_eq!(p.begin_txn_verification(7), Some(newer));
+            p.close().await.unwrap();
+        });
     }
 
     /// gh #177: a snapshotted aborted entry whose span fell below

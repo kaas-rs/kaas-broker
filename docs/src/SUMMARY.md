@@ -58,6 +58,7 @@
   - [KIP-554 — SCRAM admin API (partial)](compat/kip/kip-554.md)
   - [KIP-700 — DescribeCluster](compat/kip/kip-700.md)
   - [KIP-800 — join/leave reasons](compat/kip/kip-800.md)
+  - [KIP-890 — transaction verification (part 1)](compat/kip/kip-890.md)
 - [Non-goals](compat/non-goals.md)
 - [Verification story](compat/verification.md)
 

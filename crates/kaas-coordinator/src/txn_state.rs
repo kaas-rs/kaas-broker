@@ -273,7 +273,8 @@ pub enum TxnStateError {
     /// INVALID_PRODUCER_EPOCH instead.
     #[error("txn state: producer epoch fenced")]
     EpochFenced,
-    /// Wire code 51 — CONCURRENT_TRANSACTIONS.
+    /// Wire code 51 — CONCURRENT_TRANSACTIONS. Produce answers 19
+    /// NOT_ENOUGH_REPLICAS instead, which is retriable there.
     #[error("txn state: concurrent transition in progress")]
     Concurrent,
     /// Wire code 48 — INVALID_TXN_STATE (gh #198; 50 is INVALID_TRANSACTION_TIMEOUT).
@@ -522,6 +523,47 @@ impl TxnStateStore {
         state.insert(txn_id.to_owned(), entry);
         self.persist_slot(slot, &state)?;
         Ok(InitPidOutcome::Ready { pid, epoch })
+    }
+
+    /// Whether `(topic, partition)` is part of `txn_id`'s ongoing transaction at
+    /// this PID and epoch. Apache's `handleVerifyPartitionsInTransaction`, which
+    /// a partition leader asks before a transaction's first batch lands on it
+    /// (KIP-890 part 1, gh #299).
+    ///
+    /// The slot may be another broker's, and this is what stands in for the RPC:
+    /// the coordinator writes the slot before answering AddPartitionsToTxn, and
+    /// close-to-open consistency makes that visible here. It takes no lock,
+    /// because a slot file is replaced atomically and so reads as one state, and
+    /// the store's mutex can be held across an fsync. Only one batch per
+    /// transaction per partition comes through here.
+    pub fn verify_partition(
+        &self,
+        txn_id: &str,
+        pid: i64,
+        epoch: i16,
+        topic: &str,
+        partition: i32,
+    ) -> Result<()> {
+        if txn_id.is_empty() {
+            return Err(TxnStateError::EmptyTxnId);
+        }
+        let state = self.load_slot(self.slot_for(txn_id))?;
+        let entry = state.get(txn_id).ok_or(TxnStateError::UnknownProducer)?;
+        if entry.pid != pid {
+            return Err(TxnStateError::UnknownProducer);
+        }
+        if entry.epoch != epoch {
+            return Err(TxnStateError::EpochFenced);
+        }
+        let in_transaction = entry
+            .partitions
+            .iter()
+            .any(|t| t.topic == topic && t.partitions.contains(&partition));
+        match entry.state {
+            TxnState::PrepareCommit | TxnState::PrepareAbort => Err(TxnStateError::Concurrent),
+            TxnState::Ongoing if in_transaction => Ok(()),
+            _ => Err(TxnStateError::InvalidState),
+        }
     }
 
     /// Union `additions` into the entry's partition list. gh #23.
@@ -1124,6 +1166,84 @@ mod tests {
     fn pid_alloc() -> impl FnMut() -> i64 {
         let counter = AtomicI64::new(100);
         move || counter.fetch_add(1, Ordering::SeqCst)
+    }
+
+    fn orders() -> Vec<TxnTopic> {
+        vec![TxnTopic {
+            topic: "orders".to_owned(),
+            partitions: vec![0],
+        }]
+    }
+
+    /// gh #299: the rules of Apache's `handleVerifyPartitionsInTransaction`.
+    #[test]
+    fn verify_partition_needs_an_ongoing_transaction_holding_the_partition() {
+        let (_tmp, s) = store();
+        assert!(matches!(
+            s.verify_partition("", 1, 0, "orders", 0),
+            Err(TxnStateError::EmptyTxnId)
+        ));
+        assert!(matches!(
+            s.verify_partition("tx", 1, 0, "orders", 0),
+            Err(TxnStateError::UnknownProducer)
+        ));
+
+        let (pid, epoch) = s.get_or_allocate("tx", || 7).unwrap();
+        let check =
+            |p: i64, e: i16, partition: i32| s.verify_partition("tx", p, e, "orders", partition);
+        assert!(matches!(
+            check(pid + 1, epoch, 0),
+            Err(TxnStateError::UnknownProducer)
+        ));
+        assert!(matches!(
+            check(pid, epoch + 1, 0),
+            Err(TxnStateError::EpochFenced)
+        ));
+        assert!(matches!(
+            check(pid, epoch, 0),
+            Err(TxnStateError::InvalidState)
+        ));
+
+        s.add_partitions("tx", pid, epoch, &orders(), 1).unwrap();
+        check(pid, epoch, 0).unwrap();
+        assert!(matches!(
+            check(pid, epoch, 1),
+            Err(TxnStateError::InvalidState)
+        ));
+        assert!(matches!(
+            s.verify_partition("tx", pid, epoch, "audit", 0),
+            Err(TxnStateError::InvalidState)
+        ));
+
+        // Prepared still lists the partition, but the outcome is decided.
+        s.prepare_end_txn("tx", pid, epoch, true).unwrap();
+        assert!(matches!(
+            check(pid, epoch, 0),
+            Err(TxnStateError::Concurrent)
+        ));
+        s.complete_end_txn("tx", pid, epoch, true).unwrap();
+        assert!(matches!(
+            check(pid, epoch, 0),
+            Err(TxnStateError::InvalidState)
+        ));
+    }
+
+    /// The partition's leader isn't always the transaction's coordinator, so the
+    /// answer has to come from the file, not from what this store has written.
+    #[test]
+    fn verify_partition_reads_another_brokers_slot() {
+        let (tmp, coordinator) = store();
+        let leader = TxnStateStore::open(tmp.path(), DEFAULT_NUM_SLOTS).unwrap();
+        let (pid, epoch) = coordinator.get_or_allocate("tx", || 7).unwrap();
+        assert!(leader
+            .verify_partition("tx", pid, epoch, "orders", 0)
+            .is_err());
+        coordinator
+            .add_partitions("tx", pid, epoch, &orders(), 1)
+            .unwrap();
+        leader
+            .verify_partition("tx", pid, epoch, "orders", 0)
+            .unwrap();
     }
 
     #[test]

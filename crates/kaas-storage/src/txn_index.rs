@@ -65,6 +65,11 @@ impl OpenTxnIndex {
         self.first_offset.remove(&pid)
     }
 
+    /// Whether `pid` has an open transaction on this partition.
+    pub fn contains(&self, pid: i64) -> bool {
+        self.first_offset.contains_key(&pid)
+    }
+
     /// Lowest offset across all open transactions. `None` when no
     /// txn is open — caller uses HWM as the LSO in that case.
     pub fn min_open_offset(&self) -> Option<i64> {

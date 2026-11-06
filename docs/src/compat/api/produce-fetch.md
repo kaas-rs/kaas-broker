@@ -49,6 +49,14 @@ all `INVALID_RECORD` (87): `lastOffsetDelta + 1` must be positive and equal a
 positive `recordCount`, and a batch with a producer id needs a non-negative
 base sequence. The high watermark advances by `lastOffsetDelta`, so a batch
 that lied about it used to wreck the partition's offsets for good.
+A transaction's first batch on a partition is verified with its coordinator
+(KIP-890 part 1, gh #299). The partition must be part of an ongoing transaction
+at the batch's producer id and epoch, or the answer is `INVALID_TXN_STATE` (48);
+an unknown transactional id or another producer's id is
+`INVALID_PRODUCER_ID_MAPPING` (49), an earlier epoch is
+`INVALID_PRODUCER_EPOCH` (47), and a transaction being ended or a store that
+can't be read is `NOT_ENOUGH_REPLICAS` (19), which the producer retries. Later
+batches of that transaction skip this. See [KIP-890](../kip/kip-890.md).
 A control batch from a client is refused with `INVALID_RECORD` (87), as in
 Apache's `LogValidator`: COMMIT/ABORT markers are the transaction
 coordinator's to write, and it appends them to the engine directly, not
