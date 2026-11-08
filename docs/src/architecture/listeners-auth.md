@@ -86,7 +86,13 @@ Every load logs the certificate's serial and expiry.
 
 The reload changes the certificate the broker serves, not what clients
 trust. A client gets through a rotation only if the new certificate chains to
-an anchor it already holds.
+an anchor it already holds. The chart's internal TLS listeners serve a
+certificate from a CA the chart creates, which renewals don't change, and
+clients trust that CA
+([internal TLS listeners](../operations/helm.md#internal-tls-listeners)).
+Before gh #343 the chart's certificate was self-signed and got a new key at
+every renewal, so even a broker that reloaded it would have broken every
+client.
 
 ## The pre-auth gate on an authed listener
 

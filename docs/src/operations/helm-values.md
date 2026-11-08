@@ -191,7 +191,7 @@ the model; this is the field reference. Defaults ship four entries:
 | `enabled` | Absent = enabled. |
 | `port` | Unique per entry. |
 | `type` | `internal` (headless-Service DNS) or `external` (per-broker plumbing below). |
-| `tls` | Independent of authentication; `tls: true` + `type: none` is opportunistic TLS. |
+| `tls` | Independent of authentication; `tls: true` + `type: none` is opportunistic TLS. An internal TLS listener serves the chart's certificate: clients trust `ca.crt` from the `<fullname>-broker-internal-tls` Secret ([internal TLS listeners](./helm.md#internal-tls-listeners)). |
 | `authentication.type` | `none` / `scram-sha-512` / `plain` / `mtls` / `oauth`. `mtls` requires `tls: true`; SASL PLAIN and OAUTHBEARER are *refused* over non-TLS connections at runtime (they carry reusable credentials). Anonymous connections are `User:ANONYMOUS`, which ACLs deny by default under `authorization.type: simple`; `auth.requireSasl` makes those listeners demand SASL instead. |
 | `clientCA.existingSecret` / `key` | Internal TLS listeners only (default key `ca.crt`): the Secret holding the CA that signs client certificates. Only *this* listener then requires a client certificate — SCRAM or OAuth listeners on the same broker keep accepting certificate-less clients, the way Apache Kafka's per-listener `listener.name.<name>.ssl.client.auth` works. Required for an internal `mtls` listener (the template fails without it); the external listener uses its own `clientCA.enabled` block below. |
 

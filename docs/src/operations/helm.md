@@ -45,6 +45,32 @@ authentication requires `tls: true`, and the broker refuses `plain` and
 `oauth` (SASL PLAIN / OAUTHBEARER) over non-TLS connections at runtime —
 both send reusable credentials on the wire.
 
+### Internal TLS listeners
+
+An enabled `type: internal` listener with `tls: true` serves a certificate
+the chart issues through cert-manager. The chart creates a CA once,
+`<fullname>-internal-ca`, valid for 10 years and renewed a year early with
+the same key. The CA issues the broker certificate,
+`<fullname>-broker-internal-tls`, valid for 90 days and renewed 15 days
+early with a new key. Every broker mounts that Secret, and its SANs cover the
+client Service and every broker's headless name.
+
+**Clients trust the Secret's `ca.crt`, never its `tls.crt`.** `ca.crt` holds
+the CA, which a renewal doesn't change, so a client keeps working while the
+brokers
+[reload the renewed certificate](../architecture/listeners-auth.md#certificate-rotation).
+`tls.crt` changes at every renewal, so a client that trusts it breaks at the
+next one. A client reads its truststore when it starts, so copy `ca.crt`
+into its config once; it doesn't need refreshing until the CA itself
+expires.
+
+**Upgrading from v0.3.64-preview or earlier changes the anchor once.**
+Earlier charts issued a self-signed broker certificate that was its own
+`ca.crt`. On upgrade, cert-manager reissues the broker certificate from the
+new CA and `ca.crt` changes, so every client that copied the old one fails
+the handshake until it picks up the new `ca.crt` and restarts. Plan that
+restart with the upgrade. After it, renewals need no client restarts (gh #343).
+
 Two behaviours to know before enabling an external listener:
 
 - **Only the first `type: external` listener** drives the `KafkaCluster`

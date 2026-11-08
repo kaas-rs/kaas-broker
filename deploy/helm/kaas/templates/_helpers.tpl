@@ -261,8 +261,8 @@ enabled — that would mean no Kafka traffic, which is never the intent.
 kaas.hasInternalTLSListener — true (returns "1") if any enabled
 listener has type: internal + tls: true. Distinct from the external
 TLS path, which is reconciled by the operator from the KafkaCluster
-CR — the internal-TLS case is chart-managed end-to-end via a
-selfSigned cert-manager Issuer + Certificate (gh #131).
+CR — the internal-TLS case is chart-managed end-to-end: a chart CA
+issues the broker certificate (gh #131, gh #343).
 */}}
 {{- define "kaas.hasInternalTLSListener" -}}
 {{- $hit := "" -}}
@@ -293,11 +293,21 @@ per crates/sk-protocol/src/server.rs).
 
 {{/*
 kaas.internalTLSSecretName — Secret name for the chart-managed
-internal-TLS cert. Cert-manager populates it with tls.crt + tls.key
-(no separate ca.crt; the self-signed leaf cert IS the trust anchor).
+internal-TLS cert. Cert-manager populates it with tls.crt + tls.key,
+and ca.crt with the chart CA that issued it, which is what clients
+should trust: tls.crt changes at every renewal.
 */}}
 {{- define "kaas.internalTLSSecretName" -}}
 {{- printf "%s-broker-internal-tls" (include "kaas.fullname" .) -}}
+{{- end -}}
+
+{{/*
+kaas.internalCAName — the chart CA behind the internal-TLS cert: its
+Certificate, its Secret and the Issuer that signs with it share the
+name (gh #343).
+*/}}
+{{- define "kaas.internalCAName" -}}
+{{- printf "%s-internal-ca" (include "kaas.fullname" .) -}}
 {{- end -}}
 
 {{/*

@@ -112,6 +112,89 @@ fn check_zero_values(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The rendered documents of `kind` from cert-manager.
+fn cert_manager_documents(rendered: &str, kind: &str) -> Result<Vec<serde_yaml::Value>> {
+    let mut out = Vec::new();
+    for document in serde_yaml::Deserializer::from_str(rendered) {
+        let document = serde_yaml::Value::deserialize(document)?;
+        let api = document
+            .get("apiVersion")
+            .and_then(serde_yaml::Value::as_str);
+        if document.get("kind").and_then(serde_yaml::Value::as_str) == Some(kind)
+            && api.is_some_and(|a| a.starts_with("cert-manager.io/"))
+        {
+            out.push(document);
+        }
+    }
+    Ok(out)
+}
+
+fn field<'a>(v: &'a serde_yaml::Value, path: &[&str]) -> Option<&'a str> {
+    path.iter()
+        .try_fold(v, |v, key| v.get(*key))
+        .and_then(serde_yaml::Value::as_str)
+}
+
+/// Clients of an internal TLS listener trust the CA in `ca.crt`, so the
+/// broker certificate must come from the chart's CA, and the CA must keep its
+/// key when it renews. A self-signed broker certificate, or a CA on
+/// cert-manager's default `rotationPolicy: Always`, changes the trust anchor
+/// at a renewal and breaks every client holding the old one (gh #343).
+fn check_internal_ca(root: &Path) -> Result<()> {
+    let rendered = render(
+        root,
+        "internal CA",
+        &[
+            "--set-json",
+            r#"listeners=[{"name":"tls","port":9093,"type":"internal","tls":true,"authentication":{"type":"none"}}]"#,
+        ],
+    )?;
+    let certificates = cert_manager_documents(&rendered, "Certificate")?;
+    let issuers = cert_manager_documents(&rendered, "Issuer")?;
+    let cas: Vec<_> = certificates
+        .iter()
+        .filter(|c| {
+            c.get("spec").and_then(|s| s.get("isCA")) == Some(&serde_yaml::Value::Bool(true))
+        })
+        .collect();
+    let [ca] = cas.as_slice() else {
+        bail!(
+            "internal CA: want one isCA Certificate, the chart renders {}",
+            cas.len()
+        );
+    };
+    let policy = field(ca, &["spec", "privateKey", "rotationPolicy"]);
+    if policy != Some("Never") {
+        bail!("internal CA: rotationPolicy is {policy:?}, not Never, so a CA renewal would change the trust anchor");
+    }
+    let ca_secret = field(ca, &["spec", "secretName"]);
+    let Some(ca_issuer) = issuers
+        .iter()
+        .find(|i| ca_secret.is_some() && field(i, &["spec", "ca", "secretName"]) == ca_secret)
+        .and_then(|i| field(i, &["metadata", "name"]))
+    else {
+        bail!("internal CA: no Issuer signs with the CA's Secret {ca_secret:?}");
+    };
+    let leaves: Vec<_> = certificates
+        .iter()
+        .filter(|c| {
+            field(c, &["metadata", "name"]).is_some_and(|n| n.ends_with("-broker-internal-tls"))
+        })
+        .collect();
+    let [leaf] = leaves.as_slice() else {
+        bail!(
+            "internal CA: want one broker certificate, the chart renders {}",
+            leaves.len()
+        );
+    };
+    let leaf_issuer = field(leaf, &["spec", "issuerRef", "name"]);
+    if leaf_issuer != Some(ca_issuer) {
+        bail!("internal CA: the broker certificate is issued by {leaf_issuer:?}, not the CA's Issuer {ca_issuer}");
+    }
+    println!("check-chart: internal CA: the broker certificate comes from a CA that keeps its key");
+    Ok(())
+}
+
 fn check_render(root: &Path, label: &str, args: &[&str]) -> Result<()> {
     let rendered = render(root, label, args)?;
     let documents = parse_documents(&rendered)
@@ -133,6 +216,7 @@ pub fn check(root: &Path, extra_values: Option<&str>) -> Result<()> {
         &["--set", "storage.controlPlane.enabled=true"],
     )?;
     check_zero_values(root)?;
+    check_internal_ca(root)?;
 
     let mut value_files: Vec<_> = std::fs::read_dir(root.join(CI_VALUES))?
         .collect::<std::io::Result<Vec<_>>>()?

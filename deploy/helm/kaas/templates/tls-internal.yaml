@@ -7,10 +7,17 @@ pod presents the same self-signed cert covering the headless-service
 DNS names, and in-cluster clients trust the cert directly via PEM
 truststore.
 
-Self-signed Issuer + a single Certificate (no intermediate CA). The
-broker certs that cert-manager emits carry their own subject as both
-the leaf and the trust anchor for clients — clients mount the
-Secret's tls.crt as their PEM truststore.
+The broker certificate is issued by a CA the chart creates once, and
+clients trust that CA: the broker Secret's ca.crt, which cert-manager
+fills from it (gh #343). The broker certificate renews every 75 days
+with a new key, and the brokers reload it without a restart; clients
+don't notice, because the CA doesn't change. The CA renews a year
+before its 10 years run out, with the same key, so clients holding the
+old CA certificate still verify against it.
+
+Before gh #343 the broker certificate was self-signed, so it was its
+own trust anchor, and each renewal broke every client holding the old
+one. Moving an install over changes the anchor once.
 */ -}}
 {{- if include "kaas.hasInternalTLSListener" . }}
 apiVersion: cert-manager.io/v1
@@ -24,12 +31,43 @@ spec:
 apiVersion: cert-manager.io/v1
 kind: Certificate
 metadata:
+  name: {{ include "kaas.internalCAName" . }}
+  labels: {{- include "kaas.labels" . | nindent 4 }}
+spec:
+  isCA: true
+  secretName: {{ include "kaas.internalCAName" . }}
+  commonName: {{ include "kaas.internalCAName" . }}
+  issuerRef:
+    name: {{ include "kaas.fullname" . }}-selfsigned
+    kind: Issuer
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    # The key is the trust anchor: a renewal that kept the certificate
+    # but changed the key would break every client. cert-manager's
+    # default has been Always since v1.18.
+    rotationPolicy: Never
+  duration: 87600h   # 10 years
+  renewBefore: 8760h # 1 year
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ include "kaas.internalCAName" . }}
+  labels: {{- include "kaas.labels" . | nindent 4 }}
+spec:
+  ca:
+    secretName: {{ include "kaas.internalCAName" . }}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
   name: {{ include "kaas.fullname" . }}-broker-internal-tls
   labels: {{- include "kaas.labels" . | nindent 4 }}
 spec:
   secretName: {{ include "kaas.internalTLSSecretName" . }}
   issuerRef:
-    name: {{ include "kaas.fullname" . }}-selfsigned
+    name: {{ include "kaas.internalCAName" . }}
     kind: Issuer
   commonName: {{ include "kaas.fullname" . }}
   dnsNames:

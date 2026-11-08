@@ -172,6 +172,17 @@ against a 2.7 ms ICMP round trip, while a 44 KB `WRITE` averaged 19.3 ms — so
 with `bklog_u` at 0 throughout. On that substrate `nconnect` is not the lever;
 faster storage is.
 
+## Internal TLS
+
+An enabled `type: internal` listener with `tls: true` serves a
+certificate from a CA the chart creates (`<fullname>-internal-ca`, 10
+years). Clients trust `ca.crt` from the `<fullname>-broker-internal-tls`
+Secret, never `tls.crt`: the broker certificate renews every 75 days
+with a new key, and the brokers reload it without a restart, but the CA
+stays the same. Upgrading from v0.3.64-preview or earlier changes
+`ca.crt` once, so restart every client after it picks up the new one
+(gh #343).
+
 ## External access
 
 The external listener uses **explicit per-broker hostnames** with a
