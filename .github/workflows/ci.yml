@@ -199,14 +199,21 @@ jobs:
       - uses: actions/checkout@v6
 
       - name: Install mdbook + mdbook-mermaid + mdbook-linkcheck (pinned)
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           mkdir -p "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          # GitHub's release downloads fail now and then with a 504 page,
-          # which tar or unzip then reports as a corrupt archive. -f fails on
-          # the HTTP status and --retry tries again; each goes to a file first,
-          # because a retry into a pipe would hand tar the bytes twice.
-          fetch() { curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 -o "$1" "$2"; }
+          # Authenticated: during GitHub's 2026-11-08 incident for unauthenticated
+          # users, anonymous downloads got a 503 every time and token ones a 200.
+          # curl drops the header on the redirect to the download host. -f fails
+          # on the HTTP status rather than handing tar or unzip an error page, and
+          # each file is downloaded before extracting, so a retry can't feed tar
+          # the same bytes twice.
+          fetch() {
+            curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 \
+              -H "Authorization: Bearer $GH_TOKEN" -o "$1" "$2"
+          }
           fetch /tmp/mdbook.tar.gz \
             "https://github.com/rust-lang/mdBook/releases/download/${MDBOOK_VERSION}/mdbook-${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
           tar -xzf /tmp/mdbook.tar.gz -C "$HOME/.local/bin"
