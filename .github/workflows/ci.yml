@@ -202,11 +202,18 @@ jobs:
         run: |
           mkdir -p "$HOME/.local/bin"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          curl -sSL "https://github.com/rust-lang/mdBook/releases/download/${MDBOOK_VERSION}/mdbook-${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
-            | tar -xz -C "$HOME/.local/bin"
-          curl -sSL "https://github.com/badboy/mdbook-mermaid/releases/download/${MDBOOK_MERMAID_VERSION}/mdbook-mermaid-${MDBOOK_MERMAID_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
-            | tar -xz -C "$HOME/.local/bin"
-          curl -sSL -o /tmp/mdbook-linkcheck.zip \
+          # GitHub's release downloads fail now and then with a 504 page,
+          # which tar or unzip then reports as a corrupt archive. -f fails on
+          # the HTTP status and --retry tries again; each goes to a file first,
+          # because a retry into a pipe would hand tar the bytes twice.
+          fetch() { curl -fsSL --retry 5 --retry-all-errors --retry-delay 10 -o "$1" "$2"; }
+          fetch /tmp/mdbook.tar.gz \
+            "https://github.com/rust-lang/mdBook/releases/download/${MDBOOK_VERSION}/mdbook-${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          tar -xzf /tmp/mdbook.tar.gz -C "$HOME/.local/bin"
+          fetch /tmp/mdbook-mermaid.tar.gz \
+            "https://github.com/badboy/mdbook-mermaid/releases/download/${MDBOOK_MERMAID_VERSION}/mdbook-mermaid-${MDBOOK_MERMAID_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          tar -xzf /tmp/mdbook-mermaid.tar.gz -C "$HOME/.local/bin"
+          fetch /tmp/mdbook-linkcheck.zip \
             "https://github.com/Michael-F-Bryan/mdbook-linkcheck/releases/download/${MDBOOK_LINKCHECK_VERSION}/mdbook-linkcheck.x86_64-unknown-linux-gnu.zip"
           unzip -o -d "$HOME/.local/bin" /tmp/mdbook-linkcheck.zip mdbook-linkcheck
           chmod +x "$HOME/.local/bin/mdbook-linkcheck"
