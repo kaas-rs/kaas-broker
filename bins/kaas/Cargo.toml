@@ -18,7 +18,6 @@ async-trait        = { workspace = true }
 axum               = { workspace = true }
 bytes              = { workspace = true }
 rustls             = { workspace = true }
-rustls-pemfile     = { workspace = true }
 kaas-auth            = { path = "../../crates/kaas-auth" }
 kaas-broker          = { path = "../../crates/kaas-broker", features = ["cr-writer"] }
 parking_lot        = { workspace = true }

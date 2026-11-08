@@ -63,6 +63,31 @@ not `:9092`. Without this, an authed-listener client was handed the
 anonymous listener's port in the Metadata response and looped on SCRAM
 retry against a listener that never asks for SASL.
 
+## Certificate rotation
+
+A TLS listener reads its certificate, key and, for mTLS, client CA from
+files, which the chart mounts from a Secret. The broker re-reads them every
+10 seconds and compares their content with what it's serving (gh #343). A
+change loads on the second poll that reads it, so a poll that catches the
+files half-replaced doesn't take them for a broken pair. Each new connection
+gets the config current when it's accepted, and connections already open
+keep the session they negotiated. The kubelet takes up to about a minute to
+update a Secret volume, so a renewed certificate reaches new connections a
+minute or two after cert-manager writes it, with no restart. A rotated client
+CA takes effect the same way.
+
+New files that don't load are refused, and the listener keeps serving the
+previous ones. That covers a certificate that isn't PEM, a key that doesn't
+match the certificate, and a missing file. The broker logs a warning and
+counts `kaas.cert.reloads` with `result=error`, once for each content it
+refuses; `result=ok` counts reloads. Alert on `result=error`: otherwise a
+renewal that didn't load goes unnoticed until the old certificate expires.
+Every load logs the certificate's serial and expiry.
+
+The reload changes the certificate the broker serves, not what clients
+trust. A client gets through a rotation only if the new certificate chains to
+an anchor it already holds.
+
 ## The pre-auth gate on an authed listener
 
 Anonymous listeners use an allow-all engine (no SASL, no principal); on
@@ -282,6 +307,9 @@ themselves; adversarial ones are a known gap tracked in the
 - ACL evaluation: `crates/kaas-auth/src/acls.rs`.
 - Principal mapping: `crates/kaas-auth/src/principal_mapping.rs`
   (gh #43).
+- Certificate reload: `crates/kaas-protocol/src/tls.rs` (gh #343). Its
+  tests rotate a Kubernetes-style Secret volume under a real listener and
+  check the certificate each new handshake gets.
 - OAUTHBEARER + JWT/JWKS validation: `crates/kaas-auth/src/oauth.rs`
   (gh #42). The validator is pure-sync (SASL hot path); the JWKS HTTP
   fetch loop lives in `bins/kaas/src/main.rs`

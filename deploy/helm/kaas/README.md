@@ -192,9 +192,8 @@ the optional `bootstrapHostname`. Both choices are deliberate:
   rotation churn for no gain — every broker pod mounts the same
   Secret, and the in-process TLS listener picks the right SNI from
   the cert's SAN list. cert-manager rotates this single Secret
-  in-place, but the broker reads it only at startup, so a rotated
-  certificate takes effect when the pod restarts. Roll the brokers
-  before the old one expires (gh #343).
+  in-place, and the brokers pick up the new certificate a minute or
+  two later without a restart (gh #343).
 
 If you scale `broker.replicaCount` up at runtime, the operator
 re-reconciles the `KafkaCluster` CR and updates the Certificate's

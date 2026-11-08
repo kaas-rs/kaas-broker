@@ -53,6 +53,7 @@ const EXPECTED_WIRED: &[&str] = &[
     "acl_deny",
     "quota_throttle",
     "tls_handshakes",
+    "cert_reloads",
     "connections",
     "connections_open",
     "cleaner_runs",
@@ -71,8 +72,7 @@ const EXPECTED_WIRED: &[&str] = &[
 ///
 /// * **Forward-compat / not-yet-ported subsystems**: compactor
 ///   metrics (`compaction_*`) — no compactor exists yet;
-///   `cert_reloads` — TLS certs are bound at startup; hot reload is
-///   a Phase 8/9 gap; `heartbeat_rtt` — the heartbeat is a bidi
+///   `heartbeat_rtt` — the heartbeat is a bidi
 ///   stream, so an RTT needs a controller-side echo timestamp in
 ///   `proto/heartbeat.proto`, which nothing sends. No alert or panel
 ///   reads it (gh #265).
@@ -81,7 +81,6 @@ const EXPECTED_WIRED: &[&str] = &[
 ///   `otlp_push_observer.rs`.
 const EXPECTED_ZERO: &[&str] = &[
     "heartbeat_rtt",
-    "cert_reloads",
     "compaction_runs",
     "compaction_duration",
     "compaction_records_kept",

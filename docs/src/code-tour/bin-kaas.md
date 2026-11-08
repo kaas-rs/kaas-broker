@@ -16,8 +16,8 @@ every open partition (persisting manifests + producer snapshots, closing
 FDs); the relinquish is the final persist
 ([file-handle ownership](../architecture/file-handles.md)). It also carries
 the `--init` init-container entry point, the retention-cleaner tick, the
-credentials/ACL hot-reload task, and the JWKS refresher loops for OAuth
-listeners.
+credentials/ACL hot-reload task, the certificate reload loop for each TLS
+listener, and the JWKS refresher loops for OAuth listeners.
 
 **`cluster.rs`**: the cluster runtime — Lease election glue, heartbeat
 client/server wiring, broker-set watcher (2 s alive-set poll), topic-change

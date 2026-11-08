@@ -47,17 +47,21 @@ use kaas_broker::{
     SaslAuthenticateHandler, SaslHandshakeHandler, SyncGroupHandler, TopicRegistry,
     TxnOffsetCommitHandler, WriteTxnMarkersHandler,
 };
-use kaas_protocol::{Dispatcher, ListenerConfig, MtlsConfig, Server, ServerConfigBuilder};
+use kaas_protocol::{
+    Dispatcher, ListenerConfig, MtlsConfig, Server, ServerConfigBuilder, TlsPaths, TlsReloader,
+};
 use kaas_storage::{DiskStorageEngine, MemoryStorage, PartitionConfig, RealFs, StorageEngine};
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::server::WebPkiClientVerifier;
-use rustls::{RootCertStore, ServerConfig as RustlsServerConfig};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 /// Hot-reload interval for credentials.json + acls.json. 10 s
 /// mtime poll. Swapping in `notify` inotify is an open follow-up.
 const RELOAD_INTERVAL_SECS: u64 = 10;
+
+/// How often a TLS listener re-reads its certificate, key and client CA
+/// (gh #343). A change loads on the second poll that reads it, so a rotated
+/// Secret reaches new connections 10-20 s after the kubelet updates the volume.
+const TLS_RELOAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
 /// The wait after each partition the `migrate-to-volume` driver moves
 /// (gh #224).
 const MIGRATION_PACE: std::time::Duration = std::time::Duration::from_secs(3);
@@ -510,8 +514,12 @@ async fn main() -> Result<()> {
             .clone()
             .map(|c| -> Arc<dyn kaas_auth::CredentialStore> { c }),
     );
-    let listeners = parse_listeners(&cli.listeners, &auth.engines, &auth.principal_mapper)?;
+    let (listeners, tls_reloaders) =
+        parse_listeners(&cli.listeners, &auth.engines, &auth.principal_mapper)?;
     let server = Server::new(ServerConfigBuilder::new(listeners), Arc::new(dispatcher));
+    for reloader in tls_reloaders {
+        tokio::spawn(reloader.run(TLS_RELOAD_INTERVAL, cancel.clone()));
+    }
 
     let serve_cancel = cancel.clone();
     let serve = tokio::spawn(async move { server.serve(serve_cancel).await });
@@ -1256,12 +1264,15 @@ fn build_dispatcher(
     d
 }
 
+/// The listeners to serve, and a [`TlsReloader`] for each TLS one to run
+/// alongside it.
 fn parse_listeners(
     entries: &[ListenerEntry],
     engines: &Arc<PerListenerAuthEngine>,
     mapper: &Arc<PrincipalMapper>,
-) -> Result<Vec<ListenerConfig>> {
-    entries
+) -> Result<(Vec<ListenerConfig>, Vec<TlsReloader>)> {
+    let mut reloaders = Vec::new();
+    let listeners = entries
         .iter()
         .map(|e| {
             let addr = e
@@ -1271,9 +1282,11 @@ fn parse_listeners(
             let tls_config = match &e.tls {
                 None => None,
                 Some(tc) => {
-                    Some(Arc::new(load_tls(tc).with_context(|| {
-                        format!("loading TLS for listener {}", e.name)
-                    })?))
+                    let reloader = TlsReloader::load(&e.name, tls_paths(tc))
+                        .with_context(|| format!("loading TLS for listener {}", e.name))?;
+                    let tls = reloader.tls();
+                    reloaders.push(reloader);
+                    Some(tls)
                 }
             };
             let mtls = if matches!(e.authentication_type.as_deref(), Some("mtls")) {
@@ -1293,54 +1306,16 @@ fn parse_listeners(
                 mtls,
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok((listeners, reloaders))
 }
 
-fn load_tls(cfg: &CliTlsConfig) -> Result<RustlsServerConfig> {
-    let certs = load_certs(&cfg.cert_path)?;
-    let key = load_private_key(&cfg.key_path)?;
-    let builder = RustlsServerConfig::builder();
-    let server = if let Some(ca_path) = &cfg.client_ca_path {
-        let mut roots = RootCertStore::empty();
-        for cert in load_certs(ca_path)? {
-            roots
-                .add(cert)
-                .context("installing client-CA cert into trust store")?;
-        }
-        let verifier = WebPkiClientVerifier::builder(Arc::new(roots))
-            .build()
-            .context("building client cert verifier")?;
-        builder.with_client_cert_verifier(verifier)
-    } else {
-        builder.with_no_client_auth()
-    };
-    server
-        .with_single_cert(certs, key)
-        .context("rustls server config with cert + key")
-}
-
-fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
-    let f = std::fs::File::open(path)
-        .with_context(|| format!("opening cert file {}", path.display()))?;
-    let mut r = std::io::BufReader::new(f);
-    let mut out = Vec::new();
-    for cert in rustls_pemfile::certs(&mut r) {
-        out.push(cert.with_context(|| format!("parsing cert in {}", path.display()))?);
+fn tls_paths(cfg: &CliTlsConfig) -> TlsPaths {
+    TlsPaths {
+        cert: cfg.cert_path.clone(),
+        key: cfg.key_path.clone(),
+        client_ca: cfg.client_ca_path.clone(),
     }
-    if out.is_empty() {
-        anyhow::bail!("no PEM certificates found in {}", path.display());
-    }
-    Ok(out)
-}
-
-fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
-    let f = std::fs::File::open(path)
-        .with_context(|| format!("opening key file {}", path.display()))?;
-    let mut r = std::io::BufReader::new(f);
-    let key = rustls_pemfile::private_key(&mut r)
-        .with_context(|| format!("parsing private key in {}", path.display()))?
-        .ok_or_else(|| anyhow::anyhow!("no private key in {}", path.display()))?;
-    Ok(key)
 }
 
 async fn wait_for_shutdown_signal() -> Result<()> {

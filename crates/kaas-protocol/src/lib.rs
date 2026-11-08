@@ -14,6 +14,7 @@ pub mod connstate;
 pub mod dispatch;
 pub mod frame;
 pub mod server;
+pub mod tls;
 
 pub use connstate::{ConnState, Principal, Reply};
 pub use dispatch::{
@@ -22,3 +23,4 @@ pub use dispatch::{
 };
 pub use frame::{Connection, ProtoError};
 pub use server::{BoundServer, ListenerConfig, MtlsConfig, Server, ServerConfigBuilder};
+pub use tls::{ListenerTls, PollOutcome, TlsError, TlsPaths, TlsReloader};

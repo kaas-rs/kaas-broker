@@ -52,10 +52,10 @@ Two behaviours to know before enabling an external listener:
   operator currently understands a single external listener.
 - External listeners use **per-broker hostnames on one SAN-per-broker
   certificate** (works with HTTP-01 ACME; one DNS record per broker).
-  cert-manager rotates the single Secret in place, but brokers read it only
-  at startup, so a rotated certificate takes effect when the pods restart:
-  roll them before the old one expires (tracked as gh #343). Scaling
-  `replicaCount` re-reconciles the Certificate's SAN list.
+  cert-manager rotates the single Secret in place, and the brokers pick up
+  the new certificate a minute or two later without a restart
+  ([certificate rotation](../architecture/listeners-auth.md#certificate-rotation)).
+  Scaling `replicaCount` re-reconciles the Certificate's SAN list.
 
 ## Cluster-wide authorization
 

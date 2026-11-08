@@ -3,8 +3,8 @@
 //! Multi-listener server bring-up:
 //! - one `tokio::task` per accepted connection,
 //! - cancellation via [`CancellationToken`],
-//! - per-listener TLS plumbing (`tls_config: Option<...>`) — wired
-//!   but unused in Phase 3; Phase 4 lights up real cert loading.
+//! - per-listener TLS (`tls_config`), read once per connection so a
+//!   reloaded certificate reaches the next handshake ([`crate::tls`]).
 //!
 //! Three independent axes per listener: exposure (`addr`),
 //! encryption (`tls_config`), and authentication (which the
@@ -18,13 +18,14 @@ use std::sync::Arc;
 use kaas_auth::engine::AuthEngine;
 use kaas_auth::principal_mapping::PrincipalMapper;
 use tokio::net::{TcpListener, TcpStream};
-use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
+use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::connstate::{ConnState, Reply};
 use crate::dispatch::Dispatcher;
 use crate::frame::{Connection, ProtoError};
+use crate::tls::ListenerTls;
 
 /// Per-listener TLS principal extraction. When `Some`, the accept
 /// loop pulls the peer's leaf cert after the TLS handshake and asks
@@ -55,8 +56,9 @@ pub struct ListenerConfig {
     /// pre-bound socket — tests use this to allocate `127.0.0.1:0`
     /// themselves and capture the assigned port.
     pub pre_bound: Option<TcpListener>,
-    /// `Some(cfg)` wraps the bound listener with TLS.
-    pub tls_config: Option<Arc<ServerConfig>>,
+    /// `Some(tls)` wraps the bound listener with TLS. Each connection takes
+    /// the config current when it's accepted.
+    pub tls_config: Option<ListenerTls>,
     /// `Some(...)` runs mTLS principal extraction after the TLS
     /// handshake. Requires `tls_config` to also be `Some` and the
     /// rustls `ServerConfig` to require a client certificate.
@@ -142,10 +144,7 @@ impl Server {
                 }
                 None => TcpListener::bind(lc.addr).await?,
             };
-            let tls = lc
-                .tls_config
-                .as_ref()
-                .map(|cfg| TlsAcceptor::from(cfg.clone()));
+            let tls = lc.tls_config.clone();
             info!(
                 addr = %ln.local_addr().map(|a| a.to_string()).unwrap_or_default(),
                 listener = lc.name.as_str(),
@@ -169,7 +168,7 @@ struct BoundListener {
     name: String,
     listener: TcpListener,
     max_frame_bytes: usize,
-    tls: Option<TlsAcceptor>,
+    tls: Option<ListenerTls>,
     mtls: Option<MtlsConfig>,
 }
 
@@ -236,7 +235,7 @@ async fn accept_loop(
     listener_name: String,
     listener: TcpListener,
     max_frame_bytes: usize,
-    tls: Option<TlsAcceptor>,
+    tls: Option<ListenerTls>,
     mtls: Option<MtlsConfig>,
     dispatcher: Arc<Dispatcher>,
     cancel: CancellationToken,
@@ -301,7 +300,7 @@ async fn serve_conn(
     stream: TcpStream,
     peer: SocketAddr,
     max_frame_bytes: usize,
-    tls: Option<TlsAcceptor>,
+    tls: Option<ListenerTls>,
     mtls: Option<MtlsConfig>,
     dispatcher: Arc<Dispatcher>,
     cancel: CancellationToken,
@@ -309,7 +308,8 @@ async fn serve_conn(
     let mut cs = ConnState::new(&listener_name, peer);
     cs.is_tls = tls.is_some();
     let state = Arc::new(parking_lot::Mutex::new(cs));
-    if let Some(acceptor) = tls {
+    if let Some(tls) = tls {
+        let acceptor = TlsAcceptor::from(tls.current());
         // Counted on both outcomes, with a `result` label, so the
         // dashboard's success rate has something to divide (gh #290
         // verification: only successes were counted, with no `result`).

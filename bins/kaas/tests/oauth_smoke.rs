@@ -191,7 +191,7 @@ async fn spawn_oauth_broker(
         name: "oauth".to_owned(),
         addr: "127.0.0.1:0".parse().unwrap(),
         pre_bound: None,
-        tls_config: Some(Arc::new(server_tls)),
+        tls_config: Some(Arc::new(server_tls).into()),
         mtls: None,
     }]);
     let server = Server::new(cfg, dispatcher.clone());

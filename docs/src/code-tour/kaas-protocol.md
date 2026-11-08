@@ -6,7 +6,9 @@ The layer between the codec and the handlers: it owns sockets, connection
 lifecycle, and the decision of *whether a request may be dispatched at all*.
 
 **Module map**: `server.rs` (multi-listener TCP/TLS accept loops —
-TCP_NODELAY on accept, mTLS principal-mapper wiring), `frame.rs`
+TCP_NODELAY on accept, mTLS principal-mapper wiring), `tls.rs` (a
+listener's TLS config loaded from its files and reloaded when they change,
+gh #343), `frame.rs`
 (`Connection<S>`: async stream + frame reader, request headers parsed via
 the codec registry, responses written with the right header version),
 `dispatch.rs` (the API-key router), `connstate.rs` (per-connection mutable

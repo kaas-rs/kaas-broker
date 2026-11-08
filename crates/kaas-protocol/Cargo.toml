@@ -9,10 +9,13 @@ publish      = false
 description  = "Per-API request/response types, dispatch, multi-listener server bring-up."
 
 [dependencies]
+arc-swap     = { workspace = true }
 async-trait = { workspace = true }
 bytes        = { workspace = true }
 futures      = { workspace = true }
 parking_lot  = { workspace = true }
+rustls-pemfile = { workspace = true }
+sha2         = { workspace = true }
 kaas-auth          = { path = "../kaas-auth" }
 kaas-codec         = { path = "../kaas-codec" }
 kaas-observability = { workspace = true }
@@ -22,8 +25,13 @@ tokio        = { workspace = true }
 tokio-rustls = { workspace = true }
 tokio-util   = { workspace = true }
 tracing      = { workspace = true }
+x509-parser  = { workspace = true }
 
 [dev-dependencies]
+rcgen        = { workspace = true }
+# The ring provider the broker installs; tokio-rustls alone may only bring aws-lc-rs.
+rustls       = { workspace = true }
+tempfile     = { workspace = true }
 tokio-test   = { workspace = true }
 
 [lints]
