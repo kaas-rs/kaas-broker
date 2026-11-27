@@ -805,7 +805,11 @@ impl ActiveSegment {
             self.log = Some(fs.open_write(&self.meta.log_path, false)?);
         }
         if self.index.is_none() {
-            match fs.open_write(&self.meta.index_path, false) {
+            // Append mode: entries go on with `write_all`, so without it a
+            // reopened index was written over from its first entry, and the
+            // old entries, the ones that cover the log already there, were
+            // lost.
+            match fs.open_write(&self.meta.index_path, true) {
                 Ok(f) => self.index = Some(f),
                 Err(e) => {
                     self.log = None;
@@ -827,6 +831,53 @@ impl ActiveSegment {
             // exact value isn't required for appends.
             self.last_indexed_log_pos = meta.len() / 8 * 4096;
         }
+        Ok(())
+    }
+
+    /// Keep the longest prefix of the index that describes this log:
+    /// entries rising in both offset and position, each inside the log.
+    /// Run at open, after any torn-tail truncation, and it sets the next
+    /// entry's spacing from the last one kept.
+    ///
+    /// An entry past the log end points into bytes that are gone, a torn
+    /// tail or a tail truncated after a failed fsync (gh #330). New batches
+    /// then fill that space at other positions, and a lookup through the
+    /// stale entry started a Fetch in the middle of one, serving whatever
+    /// the bytes there parsed as. An entry out of order comes from the
+    /// index being written over from its start after a reopen, before
+    /// that was fixed; everything from the first one is dropped, which
+    /// costs lookups a longer walk, never correctness.
+    pub fn sanitize_index(&mut self, fs: &dyn Fs) -> io::Result<()> {
+        let data = match fs.open_read(&self.meta.index_path) {
+            Ok(mut f) => {
+                let mut buf = Vec::new();
+                io::Read::read_to_end(&mut f, &mut buf)?;
+                buf
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
+            Err(e) => return Err(e),
+        };
+        let mut kept = 0usize;
+        let mut last: Option<(i32, u64)> = None;
+        for i in 0..data.len() / INDEX_ENTRY_SIZE {
+            let (rel, pos) = read_index_entry(&data, i);
+            let Ok(pos) = u64::try_from(pos) else { break };
+            let rising = last.is_none_or(|(r, p)| rel > r && pos > p);
+            if rel < 0 || pos >= self.log_size || !rising {
+                break;
+            }
+            last = Some((rel, pos));
+            kept = i + 1;
+        }
+        let kept_len = u64::try_from(kept * INDEX_ENTRY_SIZE).unwrap_or(u64::MAX);
+        if kept_len < u64::try_from(data.len()).unwrap_or(u64::MAX) {
+            match fs.truncate(&self.meta.index_path, kept_len) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::Unsupported => {}
+                Err(e) => return Err(e),
+            }
+        }
+        self.last_indexed_log_pos = last.map_or(0, |(_, pos)| pos);
         Ok(())
     }
 
@@ -1886,6 +1937,87 @@ mod tests {
         let got = read_batches(&fs, &log_path, 0, 2, None, max_bytes).unwrap();
         let expected: Vec<u8> = raws[2..].iter().flatten().copied().collect();
         assert_eq!(got, expected);
+    }
+
+    fn index_entries(path: &Path) -> Vec<(i32, i64)> {
+        let data = std::fs::read(path).unwrap();
+        (0..data.len() / INDEX_ENTRY_SIZE)
+            .map(|i| read_index_entry(&data, i))
+            .collect()
+    }
+
+    /// After a reopen the index was written over from its first entry, so
+    /// the entries covering the log already there were lost.
+    #[test]
+    fn a_reopened_index_is_appended_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = RealFs::new();
+        let mut seg = ActiveSegment::create(&fs, tmp.path(), 0, 1).unwrap();
+        for i in 0..4 {
+            seg.append_batch(&build_batch(i, 0, 1_000, 5_000), 4096)
+                .unwrap();
+        }
+        let meta = seg.meta.clone();
+        seg.close_handles();
+        drop(seg);
+        let before = index_entries(&meta.index_path);
+        assert_eq!(before.len(), 3);
+
+        let mut seg = ActiveSegment::open_meta_only(meta.clone());
+        seg.open_handles(&fs).unwrap();
+        seg.sanitize_index(&fs).unwrap();
+        for i in 4..6 {
+            seg.append_batch(&build_batch(i, 0, 1_000, 5_000), 4096)
+                .unwrap();
+        }
+        seg.close_handles();
+        let after = index_entries(&meta.index_path);
+        assert_eq!(&after[..3], &before[..]);
+        assert_eq!(
+            after.iter().map(|e| e.0).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn sanitize_index_keeps_the_longest_valid_prefix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = RealFs::new();
+        let mut seg = ActiveSegment::create(&fs, tmp.path(), 0, 1).unwrap();
+        seg.append_batch(&build_batch(0, 0, 1_000, 20_000), 4096)
+            .unwrap();
+        let log_size = seg.log_size();
+        seg.close_handles();
+        let entry = |rel: i32, pos: u32| {
+            let mut e = rel.to_be_bytes().to_vec();
+            e.extend_from_slice(&pos.to_be_bytes());
+            e
+        };
+        let index_path = seg.meta.index_path.clone();
+        let write = |entries: &[(i32, u32)]| {
+            let bytes: Vec<u8> = entries.iter().flat_map(|(r, p)| entry(*r, *p)).collect();
+            std::fs::write(&index_path, bytes).unwrap();
+        };
+        let pos = |p: u64| u32::try_from(p).unwrap();
+
+        // Out of order: a later entry written over the first.
+        write(&[(5, 9_000), (2, 4_000), (3, 6_000)]);
+        seg.sanitize_index(&fs).unwrap();
+        assert_eq!(index_entries(&seg.meta.index_path), vec![(5, 9_000)]);
+
+        // Past the log end: a truncated tail.
+        write(&[
+            (1, 4_000),
+            (2, 8_000),
+            (3, pos(log_size)),
+            (4, pos(log_size) + 10),
+        ]);
+        seg.sanitize_index(&fs).unwrap();
+        assert_eq!(
+            index_entries(&seg.meta.index_path),
+            vec![(1, 4_000), (2, 8_000)]
+        );
+        assert_eq!(seg.last_indexed_log_pos, 8_000);
     }
 
     #[test]

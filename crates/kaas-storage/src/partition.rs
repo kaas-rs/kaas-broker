@@ -479,6 +479,8 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
     if scan.stop != segment::ScanStop::Eof {
         active.truncate_to(fs, scan.valid_end)?;
     }
+    // The index has to agree with the log the scan just settled on.
+    active.sanitize_index(fs)?;
     // The next checkpoint names this batch as its resume point (gh #230).
     active.set_last_batch(scan.last_batch);
 
@@ -2768,6 +2770,56 @@ pub(crate) mod tests {
         buf[43..51].copy_from_slice(&(-1i64).to_be_bytes());
         crate::segment::stamp_crc(&mut buf);
         Bytes::from(buf)
+    }
+
+    /// A one-record batch whose records take `records_len` bytes.
+    fn build_sized_batch(records_len: usize) -> Bytes {
+        let body_size = 49 + records_len;
+        let mut buf = vec![0u8; 12 + body_size];
+        buf[8..12].copy_from_slice(&i32::try_from(body_size).unwrap().to_be_bytes());
+        buf[16] = 2; // magic
+        buf[43..51].copy_from_slice(&(-1i64).to_be_bytes());
+        crate::segment::stamp_crc(&mut buf);
+        Bytes::from(buf)
+    }
+
+    /// A torn tail is cut off at open, but the index still pointed into
+    /// it. Smaller batches then filled that space at other positions, and a
+    /// Fetch through a stale entry started in the middle of one.
+    #[test]
+    fn a_read_after_a_cut_tail_starts_on_a_batch_boundary() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            for _ in 0..8 {
+                p.append(0, -1, build_sized_batch(3_000)).await.unwrap();
+            }
+            let log = p.inner.lock().active.meta.log_path.clone();
+            p.close().await.unwrap();
+            drop(p);
+            // Tear the fourth batch: offsets 3 and up are gone, and the
+            // index still has entries for them.
+            let batch_len = 12 + 49 + 3_000;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&log)
+                .unwrap()
+                .set_len(3 * batch_len + 100)
+                .unwrap();
+
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            assert_eq!(p.high_watermark(), 3);
+            for _ in 0..60 {
+                p.append(0, -1, build_sized_batch(100)).await.unwrap();
+            }
+            for start in 0..63 {
+                let got = batch_ranges(&p.read(start, 1 << 20).await.unwrap());
+                let expected: Vec<(i64, i64)> = (start..63).map(|o| (o, o)).collect();
+                assert_eq!(got, expected, "read from {start}");
+            }
+            p.close().await.unwrap();
+        });
     }
 
     /// Build a transactional v2 data batch (attributes bit 4 set).

@@ -318,9 +318,14 @@ batch under that producer id gets through (tracked as gh #347).
 The index is **sparse**: one `(rel_offset: i32, file_pos: i32)` entry
 every `index.interval.bytes` of log data (4 KiB default). Lookup
 binary-searches to the closest entry ≤ the target offset, then scans
-the log forward. The index is *not* fsynced on the hot path — it's
-rebuildable from the log during takeover recovery, so only the log's
-durability is on the `acks=all` promise.
+the log forward. The index is *not* fsynced on the hot path, so only the
+log's durability is on the `acks=all` promise. Instead, opening a
+partition checks the active segment's index against the log the recovery
+scan settled on. It keeps entries up to the first one that is out of
+order or points past the log end. An entry into a truncated tail is the
+dangerous kind: once new batches fill that space at other positions, a
+lookup through it starts a read in the middle of a batch. Dropping entries
+only costs lookups a longer forward scan.
 
 ## Byte opacity: the broker never parses records
 
