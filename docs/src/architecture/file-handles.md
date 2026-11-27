@@ -56,6 +56,14 @@ land in a segment belonging to a dead epoch and are discarded, instead
 of being spliced byte-wise into the live log. Its produce requests start
 failing once its own assignment view catches up.
 
+Discarded means that nothing reads them. Those records sit in the old
+file past the point where the next segment begins, at offsets the new
+leader re-issues. So every read of a closed segment stops at the next
+segment's base offset. That applies to Fetch and to the replay that
+rebuilds producer state when a partition opens. A Fetch that read to the
+end of the file served the dead leader's records ahead of the real ones
+at the same offsets.
+
 **That window can lose acknowledged writes.** It lasts up to about a
 second plus the NFS attribute-cache TTL, capped at 3 s by the self-fence
 only when the move was caused by lost controller connectivity; a move off

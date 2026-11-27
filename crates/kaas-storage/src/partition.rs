@@ -142,7 +142,9 @@ pub struct ReadSnapshot {
 /// 1. **Segments that cannot contain `effective_start` are skipped**
 ///    outright. A closed segment covers `[base_offset, next_base)`,
 ///    where `next_base` is the following segment's base — or the
-///    active segment's base for the last closed one.
+///    active segment's base for the last closed one. The read of a
+///    segment stops at `next_base` too, because the file can run past
+///    it (gh #164).
 /// 2. **The offset index picks the start position.** `search_index`
 ///    returns a file position at or before the target offset; passing
 ///    `0` instead (the old behaviour) made `read_batches` walk the
@@ -174,11 +176,15 @@ fn read_snapshot(
             continue;
         }
         let pos = segment::search_index(fs, &seg.index_path, seg.base_offset, effective_start);
+        // Stop at `next_base`: past it the file holds whatever a deposed
+        // leader wrote after its successor rolled (gh #164), at offsets the
+        // next segment re-issues.
         let chunk = segment::read_batches(
             fs,
             &seg.log_path,
             pos,
             effective_start,
+            Some(next_base),
             max_bytes.saturating_sub(out.len()),
         )?;
         out.extend_from_slice(&chunk);
@@ -196,6 +202,7 @@ fn read_snapshot(
             &snap.active_meta.log_path,
             pos,
             effective_start,
+            None,
             max_bytes.saturating_sub(out.len()),
         )?;
         out.extend_from_slice(&chunk);
@@ -3530,6 +3537,52 @@ pub(crate) mod tests {
 
             let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
             assert_eq!(open_entries(&p), vec![(7, 0)]);
+            p.close().await.unwrap();
+        });
+    }
+
+    /// `(base, last)` offsets of each batch in a read's output.
+    fn batch_ranges(mut bytes: &[u8]) -> Vec<(i64, i64)> {
+        let mut out = Vec::new();
+        while bytes.len() >= 12 {
+            let (base, delta, _) = crate::segment::parse_batch_offsets(bytes).unwrap();
+            out.push((base, base + i64::from(delta)));
+            let len = i32::from_be_bytes(bytes[8..12].try_into().unwrap());
+            bytes = &bytes[12 + usize::try_from(len).unwrap()..];
+        }
+        out
+    }
+
+    /// The same late batches, seen by a consumer: a fetch that starts in the
+    /// deposed leader's segment and reads past its end served them ahead of
+    /// the successor's batch at the same offset (gh #164).
+    #[test]
+    fn a_read_across_a_takeover_roll_skips_the_deposed_leaders_late_batches() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            use std::io::Write;
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            p.take_over(1).await.unwrap();
+            let old_log = p.inner.lock().active.meta.log_path.clone();
+            p.append(1, -1, build_batch(1, 1_000)).await.unwrap();
+            p.take_over(2).await.unwrap(); // the successor rolls at offset 1
+
+            let mut late = build_batch(3, 2_000).to_vec();
+            late[0..8].copy_from_slice(&1i64.to_be_bytes());
+            crate::segment::stamp_crc(&mut late);
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&old_log)
+                .unwrap();
+            f.write_all(&late).unwrap();
+            drop(f);
+            p.append(2, -1, build_batch(1, 3_000)).await.unwrap();
+
+            assert_eq!(
+                batch_ranges(&p.read(0, 1 << 20).await.unwrap()),
+                vec![(0, 0), (1, 1)]
+            );
             p.close().await.unwrap();
         });
     }

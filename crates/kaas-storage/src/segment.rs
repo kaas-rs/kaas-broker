@@ -1041,11 +1041,19 @@ impl std::fmt::Debug for RolledTail {
 /// [`search_index`]). Returns up to `max_bytes` of batches that
 /// start at offset `>= start_offset`. Mirrors `readBatches` in
 /// `segment.go`.
+///
+/// `end_offset` is where the segment stops being part of the log: the
+/// next segment's base offset, or `None` for the active segment. The
+/// file can run past it. A deposed leader keeps appending to its file
+/// until it learns it was deposed (gh #164), at offsets its successor
+/// re-issues in the next segment, so reading to the end of the file
+/// served those batches ahead of the real ones at the same offsets.
 pub fn read_batches(
     fs: &dyn Fs,
     log_path: &Path,
     approx_pos: i64,
     start_offset: i64,
+    end_offset: Option<i64>,
     max_bytes: usize,
 ) -> io::Result<Vec<u8>> {
     let mut f: Box<dyn FileRead> = match fs.open_read(log_path) {
@@ -1095,6 +1103,9 @@ pub fn read_batches(
         let batch_last_offset = base_offset + i64::from(last_offset_delta);
         let rest = body_len - body_head.len();
 
+        if end_offset.is_some_and(|end| base_offset >= end) {
+            break;
+        }
         if batch_last_offset < start_offset {
             // gh #209: seek past the body instead of reading and
             // heap-allocating it. Skipping used to cost a full read +
@@ -1827,8 +1838,28 @@ mod tests {
 
         // Read from start_offset = 2 → should get batches 2, 3, 4.
         let max_bytes: usize = raws.iter().map(Vec::len).sum::<usize>() + 100;
-        let got = read_batches(&fs, &log_path, 0, 2, max_bytes).unwrap();
+        let got = read_batches(&fs, &log_path, 0, 2, None, max_bytes).unwrap();
         let expected: Vec<u8> = raws[2..].iter().flatten().copied().collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn read_batches_stops_at_the_end_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = RealFs::new();
+        let mut seg = ActiveSegment::create(&fs, tmp.path(), 0, 1).unwrap();
+        let raws: Vec<Vec<u8>> = (0..5).map(|i| build_batch(i, 0, 1_000, 32)).collect();
+        for r in &raws {
+            seg.append_batch(r, 4096).unwrap();
+        }
+        seg.sync_log().unwrap();
+        let log_path = seg.meta.log_path.clone();
+        seg.close_handles();
+        drop(seg);
+
+        let max_bytes: usize = raws.iter().map(Vec::len).sum::<usize>() + 100;
+        let got = read_batches(&fs, &log_path, 0, 1, Some(3), max_bytes).unwrap();
+        let expected: Vec<u8> = raws[1..3].iter().flatten().copied().collect();
         assert_eq!(got, expected);
     }
 
@@ -1984,7 +2015,7 @@ mod tests {
 
         // Read from the very last offset, without an index hint — the
         // worst case, and exactly what kafbat-ui's `mode=LATEST` does.
-        let got = read_batches(&fs, &log_path, 0, 199, total + 100).unwrap();
+        let got = read_batches(&fs, &log_path, 0, 199, None, total + 100).unwrap();
         assert_eq!(got, raws[199], "should return exactly the last batch");
 
         let read = usize::try_from(counter.load(std::sync::atomic::Ordering::Relaxed))
@@ -2018,7 +2049,7 @@ mod tests {
 
         let total: usize = raws.iter().map(Vec::len).sum::<usize>() + 100;
         for start in 0..8i64 {
-            let got = read_batches(&fs, &log_path, 0, start, total).unwrap();
+            let got = read_batches(&fs, &log_path, 0, start, None, total).unwrap();
             let idx = usize::try_from(start).unwrap();
             let expected: Vec<u8> = raws[idx..].iter().flatten().copied().collect();
             assert_eq!(got, expected, "mismatch reading from offset {start}");
@@ -2040,7 +2071,7 @@ mod tests {
         bytes.extend_from_slice(&[0u8; 4]);
         std::fs::write(&log_path, &bytes).unwrap();
 
-        let got = read_batches(&fs, &log_path, 0, 0, 1 << 20).unwrap();
+        let got = read_batches(&fs, &log_path, 0, 0, None, 1 << 20).unwrap();
         assert_eq!(got, build_batch(0, 0, 1_000, 32));
     }
 
@@ -2058,7 +2089,7 @@ mod tests {
         seg.close_handles();
 
         // Read at most ~one batch worth.
-        let got = read_batches(&fs, &log_path, 0, 0, 50).unwrap();
+        let got = read_batches(&fs, &log_path, 0, 0, None, 50).unwrap();
         // Either 0 or exactly one batch — but never more than one
         // started (we stop on the first batch that pushes us past
         // max_bytes).
