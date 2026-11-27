@@ -31,7 +31,9 @@ genuinely frees space instead of leaving `.nfsXXXX` ghosts.
 When `assignment.json` moves a partition (the
 [controller chapter](./controller.md) covers who writes it and why):
 
-- **New leader**: takeover opens the log + index handles, restores the
+- **New leader**: takeover first writes its epoch to the partition's
+  leader fence (`leader-fence.json`, below). Then it opens the log +
+  index handles, restores the
   idempotent-producer snapshot, and runs segment recovery — scanning
   the active segment forward, verifying each batch's CRC, truncating
   any torn tail to the last valid byte, and reconciling the manifest's
@@ -80,14 +82,49 @@ the active segment at the next restart. Since no leader ever starts a
 segment at an epoch below an earlier segment's, opening a partition
 leaves out and removes every such file.
 
-**That window can lose acknowledged writes.** It lasts up to about a
-second plus the NFS attribute-cache TTL, capped at 3 s by the self-fence
-only when the move was caused by lost controller connectivity; a move off
-a healthy broker never trips the self-fence. A batch acknowledged in the
-window sits in the dead-epoch segment at offsets the new leader re-issues.
-The new log is never corrupted, but that write is gone. Apache closes its
-equivalent window through replication, which kaas doesn't have, and a
-Produce request carries no leader epoch to check at any version.
+### The leader fence: no acks from a deposed leader
+
+That window lasts up to about a second plus the NFS attribute-cache TTL.
+The self-fence caps it at 3 s, but only when the move was caused by lost
+controller connectivity; a move off a healthy broker never trips it. Until
+gh #164 was closed, the deposed leader also *acknowledged* writes in the
+window, and every `acks=all` ack it sent was lost. The new leader's
+recovery scan had already run, so those batches sat in the dead-epoch
+segment at offsets the new leader re-issued. Apache closes its equivalent
+window through replication, which kaas doesn't have, and a Produce request
+carries no leader epoch to check at any version.
+
+kaas closes it with an ordering on the shared volume, not a timeout:
+
+1. The new leader writes its epoch to `leader-fence.json` (tmp + fsync +
+   rename) **before** its recovery scan. If the partition was already open
+   on that broker, opened by a produce that arrived ahead of the takeover
+   or left over from an earlier leadership, it is dropped and reopened,
+   so the scan always comes after the fence.
+2. Every leader reads the fence **after** each group-commit fsync and
+   before it releases any acknowledgement. If the fence is above its own
+   epoch, it acknowledges nothing: the waiting producers get
+   `NOT_LEADER_OR_FOLLOWER`, retry, and reach the new leader. From then
+   on the partition refuses every append.
+
+So any acknowledgement the deposed leader does send covers bytes that
+were fsynced before the fence was written, and therefore before the
+successor's scan. The scan has them, and they are in the new log. What
+the deposed leader still writes in the window stays in its dead-epoch
+file and nothing reads it, as above. `acks=1` and `acks=0` writes never
+wait for a sync, so they can still be lost on a leader change, as they
+can in Apache.
+
+The fence costs one small read per group-commit cycle. It must reach the
+server, which a fresh open does on NFS through close-to-open consistency.
+The fence is not the manifest's epoch, because a partition adopts that
+epoch when it opens. Written ahead of the scan, it would make the new
+leader's takeover look finished and skip the roll. Raising the fence is a
+read followed by a write, which NFS can't make atomic. Two brokers raising
+it at the same moment, acting on different assignments, could leave the
+lower epoch on disk. That takes a stale broker racing a takeover within
+the few milliseconds of the write; the manifest's epoch check has the same
+gap.
 
 This is the shape Apache Kafka gets from replication and a leader
 epoch cache: a follower that becomes leader starts a new epoch, and
@@ -189,9 +226,11 @@ is the next chapter: [The RWX substrate contract](./nfs-substrate.md).
 - The producer snapshot lives in
   `crates/kaas-storage/src/producer_snapshot.rs`, the transaction indexes'
   in `crates/kaas-storage/src/txn_index_snapshot.rs` (gh #177).
-- The stale-leader ack window is gh #164. Closing it would take
-  event-driven assignment delivery or a durable-epoch check on first write
-  after takeover.
+- The leader fence is `crates/kaas-storage/src/leader_fence.rs`, raised in
+  `DiskStorageEngine::take_over` and read by the committer and the re-arm
+  probe in `partition.rs` (gh #164). A takeover keeps an open partition only
+  if `recovered_under_fence()` is already at its epoch, which is what stops
+  a re-driven takeover from re-scanning on every reconcile tick.
 - The whole delete path, with its ordering rules, is written up in
   [Topic delete & recreate](../code-tour/topic-lifecycle.md). The watch
   waiting for the delete is gh #331.

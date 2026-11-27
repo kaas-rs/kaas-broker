@@ -47,6 +47,7 @@ sequenceDiagram
         Note over P: all concurrent appenders to this<br/>partition park on the same Notify —<br/>one fsync cycle serves them all
         K->>K: lock: target = requested_flush_seq
         K->>K: spawn_blocking → lock + log.sync_all()<br/>30 s watchdog → sticky Stalled on timeout
+        K->>K: read leader-fence.json — above our epoch?<br/>→ ack nothing, refuse appends (gh #164)
         K-->>P: completed_flush_seq = target,<br/>notify_waiters()
     end
     H-->>C: ProduceResponse(base_offset,<br/>throttle_time from one post-append quota check)
@@ -194,6 +195,9 @@ rebuild it without new evidence.
 
 /data/<topic>/<partition>/
     manifest.json                 ── { epoch, highWatermark, logStartOffset }
+    leader-fence.json             ── epoch of the latest takeover, written
+                                     before its recovery scan (see
+                                     file-handle ownership)
     producer-state.snapshot       ── idempotent-producer dedupe window
     recovery-checkpoint.json      ── fsynced-prefix hint (see below)
     txn-index.snapshot            ── read_committed indexes (open txns,

@@ -48,6 +48,7 @@ use crate::idempotence::{
     self, parse_batch_producer_info, parse_batch_txn_info, BatchProducerInfo, Outcome,
     ProducerEntry,
 };
+use crate::leader_fence;
 use crate::manifest::{self, Manifest, ReadResult};
 use crate::producer_snapshot::{
     read_producer_snapshot, write_producer_snapshot, ProducerSnapshotError, SnapshotCoverage,
@@ -224,6 +225,8 @@ fn read_snapshot(
 /// What [`open_blocking`] recovers off disk, handed back to
 /// [`Partition::open`] to assemble into a [`Partition`].
 struct OpenedState {
+    /// The `leader-fence.json` epoch read before the scan (gh #164).
+    recovered_under_fence: i64,
     epoch: i64,
     hwm: i64,
     log_start: i64,
@@ -299,6 +302,11 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
             fs.fsync_dir(ancestor)?;
         }
     }
+
+    // gh #164: the fence this recovery runs under. Read before the scan,
+    // so a takeover at or below it knows the scan saw everything a deposed
+    // leader acked. Unreadable counts as none, which only costs a reopen.
+    let recovered_under_fence = leader_fence::read(fs, dir).ok().flatten().unwrap_or(0);
 
     // Manifest is the source of truth for (epoch, hwm, log_start)
     // when present; segment scan is the fallback.
@@ -504,6 +512,7 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
     })?;
 
     Ok(OpenedState {
+        recovered_under_fence,
         epoch,
         hwm,
         log_start,
@@ -866,6 +875,11 @@ struct PartitionInner {
     /// next fsync on the same one succeeds without the failed bytes having
     /// reached the disk.
     failed_flush_seq: u64,
+    /// The highest epoch this partition has read from `leader-fence.json`
+    /// above its own (gh #164). While it is above `epoch`, a successor has
+    /// fenced this broker out: no ack is released and no append accepted.
+    /// A `take_over` to at least this epoch lifts it, by raising `epoch`.
+    fence_seen: i64,
 
     /// Per-PID idempotence window (gh #12). Held directly here (not
     /// behind [`crate::idempotence::ProducerStates`]) so the
@@ -894,6 +908,12 @@ struct PartitionInner {
 }
 
 impl PartitionInner {
+    /// A successor's `leader-fence.json` is above this partition's epoch
+    /// (gh #164).
+    fn fenced_out(&self) -> bool {
+        self.fence_seen > self.epoch
+    }
+
     /// Record a failed fsync of the active log. Every path that syncs the
     /// log while the partition is serving comes through here on failure.
     fn mark_flush_failed(&mut self, err: StorageError) {
@@ -1132,6 +1152,8 @@ pub struct Partition {
     fs: Arc<dyn Fs>,
     topic: String,
     partition: i32,
+    /// See [`Partition::recovered_under_fence`].
+    recovered_under_fence: i64,
 }
 
 impl std::fmt::Debug for Partition {
@@ -1163,6 +1185,7 @@ impl Partition {
         let fs_open = fs.clone();
         let dir_open = dir.clone();
         let OpenedState {
+            recovered_under_fence,
             epoch,
             hwm,
             log_start,
@@ -1194,6 +1217,7 @@ impl Partition {
             flush_err: None,
             log_start_unsaved: false,
             failed_flush_seq: 0,
+            fence_seen: 0,
             producer_states: restored.producer_states,
             open_txns: restored.open_txns,
             aborted_txns: restored.aborted_txns,
@@ -1229,7 +1253,15 @@ impl Partition {
             fs,
             topic,
             partition,
+            recovered_under_fence,
         })
+    }
+
+    /// The `leader-fence.json` epoch this partition's recovery scan ran
+    /// under (gh #164). A takeover above it has to recover again, because
+    /// a deposed leader may have acked writes after this scan.
+    pub fn recovered_under_fence(&self) -> i64 {
+        self.recovered_under_fence
     }
 
     /// Claim write ownership at `epoch`, fencing every earlier leader
@@ -1388,6 +1420,20 @@ impl Partition {
         Ok(())
     }
 
+    /// Fence this partition out ahead of a reopen at `epoch` (gh #164):
+    /// nothing still waiting on a flush here is acked, and nothing more is
+    /// appended. The waiters wake now and answer `EpochMismatch`, which
+    /// clients retry against the reopened partition.
+    pub fn fence_out(&self, epoch: i64) {
+        {
+            let mut guard = self.inner.lock();
+            if epoch > guard.fence_seen {
+                guard.fence_seen = epoch;
+            }
+        }
+        self.flush.cond.notify_waiters();
+    }
+
     /// Drop this partition **without persisting anything** (gh #219).
     ///
     /// The counterpart to [`Partition::close`], for when the topic
@@ -1510,7 +1556,7 @@ impl Partition {
             // it would interleave two leaders in one log, the gh #227 bug
             // through a window instead of a missing roll. Both answer
             // NOT_LEADER_OR_FOLLOWER, which clients retry.
-            if i64::from(epoch) != guard.epoch {
+            if i64::from(epoch) != guard.epoch || guard.fenced_out() {
                 return Err(StorageError::EpochMismatch);
             }
 
@@ -1757,6 +1803,11 @@ impl Partition {
                 }
                 if guard.completed_flush_seq >= target_seq {
                     return Ok(());
+                }
+                // A successor fenced this broker out after the flush this
+                // waits on (gh #164): its recovery scan may have missed it.
+                if guard.fenced_out() {
+                    return Err(StorageError::EpochMismatch);
                 }
             }
             notified.await;
@@ -2144,6 +2195,12 @@ fn persist_state_locked(
     // (close-to-open gives us the latest) and cheap — the manifest is
     // persisted on open and close, never per append. Being superseded is
     // not an error; the caller still wants its file handles released.
+    //
+    // The leader fence (gh #164) says so first: a successor writes it
+    // before its recovery scan, and its manifest only after its roll.
+    if matches!(leader_fence::superseded(fs, &guard.dir, epoch), Ok(Some(_))) {
+        return Ok(false);
+    }
     if let Ok(ReadResult::Present(on_disk)) = manifest::read(fs, &guard.dir) {
         if on_disk.epoch > epoch {
             return Ok(false);
@@ -2181,6 +2238,31 @@ fn persist_state_locked(
 // ---------------------------------------------------------------------------
 // Committer task
 // ---------------------------------------------------------------------------
+
+/// Release the acks a log sync covered, or, if the fence read after it
+/// showed a successor (gh #164), record that and release nothing. The
+/// waiters wake either way, and `await_flush` answers the fenced-out ones
+/// with `EpochMismatch`.
+fn publish_flush(guard: &mut PartitionInner, covered_seq: u64, fenced: Option<i64>) {
+    match fenced {
+        Some(fenced) => {
+            if fenced > guard.fence_seen {
+                tracing::warn!(
+                    dir = %guard.dir.display(),
+                    epoch = guard.epoch,
+                    fenced,
+                    "a successor fenced this partition; refusing acks and appends (gh #164)"
+                );
+                guard.fence_seen = fenced;
+            }
+        }
+        None => {
+            if covered_seq > guard.completed_flush_seq {
+                guard.completed_flush_seq = covered_seq;
+            }
+        }
+    }
+}
 
 /// gh #168: how often the committer probes a stalled substrate for
 /// recovery. Chosen well above typical fsync latency so probes never
@@ -2236,21 +2318,27 @@ async fn probe_and_rearm(inner: &Arc<Mutex<PartitionInner>>, cond: &Arc<Notify>,
             continue;
         }
 
-        // Phase 2 — the substrate answers; re-sync the log for real.
+        // Phase 2 — the substrate answers; re-sync the log for real. The
+        // re-arm releases acks too, so it reads the fence the same way the
+        // committer does (gh #164); a fence it can't read means another
+        // probe, not an ack.
         let inner_sync = inner.clone();
-        let synced = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
-            let mut guard = inner_sync.lock();
-            guard.active.sync_log()?;
-            Ok(guard.requested_flush_seq)
+        let fs_sync = fs.clone();
+        let synced = tokio::task::spawn_blocking(move || -> std::io::Result<(u64, Option<i64>)> {
+            let (seq, epoch, dir) = {
+                let mut guard = inner_sync.lock();
+                guard.active.sync_log()?;
+                (guard.requested_flush_seq, guard.epoch, guard.dir.clone())
+            };
+            let fenced = leader_fence::superseded(fs_sync.as_ref(), &dir, epoch)?;
+            Ok((seq, fenced))
         })
         .await;
-        if let Ok(Ok(covered_seq)) = synced {
+        if let Ok(Ok((covered_seq, fenced))) = synced {
             {
                 let mut guard = inner.lock();
                 guard.flush_err = None;
-                if covered_seq > guard.completed_flush_seq {
-                    guard.completed_flush_seq = covered_seq;
-                }
+                publish_flush(&mut guard, covered_seq, fenced);
             }
             cond.notify_waiters();
             return;
@@ -2291,56 +2379,68 @@ fn spawn_committer(
             let inner_clone = inner.clone();
             let fs_c = fs.clone();
             let stopped = state_writes_stopped.clone();
-            let fsync_handle = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
-                // Sync under the lock, then decide whether a fresh
-                // recovery checkpoint is due — but write it OFF the lock
-                // so the tmp+rename doesn't stall appenders.
-                let (seq, checkpoint, state) = {
-                    let mut guard = inner_clone.lock();
-                    guard.active.sync_log()?;
-                    let seq = guard.requested_flush_seq;
-                    // Taken here because the log was synced under this lock
-                    // hold, so everything the snapshot covers is durable.
-                    // Reset optimistically, like the checkpoint below.
-                    let state =
-                        (guard.unsnapshotted_bytes >= STATE_SNAPSHOT_INTERVAL_BYTES).then(|| {
-                            guard.unsnapshotted_bytes = 0;
-                            let epoch = guard.epoch;
-                            (capture_state(&guard, epoch), guard.dir.clone())
-                        });
-                    let durable = i64::try_from(guard.active.log_size()).unwrap_or(i64::MAX);
-                    let cp = if durable.saturating_sub(guard.last_checkpoint_byte)
-                        >= CHECKPOINT_INTERVAL_BYTES
-                    {
-                        // Advance optimistically: a failed write just
-                        // defers the next attempt one interval, and
-                        // recovery falls back to a full scan regardless.
-                        guard.last_checkpoint_byte = durable;
-                        Some((
-                            RecoveryCheckpoint {
-                                segment_base: guard.active.meta.base_offset,
-                                byte_pos: durable,
-                                last_batch_pos: guard
-                                    .active
-                                    .last_batch()
-                                    .and_then(|b| i64::try_from(b.start).ok()),
-                                last_batch_crc: guard.active.last_batch().map(|b| b.crc),
-                            },
-                            guard.dir.clone(),
-                        ))
-                    } else {
-                        None
+            let fsync_handle =
+                tokio::task::spawn_blocking(move || -> std::io::Result<(u64, Option<i64>)> {
+                    // Sync under the lock, then decide whether a fresh
+                    // recovery checkpoint is due — but write it OFF the lock
+                    // so the tmp+rename doesn't stall appenders.
+                    let (seq, epoch, dir, checkpoint, state) = {
+                        let mut guard = inner_clone.lock();
+                        guard.active.sync_log()?;
+                        let seq = guard.requested_flush_seq;
+                        let epoch = guard.epoch;
+                        // Taken here because the log was synced under this lock
+                        // hold, so everything the snapshot covers is durable.
+                        // Reset optimistically, like the checkpoint below.
+                        let state = (guard.unsnapshotted_bytes >= STATE_SNAPSHOT_INTERVAL_BYTES)
+                            .then(|| {
+                                guard.unsnapshotted_bytes = 0;
+                                let epoch = guard.epoch;
+                                (capture_state(&guard, epoch), guard.dir.clone())
+                            });
+                        let durable = i64::try_from(guard.active.log_size()).unwrap_or(i64::MAX);
+                        let cp = if durable.saturating_sub(guard.last_checkpoint_byte)
+                            >= CHECKPOINT_INTERVAL_BYTES
+                        {
+                            // Advance optimistically: a failed write just
+                            // defers the next attempt one interval, and
+                            // recovery falls back to a full scan regardless.
+                            guard.last_checkpoint_byte = durable;
+                            Some((
+                                RecoveryCheckpoint {
+                                    segment_base: guard.active.meta.base_offset,
+                                    byte_pos: durable,
+                                    last_batch_pos: guard
+                                        .active
+                                        .last_batch()
+                                        .and_then(|b| i64::try_from(b.start).ok()),
+                                    last_batch_crc: guard.active.last_batch().map(|b| b.crc),
+                                },
+                                guard.dir.clone(),
+                            ))
+                        } else {
+                            None
+                        };
+                        (seq, epoch, guard.dir.clone(), cp, state)
                     };
-                    (seq, cp, state)
-                };
-                if let Some((cp, dir)) = checkpoint {
-                    let _ = recovery_checkpoint::write(fs_c.as_ref(), &dir, &cp);
-                }
-                if let Some((state, dir)) = state {
-                    write_periodic_state(fs_c.as_ref(), &dir, &stopped, &state);
-                }
-                Ok(seq)
-            });
+                    // gh #164: the fence is read after the sync and before
+                    // anything is acked, off the lock. A successor writes it
+                    // before its recovery scan, so if it still shows this
+                    // epoch, the bytes just synced were on disk before that
+                    // scan began. If it shows a higher one, the scan may have
+                    // missed them: nothing here is acked, and the directory is
+                    // the successor's, so no checkpoint or snapshot goes in it.
+                    if let Some(fenced) = leader_fence::superseded(fs_c.as_ref(), &dir, epoch)? {
+                        return Ok((seq, Some(fenced)));
+                    }
+                    if let Some((cp, dir)) = checkpoint {
+                        let _ = recovery_checkpoint::write(fs_c.as_ref(), &dir, &cp);
+                    }
+                    if let Some((state, dir)) = state {
+                        write_periodic_state(fs_c.as_ref(), &dir, &stopped, &state);
+                    }
+                    Ok((seq, None))
+                });
 
             // gh #256: `None` = watchdog disabled — await the fsync
             // however long it takes, wrapped so both arms share the
@@ -2350,11 +2450,9 @@ fn spawn_committer(
                 None => Ok(fsync_handle.await),
             };
             match outcome {
-                Ok(Ok(Ok(satisfied_seq))) => {
+                Ok(Ok(Ok((satisfied_seq, fenced)))) => {
                     let mut guard = inner.lock();
-                    if satisfied_seq > guard.completed_flush_seq {
-                        guard.completed_flush_seq = satisfied_seq;
-                    }
+                    publish_flush(&mut guard, satisfied_seq, fenced);
                     drop(guard);
                     cond.notify_waiters();
                 }

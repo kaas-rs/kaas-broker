@@ -671,6 +671,61 @@ impl StorageEngine for DiskStorageEngine {
         // to a fresh epoch-stamped segment, which is what fences the
         // previous leader (gh #227). Idempotent at or below the current
         // epoch, so the gh #215 reconcile can re-drive it freely.
+        let new_epoch = i64::from(epoch);
+        let key = (topic.to_owned(), partition);
+        let open = self.partitions.get(&key).map(|e| e.value().clone());
+        if let Some(p) = &open {
+            if p.epoch() >= new_epoch {
+                return p.take_over(epoch).await;
+            }
+        }
+
+        // gh #164: fence before recovering. The previous leader may still be
+        // acking writes, because it learns it was deposed only when its own
+        // view of `assignment.json` catches up. The fence makes it stop
+        // before it acks anything the recovery scan below can miss: it
+        // reads the fence after each fsync and acks nothing once the fence
+        // is above its epoch. So the fence has to be on disk before the
+        // scan starts. No directory means no log and no previous leader;
+        // `ensure_open` creates it. These are the same refusals
+        // `ensure_open` makes, made before anything is written.
+        if partition < 0 || !crate::topic_identity::is_valid_topic_name(topic) {
+            return Err(StorageError::UnknownTopicOrPartition);
+        }
+        if self.migrating.contains_key(&key) {
+            return Err(StorageError::Migrating);
+        }
+        let dir = self.partition_dir(topic, partition);
+        if let Some(topic_dir) = dir.parent() {
+            self.identity_permits_open(topic, topic_dir)?;
+        }
+        let fs = self.fs.clone();
+        tokio::task::spawn_blocking(move || match fs.stat(&dir) {
+            Ok(_) => crate::leader_fence::raise(fs.as_ref(), &dir, new_epoch),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        })
+        .await
+        .map_err(|e| StorageError::Io(std::io::Error::other(e)))??;
+
+        // Recovered under a lower fence means its scan came before this one:
+        // a produce or a marker that reached this broker ahead of the
+        // takeover opened it, or this broker led it before at a lower epoch.
+        // Either way the scan may have missed what the previous leader
+        // acked, and if another broker led in between, everything it holds
+        // in memory is stale. Drop it (writing nothing, like a topic delete)
+        // and reopen from disk. A re-drive after a failed roll finds it
+        // recovered under this very fence, and goes straight to the roll.
+        if let Some(p) = open.filter(|p| p.recovered_under_fence() < new_epoch) {
+            if self
+                .partitions
+                .remove_if(&key, |_, v| Arc::ptr_eq(v, &p))
+                .is_some()
+            {
+                p.fence_out(new_epoch);
+                p.abandon().await;
+            }
+        }
         let p = self.ensure_open(topic, partition).await?;
         p.take_over(epoch).await
     }
@@ -1129,6 +1184,107 @@ mod tests {
             // Re-take.
             let hwm = e.take_over("t", 0, 0).await.unwrap();
             assert_eq!(hwm, 3);
+        });
+    }
+
+    /// Two brokers on one shared directory.
+    fn two_brokers(dir: &std::path::Path) -> (DiskStorageEngine, DiskStorageEngine) {
+        let engine = || {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            DiskStorageEngine::new(fs, dir.to_path_buf(), PartitionConfig::default())
+        };
+        (engine(), engine())
+    }
+
+    /// gh #164: a deposed leader learns it was deposed only when its view of
+    /// `assignment.json` catches up, and it used to ack `acks=all` writes
+    /// until then. Its successor had already scanned the log, so they were
+    /// lost. The successor's fence now stops it at its next flush.
+    #[test]
+    fn a_deposed_leader_acks_nothing_once_its_successor_has_fenced() {
+        rt().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let (old, new) = two_brokers(tmp.path());
+            old.take_over("t", 0, 1).await.unwrap();
+            old.append("t", 0, 1, -1, build_batch(2, 1_000))
+                .await
+                .unwrap();
+
+            assert_eq!(new.take_over("t", 0, 2).await.unwrap(), 2);
+            let err = old
+                .append("t", 0, 1, -1, build_batch(1, 2_000))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, StorageError::EpochMismatch), "{err:?}");
+            // And it takes nothing more, even without a flush to wait on.
+            let err = old
+                .append("t", 0, 1, 1, build_batch(1, 3_000))
+                .await
+                .unwrap_err();
+            assert!(matches!(err, StorageError::EpochMismatch), "{err:?}");
+
+            assert_eq!(
+                new.append("t", 0, 2, -1, build_batch(1, 4_000))
+                    .await
+                    .unwrap(),
+                2
+            );
+        });
+    }
+
+    /// gh #164: the successor's recovery has to come after its fence, or the
+    /// old leader can ack a write between the scan and the fence. A partition
+    /// the successor opened before its takeover (a produce that beat it)
+    /// recovered early, so the takeover reopens it.
+    #[test]
+    fn a_takeover_recovers_after_its_fence_even_if_the_partition_was_open() {
+        rt().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let (old, new) = two_brokers(tmp.path());
+            old.take_over("t", 0, 1).await.unwrap();
+            old.append("t", 0, 1, -1, build_batch(1, 1_000))
+                .await
+                .unwrap();
+
+            // A produce reaches the successor first: it opens the partition,
+            // scans one record, and is refused at the new epoch.
+            new.create_partition("t", 0).await.unwrap();
+            assert!(new
+                .append("t", 0, 2, -1, build_batch(1, 2_000))
+                .await
+                .is_err());
+            // The old leader acks another record after that scan.
+            assert_eq!(
+                old.append("t", 0, 1, -1, build_batch(1, 3_000))
+                    .await
+                    .unwrap(),
+                1
+            );
+
+            // Both acked records are in the successor's log.
+            assert_eq!(new.take_over("t", 0, 2).await.unwrap(), 2);
+            assert_eq!(new.high_watermark("t", 0).unwrap(), 2);
+        });
+    }
+
+    /// The reopen above costs a recovery scan, so it happens only when the
+    /// scan predates the fence. The gh #215 reconcile re-drives a takeover
+    /// whose roll failed, and that partition recovered under this very
+    /// fence, so it is kept.
+    #[test]
+    fn a_partition_recovered_under_the_takeovers_fence_is_not_reopened() {
+        rt().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let (old, new) = two_brokers(tmp.path());
+            old.take_over("t", 0, 1).await.unwrap();
+            crate::leader_fence::raise(&RealFs::new(), &tmp.path().join("t").join("0"), 2).unwrap();
+            new.create_partition("t", 0).await.unwrap();
+            let opened = new.partition("t", 0).unwrap();
+            assert_eq!(opened.recovered_under_fence(), 2);
+
+            new.take_over("t", 0, 2).await.unwrap();
+            assert!(Arc::ptr_eq(&opened, &new.partition("t", 0).unwrap()));
+            assert_eq!(opened.epoch(), 2);
         });
     }
 

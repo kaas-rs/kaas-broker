@@ -24,6 +24,7 @@ pub mod engine;
 pub mod errors;
 pub mod fs;
 pub mod idempotence;
+pub mod leader_fence;
 pub mod manifest;
 pub mod memory;
 pub mod partition;

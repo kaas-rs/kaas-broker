@@ -15,6 +15,8 @@ task), `segment.rs` (epoch-prefixed segment files + sparse index),
 retention only — compaction is still unimplemented, gh #158) +
 `topicconfig.rs` (retention/segment/compaction knobs from `.config.json`),
 `recovery_checkpoint.rs` (the bounded-recovery-scan checkpoint, gh #230),
+`leader_fence.rs` (the takeover fence that stops a deposed leader acking,
+gh #164),
 `topic_identity.rs` (the `.topic-id.json` incarnation stamp, gh #219),
 `idempotence.rs` + `producer_snapshot.rs` (per-PID dedupe rings and their
 persistence), `txn_index.rs` + `txn_index_snapshot.rs` (open-transaction and
