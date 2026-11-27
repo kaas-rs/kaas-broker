@@ -60,11 +60,11 @@ cargo xtask check-chart [--values FILE]                  # CI gate: render the c
 cargo xtask docs                                         # mdbook build docs (--serve for live preview)
 ```
 
-`rust-toolchain.toml` pins Rust 1.97 (the floor is 1.85 — transitive `getrandom` needs edition 2024 — but the pin tracks current stable); `rustup` auto-installs it on first invocation. The toolchain file lists `rust-analyzer` as a component so editors use a version matching the pin rather than their own bundled build. Note `.cargo/config.toml` sets `rustflags = ["-D", "warnings"]` repo-wide, so a toolchain bump turns any new rustc lint into a hard build failure, not just a CI-gate failure. `protoc` is vendored via `protoc-bin-vendored` inside `kaas-broker/build.rs` — no `apt install protobuf-compiler` needed. Generated proto code is silenced from the workspace clippy gate via a module-scope `#![allow(...)]`.
+`rust-toolchain.toml` pins Rust 1.97 (the floor is 1.85 — transitive `getrandom` needs edition 2024 — but the pin tracks current stable). Note `.cargo/config.toml` sets `rustflags = ["-D", "warnings"]` repo-wide, so a toolchain bump turns any new rustc lint into a hard build failure, not just a CI-gate failure.
 
 ### CI, releases, and the live cluster
 
-`.github/workflows/docker-publish.yml` is tag-triggered: it builds the broker + operator images from `bins/*/Dockerfile`, pushes them to `ghcr.io/kaas-rs/kaas-broker[-preview]` / `kaas-broker-operator[-preview]`, pushes the Helm chart to `oci://ghcr.io/kaas-rs/charts/kaas-broker`, then creates the GitHub Release — titled and described from the **annotated tag message** (a lightweight tag falls back to the commit message), so write the tag message as release notes.
+`.github/workflows/docker-publish.yml` is tag-triggered and creates the GitHub Release, titled and described from the **annotated tag message** (a lightweight tag falls back to the commit message), so write the tag message as release notes.
 
 **CRD drift** — if you edit anything under `crates/kaas-operator-api/`, run `cargo xtask gen-crds` and commit both `deploy/crds/` and `deploy/helm/kaas/crds/`. The `rust` CI job fails on drift.
 
