@@ -1502,9 +1502,15 @@ impl Partition {
                 return Err(StorageError::Stalled);
             }
 
-            // Epoch fence — caller's epoch must be ≥ our current
-            // epoch; a stale epoch is rejected.
-            if i64::from(epoch) < guard.epoch {
+            // Epoch fence: the caller's epoch must be the partition's.
+            // Below it, a deposed leader is still writing. Above it, this
+            // broker leads at `epoch` but `take_over` hasn't rolled yet, so
+            // the active segment is still the previous leader's file, which
+            // that leader may still be appending to (gh #164). Writing into
+            // it would interleave two leaders in one log, the gh #227 bug
+            // through a window instead of a missing roll. Both answer
+            // NOT_LEADER_OR_FOLLOWER, which clients retry.
+            if i64::from(epoch) != guard.epoch {
                 return Err(StorageError::EpochMismatch);
             }
 
@@ -4182,6 +4188,37 @@ pub(crate) mod tests {
             let err = p.append(2, -1, build_batch(1, 1_000)).await.unwrap_err();
             assert!(matches!(err, StorageError::EpochMismatch));
             p.close().await.unwrap();
+        });
+    }
+
+    /// A new leader learns it leads from `assignment.json`, and a produce can
+    /// reach it between its open and its `take_over` roll. Its active segment
+    /// is then still the previous leader's file, which that leader may still
+    /// be appending to (gh #164), so the write has to wait for the roll.
+    #[test]
+    fn an_append_above_the_partitions_epoch_waits_for_the_take_over_roll() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let old = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            old.take_over(1).await.unwrap();
+            old.append(1, -1, build_batch(1, 1_000)).await.unwrap();
+            let old_log = old.inner.lock().active.meta.log_path.clone();
+            let old_size = std::fs::metadata(&old_log).unwrap().len();
+
+            // The successor, on another broker, opens the same directory.
+            let new = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            assert_eq!(new.inner.lock().active.meta.log_path, old_log);
+            let err = new.append(2, -1, build_batch(1, 2_000)).await.unwrap_err();
+            assert!(matches!(err, StorageError::EpochMismatch), "{err:?}");
+            assert_eq!(std::fs::metadata(&old_log).unwrap().len(), old_size);
+
+            new.take_over(2).await.unwrap();
+            assert_eq!(new.append(2, -1, build_batch(1, 2_000)).await.unwrap(), 1);
+            assert_ne!(new.inner.lock().active.meta.log_path, old_log);
+            assert_eq!(std::fs::metadata(&old_log).unwrap().len(), old_size);
+            new.close().await.unwrap();
+            drop(old);
         });
     }
 

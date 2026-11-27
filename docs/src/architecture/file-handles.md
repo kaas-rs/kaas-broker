@@ -40,7 +40,16 @@ When `assignment.json` moves a partition (the
   [Storage engine hot path](./storage-hot-path.md)). It then raises the
   partition's epoch to the one the assignment carries, **rolls to a
   fresh segment file stamped with that epoch**, and persists the
-  manifest before accepting a single write.
+  manifest before accepting a single write. That last part is enforced
+  by the append fence, which accepts a write only at the partition's own
+  epoch. The new leader learns it leads from `assignment.json` before
+  its roll lands, so a produce can reach it while the active segment is
+  still the previous leader's file. That produce gets a retriable
+  `NOT_LEADER_OR_FOLLOWER` instead of an append into a file the
+  previous leader may still be writing. For the same reason, every
+  leadership change carries an epoch above the one on disk. That
+  includes a partition that drops out of the assignment and comes back.
+  At the on-disk epoch, `take_over` would have nothing to roll.
 - **Old leader**: relinquish persists the manifest and producer
   snapshot one last time, then closes the handles — unless the manifest
   on disk already carries a higher epoch, in which case it has been

@@ -223,8 +223,10 @@ pub trait StorageEngine: Send + Sync + 'static {
     /// HWM before storing.
     ///
     /// `epoch` is the leader epoch the caller believes it owns; the
-    /// disk engine rejects with `EpochMismatch` if its current epoch is
-    /// higher. `MemoryStorage` ignores it (single-process dev mode).
+    /// disk engine rejects with `EpochMismatch` unless it is the
+    /// partition's current epoch, so a write can't land before
+    /// `take_over` has rolled. `MemoryStorage` ignores it (single-process
+    /// dev mode).
     ///
     /// `acks` matches the producer field: `-1` waits for durable
     /// storage before returning; `0` and `1` return as soon as the

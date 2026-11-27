@@ -8,7 +8,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
-    /// The producer's epoch is older than the partition's current epoch.
+    /// The caller's leader epoch isn't the partition's: older means a
+    /// deposed leader, newer means a takeover that hasn't rolled yet.
     #[error("epoch mismatch")]
     EpochMismatch,
 

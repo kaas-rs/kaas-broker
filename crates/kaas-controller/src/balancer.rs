@@ -120,6 +120,12 @@ pub fn partition_key(topic: &str, partition: i32) -> String {
 /// writer seeds the floor from the on-disk manifest epoch for any
 /// partition not already in `prev`, so a re-add can never regress below
 /// what a broker has already committed. An empty map is a no-op.
+///
+/// A new or moved leader gets an epoch strictly *above* the floor, not
+/// equal to it. `take_over` rolls a fresh segment only for an epoch above
+/// the partition's, so a re-add at the floor itself left the new leader
+/// appending to the file the previous leader wrote at that epoch, and may
+/// still be writing (gh #164): two leaders in one log, the gh #227 bug.
 pub fn balance(
     prev: Option<&[PartitionAssignment]>,
     brokers: &[String],
@@ -194,9 +200,10 @@ pub fn balance(
             }
         }
         // New / re-added / leader-changed: bump from prev (or start at
-        // 1), but never below the partition's persisted epoch.
+        // 1), and past the partition's persisted epoch, so the new leader
+        // rolls its own segment (see the fn doc).
         let base = prev_entry.map(|pa| pa.epoch + 1).unwrap_or(1);
-        let epoch = base.max(floor);
+        let epoch = base.max(floor.saturating_add(1));
         out.push(PartitionAssignment {
             topic: s.topic,
             partition: s.partition,
@@ -762,9 +769,11 @@ mod tests {
     #[test]
     fn epoch_floor_prevents_regression_on_readd() {
         // gh #216: a partition re-added after dropping out of the
-        // assignment (prev has no entry for it) must adopt its on-disk
-        // floor, not reset to epoch 1 — else the append fence rejects
-        // every write as stale (assignment epoch < on-disk epoch).
+        // assignment (prev has no entry for it) must start above its
+        // on-disk floor, not reset to epoch 1 — else the append fence
+        // rejects every write as stale (assignment epoch < on-disk epoch).
+        // Above it, not at it, so the new leader rolls its own segment
+        // instead of appending to the previous leader's (gh #164).
         let b = brokers(3);
         let topics = vec![TopicSpec {
             name: "t1".to_owned(),
@@ -775,8 +784,8 @@ mod tests {
         assert_eq!(parts.len(), 4);
         for p in &parts {
             assert_eq!(
-                p.epoch, 11,
-                "re-added partition must adopt the on-disk floor, not reset to 1"
+                p.epoch, 12,
+                "re-added partition must start above the on-disk floor, not reset to 1"
             );
         }
         // Control: without the floor, the same re-add resets to 1.
@@ -791,15 +800,16 @@ mod tests {
             name: "t1".to_owned(),
             partition_count: 4,
         }];
-        let first = balance(None, &b, &topics, &HashMap::new()); // all epoch 1
-                                                                 // A floor above the current epoch bumps a stable partition up to
-                                                                 // the floor (self-heals an already-regressed assignment).
+        // All epoch 1. A floor above the current epoch bumps a stable
+        // partition past the floor (self-heals an already-regressed
+        // assignment).
+        let first = balance(None, &b, &topics, &HashMap::new());
         let high: HashMap<String, u32> = first
             .iter()
             .map(|p| (partition_key(&p.topic, p.partition), 9u32))
             .collect();
         let healed = balance(Some(&first), &b, &topics, &high);
-        assert!(healed.iter().all(|p| p.epoch == 9));
+        assert!(healed.iter().all(|p| p.epoch == 10));
         // A floor at or below the current epoch never perturbs a stable
         // assignment.
         let low: HashMap<String, u32> = first
