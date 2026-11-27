@@ -64,6 +64,13 @@ rebuilds producer state when a partition opens. A Fetch that read to the
 end of the file served the dead leader's records ahead of the real ones
 at the same offsets.
 
+The deposed leader can also roll. If its segment fills in that window, it
+starts a new one at its old epoch, past the base offset where its
+successor's segment starts. That file would sort last and be opened as
+the active segment at the next restart. Since no leader ever starts a
+segment at an epoch below an earlier segment's, opening a partition
+leaves out and removes every such file.
+
 **That window can lose acknowledged writes.** It lasts up to about a
 second plus the NFS attribute-cache TTL, capped at 3 s by the self-fence
 only when the move was caused by lost controller connectivity; a move off

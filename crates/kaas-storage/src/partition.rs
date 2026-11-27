@@ -316,6 +316,25 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
 
     // Load any existing segments.
     let mut closed = segment::list_segments(fs, dir)?;
+    // A deposed leader's late roll is not part of the log (gh #164), and
+    // this broker leads now, so the files are its to remove. Leaving them
+    // out of `closed` is what keeps the log right; a removal that fails is
+    // retried by the next open, which leaves them out again.
+    for s in segment::split_off_deposed_rolls(&mut closed) {
+        tracing::warn!(
+            dir = %dir.display(),
+            base_offset = s.base_offset,
+            epoch = s.epoch,
+            "removing a segment a deposed leader rolled after its successor took over (gh #164)"
+        );
+        for path in [&s.log_path, &s.index_path] {
+            if let Err(e) = fs.remove(path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(path = %path.display(), %e, "deposed segment not removed");
+                }
+            }
+        }
+    }
     // Log start is never below the first segment's base, as in Apache's
     // `LogLoader`. Offsets before it are gone, and a crash can leave the
     // manifest behind them: a volume too full to write the manifest unlinks
@@ -3583,6 +3602,50 @@ pub(crate) mod tests {
                 batch_ranges(&p.read(0, 1 << 20).await.unwrap()),
                 vec![(0, 0), (1, 1)]
             );
+            p.close().await.unwrap();
+        });
+    }
+
+    /// A deposed leader whose segment filled before it learned it was deposed
+    /// rolled at its old epoch, past the base its successor rolled at
+    /// (gh #164). That file sorts last, and the next open made it the active
+    /// segment.
+    #[test]
+    fn open_leaves_out_and_removes_a_deposed_leaders_roll() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            p.take_over(1).await.unwrap();
+            p.append(1, -1, build_batch(1, 1_000)).await.unwrap();
+            p.take_over(2).await.unwrap(); // the successor rolls at offset 1
+            p.append(2, -1, build_batch(4, 2_000)).await.unwrap(); // offsets 1..=4
+            p.close().await.unwrap();
+            drop(p);
+
+            // The deposed leader rolled at its own view of the log end,
+            // offset 2, and wrote offsets 2..=3 there.
+            let mut zombie =
+                crate::segment::ActiveSegment::create(fs.as_ref(), tmp.path(), 2, 1).unwrap();
+            let mut late = build_batch(2, 3_000).to_vec();
+            late[0..8].copy_from_slice(&2i64.to_be_bytes());
+            crate::segment::stamp_crc(&mut late);
+            zombie.append_batch(&late, 4096).unwrap();
+            zombie.sync_log().unwrap();
+            let (zombie_log, zombie_index) =
+                (zombie.meta.log_path.clone(), zombie.meta.index_path.clone());
+            zombie.close_handles();
+            drop(zombie);
+
+            let p = open_partition(&fs, tmp.path(), PartitionConfig::default()).await;
+            assert_eq!(p.high_watermark(), 5);
+            assert_eq!(p.inner.lock().active.meta.epoch, 2);
+            assert_eq!(
+                batch_ranges(&p.read(0, 1 << 20).await.unwrap()),
+                vec![(0, 0), (1, 4)]
+            );
+            assert!(!zombie_log.exists());
+            assert!(!zombie_index.exists());
             p.close().await.unwrap();
         });
     }

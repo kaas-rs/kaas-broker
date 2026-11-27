@@ -186,6 +186,32 @@ pub fn list_segments(fs: &dyn Fs, dir: &Path) -> io::Result<Vec<SegmentMeta>> {
     Ok(out)
 }
 
+/// Take out of `segments` (sorted by base offset, as [`list_segments`]
+/// returns them) every segment whose epoch is below an earlier segment's.
+/// No leader writes one: each starts its own segment at its own epoch, at
+/// or past the end of every segment before it, and epochs only rise.
+///
+/// A deposed leader does, though (gh #164). It keeps appending until its
+/// assignment view catches up, and if its segment fills meanwhile it rolls,
+/// at its own old epoch and at a base past the one its successor rolled at.
+/// Listed with the rest, that file sorts last, so the next open made it the
+/// active segment: appends went into the dead leader's file, and the
+/// successor's records past its base were hidden behind it.
+pub fn split_off_deposed_rolls(segments: &mut Vec<SegmentMeta>) -> Vec<SegmentMeta> {
+    let mut highest = i64::MIN;
+    let mut deposed = Vec::new();
+    segments.retain(|s| {
+        if s.epoch < highest {
+            deposed.push(s.clone());
+            false
+        } else {
+            highest = s.epoch;
+            true
+        }
+    });
+    deposed
+}
+
 // ---------------------------------------------------------------------------
 // parse_batch_offsets
 // ---------------------------------------------------------------------------
@@ -1415,6 +1441,25 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0, 1), (40, 3)]
         );
+    }
+
+    #[test]
+    fn a_lower_epoch_after_a_higher_one_is_a_deposed_leaders_roll() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fs = RealFs::new();
+        for (base, epoch) in &[(0, 1), (10, 1), (20, 3), (25, 2), (30, 3), (40, 2), (50, 4)] {
+            let _ = ActiveSegment::create(&fs, tmp.path(), *base, *epoch).unwrap();
+        }
+        let mut segs = list_segments(&fs, tmp.path()).unwrap();
+        let deposed = split_off_deposed_rolls(&mut segs);
+        let pairs = |v: &[SegmentMeta]| -> Vec<(i64, i64)> {
+            v.iter().map(|s| (s.base_offset, s.epoch)).collect()
+        };
+        assert_eq!(
+            pairs(&segs),
+            vec![(0, 1), (10, 1), (20, 3), (30, 3), (50, 4)]
+        );
+        assert_eq!(pairs(&deposed), vec![(25, 2), (40, 2)]);
     }
 
     #[test]
