@@ -33,6 +33,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -498,7 +499,7 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
     // Adopt whatever epoch ends up in effect. Coming up *below* the
     // durable epoch would leave this partition accepting appends the
     // fence is supposed to reject.
-    let epoch = manifest::write_unless_superseded(
+    let written = manifest::write_unless_superseded(
         fs,
         dir,
         &Manifest {
@@ -506,12 +507,41 @@ fn open_blocking(fs: &dyn Fs, dir: &std::path::Path) -> Result<OpenedState, Stor
             high_watermark: hwm,
             log_start_offset: log_start,
         },
-    )
-    .map_err(|e| match e {
-        manifest::ManifestError::Io(e) => StorageError::Io(e),
-        manifest::ManifestError::Json(e) => StorageError::Json(e),
-        other => StorageError::Io(std::io::Error::other(other.to_string())),
-    })?;
+    );
+    let epoch = match written {
+        Ok(epoch) => epoch,
+        // A full volume can't take the manifest's tmp file. Its high
+        // watermark is only a hint the scan above has replaced, so the
+        // write can wait for the next one; the epoch is what can't be
+        // lost, and the manifest on disk still has it. Failing here kept
+        // a partition closed on a full volume, so retention and
+        // DeleteRecords, which only reach open partitions, couldn't free
+        // anything, and a reopen after a failed fsync (gh #330) would
+        // turn ENOSPC into a closed partition.
+        Err(manifest::ManifestError::Io(e))
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+            ) =>
+        {
+            tracing::warn!(
+                dir = %dir.display(),
+                %e,
+                "no space to rewrite the manifest at open; keeping the one on disk"
+            );
+            match manifest::read(fs, dir) {
+                Ok(ReadResult::Present(m) | ReadResult::Legacy(m)) => epoch.max(m.epoch),
+                _ => epoch,
+            }
+        }
+        Err(e) => {
+            return Err(match e {
+                manifest::ManifestError::Io(e) => StorageError::Io(e),
+                manifest::ManifestError::Json(e) => StorageError::Json(e),
+                other => StorageError::Io(std::io::Error::other(other.to_string())),
+            })
+        }
+    };
 
     Ok(OpenedState {
         recovered_under_fence,
@@ -882,6 +912,12 @@ struct PartitionInner {
     /// fenced this broker out: no ack is released and no append accepted.
     /// A `take_over` to at least this epoch lifts it, by raising `epoch`.
     fence_seen: i64,
+    /// A sync of the active log failed with an error (gh #330), so its
+    /// bytes past `active.synced_len()` may be in the page cache and
+    /// nowhere else. Shared with [`Partition`] so the engine can see it
+    /// without the lock. Nothing re-arms it in place: the engine cuts the
+    /// log back and reopens the partition.
+    tail_suspect: Arc<AtomicBool>,
 
     /// Per-PID idempotence window (gh #12). Held directly here (not
     /// behind [`crate::idempotence::ProducerStates`]) so the
@@ -919,6 +955,9 @@ impl PartitionInner {
     /// Record a failed fsync of the active log. Every path that syncs the
     /// log while the partition is serving comes through here on failure.
     fn mark_flush_failed(&mut self, err: StorageError) {
+        if matches!(err, StorageError::Io(_)) {
+            self.tail_suspect.store(true, Ordering::Release);
+        }
         if self.flush_err.is_none() {
             self.flush_err = Some(err);
         }
@@ -1156,6 +1195,10 @@ pub struct Partition {
     partition: i32,
     /// See [`Partition::recovered_under_fence`].
     recovered_under_fence: i64,
+    /// See `PartitionInner::tail_suspect`.
+    tail_suspect: Arc<AtomicBool>,
+    /// Claimed by the one caller of [`Partition::cut_suspect_tail`].
+    tail_cut: AtomicBool,
 }
 
 impl std::fmt::Debug for Partition {
@@ -1200,6 +1243,7 @@ impl Partition {
         .await
         .map_err(|e| StorageError::Io(std::io::Error::other(e)))??;
 
+        let tail_suspect = Arc::new(AtomicBool::new(false));
         let inner = Arc::new(Mutex::new(PartitionInner {
             dir: dir.clone(),
             active,
@@ -1220,6 +1264,7 @@ impl Partition {
             log_start_unsaved: false,
             failed_flush_seq: 0,
             fence_seen: 0,
+            tail_suspect: tail_suspect.clone(),
             producer_states: restored.producer_states,
             open_txns: restored.open_txns,
             aborted_txns: restored.aborted_txns,
@@ -1256,6 +1301,8 @@ impl Partition {
             topic,
             partition,
             recovered_under_fence,
+            tail_suspect,
+            tail_cut: AtomicBool::new(false),
         })
     }
 
@@ -1264,6 +1311,61 @@ impl Partition {
     /// a deposed leader may have acked writes after this scan.
     pub fn recovered_under_fence(&self) -> i64 {
         self.recovered_under_fence
+    }
+
+    /// A sync of the active log failed with an error, so the log past the
+    /// last successful one is in doubt (gh #330). Linux can mark the pages
+    /// a failed writeback held clean while keeping them readable: the next
+    /// fsync then succeeds without them, a reopen on this host reads them
+    /// back, and a producer's retry used to match the batch as a duplicate
+    /// and be acked for bytes that were never on disk. A partition in this
+    /// state refuses every write until it is cut back and reopened. That is
+    /// PostgreSQL's answer to the same kernel behaviour, which treats a
+    /// failed fsync as fatal and recovers from its WAL. Here the log is the
+    /// WAL, so the redo source is the producers' retries.
+    pub fn suspect_tail(&self) -> bool {
+        self.tail_suspect.load(Ordering::Acquire)
+    }
+
+    /// Cut the active log back to the last length a successful fsync
+    /// covered, closing its handles first, so nothing this partition holds
+    /// writes to the file again (gh #330). Truncating drops the doubtful
+    /// bytes from the page cache too, which reopening alone would not. The
+    /// caller then drops this partition and opens the directory again, and
+    /// recovery rebuilds the high watermark, the dedupe window and the
+    /// transaction indexes from what is left. Retries of the lost batches
+    /// are then written and synced again.
+    ///
+    /// One caller does the cut; any other answers `Stalled` (retriable),
+    /// as does a cut that fails, which the next caller retries.
+    pub async fn cut_suspect_tail(&self) -> Result<(), StorageError> {
+        if self.tail_cut.swap(true, Ordering::AcqRel) {
+            return Err(StorageError::Stalled);
+        }
+        let inner = self.inner.clone();
+        let fs = self.fs.clone();
+        let cut = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            let mut guard = inner.lock();
+            let synced = guard.active.synced_len();
+            let log = guard.active.meta.log_path.clone();
+            guard.active.close_handles();
+            tracing::warn!(
+                log = %log.display(),
+                synced,
+                log_size = guard.active.log_size(),
+                "a sync of the log failed; cutting it back to the last synced length \
+                 and reopening (gh #330)"
+            );
+            fs.truncate(&log, synced)
+        })
+        .await
+        .map_err(|e| StorageError::Io(std::io::Error::other(e)))?;
+        if let Err(e) = cut {
+            self.tail_cut.store(false, Ordering::Release);
+            tracing::warn!(%e, "could not cut the log back; will retry (gh #330)");
+            return Err(StorageError::Stalled);
+        }
+        Ok(())
     }
 
     /// Claim write ownership at `epoch`, fencing every earlier leader
@@ -1316,6 +1418,13 @@ impl Partition {
                 if new_epoch <= guard.epoch {
                     return Ok(None);
                 }
+                // gh #330: the roll would sync the active log, and after a
+                // failed sync the next one can succeed without the failed
+                // bytes, sealing them into a closed segment. The engine cuts
+                // a suspect partition back before it ever gets here.
+                if guard.tail_suspect.load(Ordering::Acquire) {
+                    return Err(StorageError::Stalled);
+                }
                 // Roll first: it is the step that can fail, and an epoch
                 // raised without a segment stamped to match would leave
                 // the fence rejecting writes to a log the previous
@@ -1367,6 +1476,17 @@ impl Partition {
         let Some(handle) = handle else {
             return Ok(()); // already closed
         };
+        // gh #330: nothing past the last good sync can be vouched for, so
+        // persist nothing, as `abandon` doesn't, and leave the log cut back
+        // for whoever opens it next. A sync on these handles now could
+        // succeed without the failed bytes, and its checkpoint would claim
+        // them.
+        if self.suspect_tail() {
+            *self.committer.lock() = Some(handle);
+            let _ = self.cut_suspect_tail().await;
+            self.abandon().await;
+            return Ok(());
+        }
 
         // Persist state under the lock, then close handles.
         {
@@ -2241,6 +2361,12 @@ fn persist_state_locked(
 // Committer task
 // ---------------------------------------------------------------------------
 
+/// What a committer sync answers: the flush seq it covered, and the leader
+/// fence read after it (gh #164), kept apart because a fence that can't be
+/// read is a stall while a failed sync puts the log's tail in doubt
+/// (gh #330).
+type CommitResult = std::io::Result<(u64, std::io::Result<Option<i64>>)>;
+
 /// Release the acks a log sync covered, or, if the fence read after it
 /// showed a successor (gh #164), record that and release nothing. The
 /// waiters wake either way, and `await_flush` answers the fenced-out ones
@@ -2297,9 +2423,40 @@ const REARM_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 /// kernel returns, phase 2 (and appenders) would block behind it —
 /// the probe's `try_lock` dir read just keeps sleeping in that case
 /// and recovery begins once the kernel call drains.
-async fn probe_and_rearm(inner: &Arc<Mutex<PartitionInner>>, cond: &Arc<Notify>, fs: &Arc<dyn Fs>) {
+///
+/// **Only a stall nobody reported an error for re-arms here (gh #330).**
+/// After a failed sync of the log the next one can succeed without the
+/// failed bytes, so a re-arm would have acked retries of batches that were
+/// never on disk. Such a partition is left stalled for the engine to cut
+/// back and reopen ([`Partition::cut_suspect_tail`]), and so is one whose
+/// timed-out sync (`orphan`) ends in an error, or whose phase 2 sync fails.
+async fn probe_and_rearm(
+    inner: &Arc<Mutex<PartitionInner>>,
+    cond: &Arc<Notify>,
+    fs: &Arc<dyn Fs>,
+    mut orphan: Option<JoinHandle<CommitResult>>,
+) {
+    let suspect = inner.lock().tail_suspect.clone();
     loop {
+        if suspect.load(Ordering::Acquire) {
+            return;
+        }
         tokio::time::sleep(REARM_PROBE_INTERVAL).await;
+
+        // A timed-out sync is still the only one that knows how its bytes
+        // fared. Its lock hold keeps phase 2 behind it anyway.
+        if let Some(handle) = orphan.as_mut() {
+            if !handle.is_finished() {
+                continue;
+            }
+            let synced = matches!(handle.await, Ok(Ok(_)));
+            orphan = None;
+            if !synced {
+                suspect.store(true, Ordering::Release);
+                cond.notify_waiters();
+                return;
+            }
+        }
 
         // Phase 1 — substrate probe, no partition lock held.
         let Some(dir) = inner.try_lock().map(|g| g.dir.clone()) else {
@@ -2326,24 +2483,37 @@ async fn probe_and_rearm(inner: &Arc<Mutex<PartitionInner>>, cond: &Arc<Notify>,
         // probe, not an ack.
         let inner_sync = inner.clone();
         let fs_sync = fs.clone();
-        let synced = tokio::task::spawn_blocking(move || -> std::io::Result<(u64, Option<i64>)> {
+        let synced = tokio::task::spawn_blocking(move || -> CommitResult {
             let (seq, epoch, dir) = {
                 let mut guard = inner_sync.lock();
                 guard.active.sync_log()?;
                 (guard.requested_flush_seq, guard.epoch, guard.dir.clone())
             };
-            let fenced = leader_fence::superseded(fs_sync.as_ref(), &dir, epoch)?;
-            Ok((seq, fenced))
+            Ok((seq, leader_fence::superseded(fs_sync.as_ref(), &dir, epoch)))
         })
         .await;
-        if let Ok(Ok((covered_seq, fenced))) = synced {
-            {
-                let mut guard = inner.lock();
-                guard.flush_err = None;
-                publish_flush(&mut guard, covered_seq, fenced);
+        match synced {
+            Ok(Ok((covered_seq, Ok(fenced)))) => {
+                {
+                    let mut guard = inner.lock();
+                    guard.flush_err = None;
+                    publish_flush(&mut guard, covered_seq, fenced);
+                }
+                cond.notify_waiters();
+                return;
             }
-            cond.notify_waiters();
-            return;
+            // The log synced, but the fence can't be read: probe again.
+            Ok(Ok((_, Err(_)))) => {}
+            Ok(Err(e)) => {
+                inner.lock().mark_flush_failed(StorageError::Io(e));
+                cond.notify_waiters();
+                return;
+            }
+            Err(_) => {
+                suspect.store(true, Ordering::Release);
+                cond.notify_waiters();
+                return;
+            }
         }
     }
 }
@@ -2362,7 +2532,7 @@ fn spawn_committer(
             // is flushed until the probe says the log is good again; the
             // re-arm covers every seq requested so far.
             if inner.lock().flush_err.is_some() {
-                probe_and_rearm(&inner, &cond, &fs).await;
+                probe_and_rearm(&inner, &cond, &fs, None).await;
                 continue;
             }
 
@@ -2381,106 +2551,130 @@ fn spawn_committer(
             let inner_clone = inner.clone();
             let fs_c = fs.clone();
             let stopped = state_writes_stopped.clone();
-            let fsync_handle =
-                tokio::task::spawn_blocking(move || -> std::io::Result<(u64, Option<i64>)> {
-                    // Sync under the lock, then decide whether a fresh
-                    // recovery checkpoint is due — but write it OFF the lock
-                    // so the tmp+rename doesn't stall appenders.
-                    let (seq, epoch, dir, checkpoint, state) = {
-                        let mut guard = inner_clone.lock();
-                        guard.active.sync_log()?;
-                        let seq = guard.requested_flush_seq;
-                        let epoch = guard.epoch;
-                        // Taken here because the log was synced under this lock
-                        // hold, so everything the snapshot covers is durable.
-                        // Reset optimistically, like the checkpoint below.
-                        let state = (guard.unsnapshotted_bytes >= STATE_SNAPSHOT_INTERVAL_BYTES)
-                            .then(|| {
-                                guard.unsnapshotted_bytes = 0;
-                                let epoch = guard.epoch;
-                                (capture_state(&guard, epoch), guard.dir.clone())
-                            });
-                        let durable = i64::try_from(guard.active.log_size()).unwrap_or(i64::MAX);
-                        let cp = if durable.saturating_sub(guard.last_checkpoint_byte)
-                            >= CHECKPOINT_INTERVAL_BYTES
-                        {
-                            // Advance optimistically: a failed write just
-                            // defers the next attempt one interval, and
-                            // recovery falls back to a full scan regardless.
-                            guard.last_checkpoint_byte = durable;
-                            Some((
-                                RecoveryCheckpoint {
-                                    segment_base: guard.active.meta.base_offset,
-                                    byte_pos: durable,
-                                    last_batch_pos: guard
-                                        .active
-                                        .last_batch()
-                                        .and_then(|b| i64::try_from(b.start).ok()),
-                                    last_batch_crc: guard.active.last_batch().map(|b| b.crc),
-                                },
-                                guard.dir.clone(),
-                            ))
-                        } else {
-                            None
-                        };
-                        (seq, epoch, guard.dir.clone(), cp, state)
+            let mut fsync_handle = tokio::task::spawn_blocking(move || -> CommitResult {
+                // Sync under the lock, then decide whether a fresh
+                // recovery checkpoint is due — but write it OFF the lock
+                // so the tmp+rename doesn't stall appenders.
+                let (seq, epoch, dir, checkpoint, state) = {
+                    let mut guard = inner_clone.lock();
+                    guard.active.sync_log()?;
+                    let seq = guard.requested_flush_seq;
+                    let epoch = guard.epoch;
+                    // Taken here because the log was synced under this lock
+                    // hold, so everything the snapshot covers is durable.
+                    // Reset optimistically, like the checkpoint below.
+                    let state =
+                        (guard.unsnapshotted_bytes >= STATE_SNAPSHOT_INTERVAL_BYTES).then(|| {
+                            guard.unsnapshotted_bytes = 0;
+                            let epoch = guard.epoch;
+                            (capture_state(&guard, epoch), guard.dir.clone())
+                        });
+                    let durable = i64::try_from(guard.active.log_size()).unwrap_or(i64::MAX);
+                    let cp = if durable.saturating_sub(guard.last_checkpoint_byte)
+                        >= CHECKPOINT_INTERVAL_BYTES
+                    {
+                        // Advance optimistically: a failed write just
+                        // defers the next attempt one interval, and
+                        // recovery falls back to a full scan regardless.
+                        guard.last_checkpoint_byte = durable;
+                        Some((
+                            RecoveryCheckpoint {
+                                segment_base: guard.active.meta.base_offset,
+                                byte_pos: durable,
+                                last_batch_pos: guard
+                                    .active
+                                    .last_batch()
+                                    .and_then(|b| i64::try_from(b.start).ok()),
+                                last_batch_crc: guard.active.last_batch().map(|b| b.crc),
+                            },
+                            guard.dir.clone(),
+                        ))
+                    } else {
+                        None
                     };
-                    // gh #164: the fence is read after the sync and before
-                    // anything is acked, off the lock. A successor writes it
-                    // before its recovery scan, so if it still shows this
-                    // epoch, the bytes just synced were on disk before that
-                    // scan began. If it shows a higher one, the scan may have
-                    // missed them: nothing here is acked, and the directory is
-                    // the successor's, so no checkpoint or snapshot goes in it.
-                    if let Some(fenced) = leader_fence::superseded(fs_c.as_ref(), &dir, epoch)? {
-                        return Ok((seq, Some(fenced)));
-                    }
-                    if let Some((cp, dir)) = checkpoint {
-                        let _ = recovery_checkpoint::write(fs_c.as_ref(), &dir, &cp);
-                    }
-                    if let Some((state, dir)) = state {
-                        write_periodic_state(fs_c.as_ref(), &dir, &stopped, &state);
-                    }
-                    Ok((seq, None))
-                });
+                    (seq, epoch, guard.dir.clone(), cp, state)
+                };
+                // gh #164: the fence is read after the sync and before
+                // anything is acked, off the lock. A successor writes it
+                // before its recovery scan, so if it still shows this
+                // epoch, the bytes just synced were on disk before that
+                // scan began. If it shows a higher one, the scan may have
+                // missed them: nothing here is acked, and the directory is
+                // the successor's, so no checkpoint or snapshot goes in it.
+                // A fence that can't be read is a stall, not a failed
+                // sync: the bytes are on disk, but this broker can't
+                // tell whether it still leads.
+                let fenced = match leader_fence::superseded(fs_c.as_ref(), &dir, epoch) {
+                    Ok(fenced) => fenced,
+                    Err(e) => return Ok((seq, Err(e))),
+                };
+                if let Some(fenced) = fenced {
+                    return Ok((seq, Ok(Some(fenced))));
+                }
+                if let Some((cp, dir)) = checkpoint {
+                    let _ = recovery_checkpoint::write(fs_c.as_ref(), &dir, &cp);
+                }
+                if let Some((state, dir)) = state {
+                    write_periodic_state(fs_c.as_ref(), &dir, &stopped, &state);
+                }
+                Ok((seq, Ok(None)))
+            });
 
             // gh #256: `None` = watchdog disabled — await the fsync
             // however long it takes, wrapped so both arms share the
             // downstream match (Ok(join_result) ↔ "did not time out").
+            // The handle is borrowed, not moved, so a sync that times out
+            // can still be asked later how it ended (gh #330).
             let outcome = match fsync_max_latency {
-                Some(deadline) => tokio::time::timeout(deadline, fsync_handle).await,
-                None => Ok(fsync_handle.await),
+                Some(deadline) => tokio::time::timeout(deadline, &mut fsync_handle).await,
+                None => Ok((&mut fsync_handle).await),
             };
             match outcome {
-                Ok(Ok(Ok((satisfied_seq, fenced)))) => {
+                Ok(Ok(Ok((satisfied_seq, Ok(fenced))))) => {
                     let mut guard = inner.lock();
                     publish_flush(&mut guard, satisfied_seq, fenced);
                     drop(guard);
                     cond.notify_waiters();
                 }
-                Ok(Ok(Err(io_err))) => {
-                    inner.lock().mark_flush_failed(StorageError::Io(io_err));
-                    cond.notify_waiters();
-                    probe_and_rearm(&inner, &cond, &fs).await;
-                }
-                Ok(Err(_join_err)) => {
-                    // spawn_blocking panicked — treat as Stalled.
+                Ok(Ok(Ok((_, Err(fence_err))))) => {
+                    tracing::warn!(%fence_err, "could not read the leader fence; stalling (gh #164)");
                     inner.lock().mark_flush_failed(StorageError::Stalled);
                     cond.notify_waiters();
-                    probe_and_rearm(&inner, &cond, &fs).await;
+                    probe_and_rearm(&inner, &cond, &fs, None).await;
+                }
+                Ok(Ok(Err(io_err))) => {
+                    // Marks the tail suspect (gh #330): the probe leaves
+                    // it alone and the engine cuts it back and reopens.
+                    inner.lock().mark_flush_failed(StorageError::Io(io_err));
+                    cond.notify_waiters();
+                    probe_and_rearm(&inner, &cond, &fs, None).await;
+                }
+                Ok(Err(_join_err)) => {
+                    // spawn_blocking panicked: nobody knows what the sync
+                    // did, so the tail is as doubtful as after an error.
+                    {
+                        let mut guard = inner.lock();
+                        guard.mark_flush_failed(StorageError::Stalled);
+                        guard.tail_suspect.store(true, Ordering::Release);
+                    }
+                    cond.notify_waiters();
+                    probe_and_rearm(&inner, &cond, &fs, None).await;
                 }
                 Err(_elapsed) => {
                     // Timeout (gh #95). The orphaned spawn_blocking
-                    // task is still running; that's fine — it drains
-                    // when the kernel eventually returns. We set
-                    // sticky Stalled and move on.
+                    // task is still running; it drains when the kernel
+                    // eventually returns. We set sticky Stalled and hand
+                    // the probe its handle: if that sync ends in an error,
+                    // the error is the only report of the failed bytes,
+                    // and the next sync on the same file succeeds without
+                    // them (gh #330).
                     inner.lock().mark_flush_failed(StorageError::Stalled);
                     cond.notify_waiters();
                     // gh #168: park in the probe loop until the
                     // substrate recovers, then clear the poison. New
                     // flush requests queue on the capacity-1 channel
                     // meanwhile; appends fail fast on `flush_err`.
-                    probe_and_rearm(&inner, &cond, &fs).await;
+                    probe_and_rearm(&inner, &cond, &fs, Some(fsync_handle)).await;
                 }
             }
         }
@@ -3229,7 +3423,7 @@ pub(crate) mod tests {
             // Drive the probe directly (in production the committer
             // parks in it right after setting the poison). The tempdir
             // substrate is healthy, so the first attempt heals.
-            probe_and_rearm(&p.inner, &p.flush.cond, &p.fs).await;
+            probe_and_rearm(&p.inner, &p.flush.cond, &p.fs, None).await;
             assert!(!p.is_stalled(), "probe did not clear the poison");
             p.append(0, -1, build_batch(1, 1_000))
                 .await
@@ -6186,28 +6380,13 @@ pub(crate) mod tests {
         });
     }
 
-    /// Poll until the committer's re-arm probe has cleared the stall. Takes
-    /// the lock rather than asking `is_stalled`, which answers "no" whenever
-    /// the lock is busy, as it is during an fsync.
-    async fn wait_until_rearmed(p: &Partition) {
-        for _ in 0..200 {
-            if p.inner.lock().flush_err.is_none() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        }
-        assert!(
-            p.inner.lock().flush_err.is_none(),
-            "the partition never re-armed"
-        );
-    }
-
     /// gh #289: a failed fsync at a segment roll is the same file descriptor
     /// the committer syncs. Linux reports the error once, so the committer's
     /// next sync succeeds, and an appender parked on it must not take that
-    /// as its ack. Takes ~5 s (one real probe interval).
+    /// as its ack. gh #330: nor may the partition re-arm on that next sync.
+    /// It stays stalled, its tail suspect, until it is cut back and reopened.
     #[test]
-    fn a_failed_roll_fsync_fails_the_parked_ack_and_then_rearms() {
+    fn a_failed_roll_fsync_fails_the_parked_ack_and_leaves_the_tail_suspect() {
         let tmp = tempfile::tempdir().unwrap();
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6244,18 +6423,34 @@ pub(crate) mod tests {
             assert!(matches!(ra, Err(StorageError::Stalled)), "{ra:?}");
             assert!(matches!(rb, Err(StorageError::Stalled)), "{rb:?}");
 
-            // Nobody else wakes the committer: appends fail fast while
-            // stalled, so the roll has to have started the probe itself.
-            wait_until_rearmed(&p).await;
+            assert!(p.suspect_tail());
+            probe_and_rearm(&p.inner, &p.flush.cond, &p.fs, None).await;
+            assert!(p.inner.lock().flush_err.is_some(), "re-armed in place");
+
+            p.cut_suspect_tail().await.unwrap();
+            p.abandon().await;
+            let p = Partition::open(
+                journal.clone(),
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig {
+                    segment_bytes: one_len,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
             p.append(0, -1, build_batch(1, 1_000)).await.unwrap();
             p.close().await.unwrap();
         });
     }
 
     /// gh #289: the take-over roll syncs the same file descriptor, so its
-    /// failure has the same effect. Takes ~5 s (one real probe interval).
+    /// failure has the same effect, and gh #330: the partition takes no
+    /// take-over either until it has been cut back and reopened.
     #[test]
-    fn a_failed_take_over_fsync_stalls_the_partition_and_then_rearms() {
+    fn a_failed_take_over_fsync_stalls_the_partition_until_it_is_reopened() {
         let tmp = tempfile::tempdir().unwrap();
         rt().block_on(async {
             let journal = Arc::new(crate::fs::JournalFs::default());
@@ -6286,13 +6481,113 @@ pub(crate) mod tests {
                 Err(StorageError::Stalled)
             ));
 
-            wait_until_rearmed(&p).await;
-            assert!(matches!(
-                p.await_flush(parked).await,
-                Err(StorageError::Stalled)
-            ));
+            assert!(p.suspect_tail());
+            assert!(matches!(p.take_over(1).await, Err(StorageError::Stalled)));
+
+            p.cut_suspect_tail().await.unwrap();
+            p.abandon().await;
+            let p = Partition::open(
+                journal.clone(),
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
             p.take_over(1).await.unwrap();
             p.close().await.unwrap();
+        });
+    }
+
+    /// A full volume can't take the manifest's tmp file at open. Failing the
+    /// open kept the partition closed, so retention and DeleteRecords, which
+    /// only reach open partitions, couldn't free anything, and the gh #330
+    /// reopen after a failed fsync would turn ENOSPC into a closed partition.
+    #[test]
+    fn an_open_on_a_full_volume_keeps_the_manifest_on_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let journal = Arc::new(crate::fs::JournalFs::default());
+            let p = Partition::open(
+                journal.clone(),
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            p.take_over(3).await.unwrap();
+            for _ in 0..3 {
+                p.append(3, -1, build_batch(1, 1_000)).await.unwrap();
+            }
+            // No close, so the manifest's high watermark lags the log and
+            // the next open has to rewrite it.
+            p.abandon().await;
+            drop(p);
+
+            journal
+                .no_space
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let p = Partition::open(
+                journal.clone(),
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(p.high_watermark(), 3);
+            assert_eq!(p.epoch(), 3);
+            assert!(matches!(
+                manifest::read(&RealFs::new(), tmp.path()).unwrap(),
+                ReadResult::Present(m) if m.epoch == 3 && m.high_watermark == 0
+            ));
+        });
+    }
+
+    /// gh #330: a sync that outlives the watchdog is left running, and if it
+    /// ends in an error, that error is the only report of the failed bytes:
+    /// the probe's own sync on the same file then succeeds without them. So
+    /// the probe waits for it and, on an error, leaves the tail suspect.
+    /// Takes ~5 s (one real probe interval).
+    #[test]
+    fn a_timed_out_sync_that_fails_leaves_the_tail_suspect() {
+        let tmp = tempfile::tempdir().unwrap();
+        rt().block_on(async {
+            let journal = Arc::new(crate::fs::JournalFs::default());
+            let p = Partition::open(
+                journal.clone(),
+                "t".into(),
+                0,
+                tmp.path().to_path_buf(),
+                PartitionConfig {
+                    fsync_max_latency: Some(Duration::from_millis(50)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            *journal.slow_failing_sync.lock() = Some(Duration::from_millis(400));
+            journal
+                .fail_next_file_sync
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(matches!(
+                p.append(0, -1, build_batch(1, 1_000)).await,
+                Err(StorageError::Stalled)
+            ));
+            assert!(!p.suspect_tail(), "a timeout alone reports no error");
+
+            for _ in 0..100 {
+                if p.suspect_tail() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(p.suspect_tail());
+            assert!(p.inner.lock().flush_err.is_some(), "re-armed in place");
         });
     }
 

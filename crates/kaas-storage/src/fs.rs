@@ -333,6 +333,9 @@ pub(crate) struct JournalFs {
     pub(crate) fail_create_suffix: parking_lot::Mutex<Option<&'static str>>,
     pub(crate) fail_fsync_dir: std::sync::atomic::AtomicBool,
     pub(crate) fail_next_file_sync: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// How long the failing sync takes before it fails, so it can outlive
+    /// the fsync watchdog (gh #330).
+    pub(crate) slow_failing_sync: std::sync::Arc<parking_lot::Mutex<Option<std::time::Duration>>>,
     pub(crate) no_space: std::sync::atomic::AtomicBool,
     pub(crate) remove_frees_space: std::sync::atomic::AtomicBool,
 }
@@ -342,6 +345,7 @@ pub(crate) struct JournalFs {
 struct JournalFile {
     inner: Box<dyn FileWrite>,
     fail_next_sync: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    slow_failing_sync: std::sync::Arc<parking_lot::Mutex<Option<std::time::Duration>>>,
 }
 
 #[cfg(test)]
@@ -371,6 +375,9 @@ impl FileWrite for JournalFile {
             .fail_next_sync
             .swap(false, std::sync::atomic::Ordering::SeqCst)
         {
+            if let Some(delay) = *self.slow_failing_sync.lock() {
+                std::thread::sleep(delay);
+            }
             return Err(io::Error::from_raw_os_error(5));
         }
         self.inner.sync_all()
@@ -383,6 +390,7 @@ impl JournalFs {
         Box::new(JournalFile {
             inner,
             fail_next_sync: self.fail_next_file_sync.clone(),
+            slow_failing_sync: self.slow_failing_sync.clone(),
         })
     }
 
@@ -458,6 +466,10 @@ impl Fs for JournalFs {
     }
     fn stat(&self, p: &Path) -> io::Result<Metadata> {
         self.inner.stat(p)
+    }
+    fn truncate(&self, p: &Path, len: u64) -> io::Result<()> {
+        self.log("truncate", p);
+        self.inner.truncate(p, len)
     }
 }
 

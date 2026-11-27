@@ -315,8 +315,11 @@ impl DiskStorageEngine {
         if self.migrating.contains_key(&key) {
             return Err(StorageError::Migrating);
         }
-        if let Some(entry) = self.partitions.get(&key) {
-            return Ok(entry.value().clone());
+        if let Some(p) = self.partitions.get(&key).map(|e| e.value().clone()) {
+            if !p.suspect_tail() {
+                return Ok(p);
+            }
+            self.drop_suspect(&key, &p).await?;
         }
         let dir = self.partition_dir(topic, partition);
         // gh #241: refuse before `Partition::open` creates anything —
@@ -342,6 +345,34 @@ impl DiskStorageEngine {
                 Ok(p)
             }
         }
+    }
+
+    /// gh #330: drop a partition whose log tail a failed fsync put in
+    /// doubt, once its log is cut back to the last length a successful
+    /// fsync covered. The caller opens the directory again, so recovery
+    /// runs over what is on disk. `Stalled` (retriable) while another
+    /// caller is doing it, or if the cut fails.
+    ///
+    /// The cut happens while the partition is still in the map, refusing
+    /// every write, so no open can read the doubtful bytes. Every way into
+    /// a partition comes through here: appends, creates and DeleteRecords
+    /// via [`Self::ensure_open`], reads, takeover, and the takeover
+    /// reconcile, which [`StorageEngine::partition_epoch`] sends back to a
+    /// suspect partition. Recovery doesn't wait for traffic.
+    async fn drop_suspect(
+        &self,
+        key: &(String, i32),
+        p: &Arc<Partition>,
+    ) -> Result<(), StorageError> {
+        p.cut_suspect_tail().await?;
+        if self
+            .partitions
+            .remove_if(key, |_, v| Arc::ptr_eq(v, p))
+            .is_some()
+        {
+            p.abandon().await;
+        }
+        Ok(())
     }
 
     /// Snapshot the currently-open partition keys. Lets the retention
@@ -478,6 +509,13 @@ impl StorageEngine for DiskStorageEngine {
         let Some(p) = self.partitions.get(&key).map(|e| Arc::clone(e.value())) else {
             return Ok(Bytes::new());
         };
+        // gh #330: a suspect tail may be in the page cache only. Reopening
+        // cuts it before anything more is served from it.
+        let p = if p.suspect_tail() {
+            self.ensure_open(topic, partition).await?
+        } else {
+            p
+        };
         let out = p.read(start_offset, max_bytes).await;
         let m = kaas_observability::metrics::global();
         m.read_latency.record(started.elapsed().as_secs_f64(), &[]);
@@ -504,9 +542,17 @@ impl StorageEngine for DiskStorageEngine {
     }
 
     fn partition_epoch(&self, topic: &str, partition: i32) -> Option<i64> {
+        // A suspect tail (gh #330) reads as below every assignment epoch,
+        // so the takeover reconcile re-drives it into the reopen.
         self.partitions
             .get(&(topic.to_owned(), partition))
-            .map(|e| e.value().epoch())
+            .map(|e| {
+                if e.value().suspect_tail() {
+                    -1
+                } else {
+                    e.value().epoch()
+                }
+            })
     }
 
     fn topic_config(&self, topic: &str) -> Option<crate::topicconfig::TopicConfigFile> {
@@ -673,7 +719,13 @@ impl StorageEngine for DiskStorageEngine {
         // epoch, so the gh #215 reconcile can re-drive it freely.
         let new_epoch = i64::from(epoch);
         let key = (topic.to_owned(), partition);
-        let open = self.partitions.get(&key).map(|e| e.value().clone());
+        let open = match self.partitions.get(&key).map(|e| e.value().clone()) {
+            Some(p) if p.suspect_tail() => {
+                self.drop_suspect(&key, &p).await?;
+                None
+            }
+            open => open,
+        };
         if let Some(p) = &open {
             if p.epoch() >= new_epoch {
                 return p.take_over(epoch).await;
@@ -1285,6 +1337,109 @@ mod tests {
             new.take_over("t", 0, 2).await.unwrap();
             assert!(Arc::ptr_eq(&opened, &new.partition("t", 0).unwrap()));
             assert_eq!(opened.epoch(), 2);
+        });
+    }
+
+    /// A one-record batch from idempotent producer `pid` at sequence `seq`.
+    fn idempotent_batch(pid: i64, seq: i32) -> Bytes {
+        let mut buf = build_batch(1, 1_000).to_vec();
+        buf[43..51].copy_from_slice(&pid.to_be_bytes());
+        buf[51..53].copy_from_slice(&0i16.to_be_bytes());
+        buf[53..57].copy_from_slice(&seq.to_be_bytes());
+        crate::segment::stamp_crc(&mut buf);
+        Bytes::from(buf)
+    }
+
+    /// gh #330: after a failed fsync the producer retries. The batch was
+    /// still in the log and in the dedupe window, so once the partition had
+    /// re-armed, the retry matched it as a duplicate and was acked, though
+    /// Linux may have dropped its bytes on the way to disk: the next fsync
+    /// succeeds without them. Now the log is cut back to the last synced
+    /// length and the partition reopened, so the retry is written again.
+    #[test]
+    fn a_retry_after_a_failed_fsync_is_written_again_not_acked_as_a_duplicate() {
+        rt().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let journal = Arc::new(crate::fs::JournalFs::default());
+            let fs: Arc<dyn Fs> = journal.clone();
+            let e =
+                DiskStorageEngine::new(fs, tmp.path().to_path_buf(), PartitionConfig::default());
+            e.take_over("t", 0, 1).await.unwrap();
+            let first = idempotent_batch(7, 0);
+            let first_len = u64::try_from(first.len()).unwrap();
+            assert_eq!(e.append("t", 0, 1, -1, first).await.unwrap(), 0);
+
+            journal
+                .fail_next_file_sync
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let second = idempotent_batch(7, 1);
+            let err = e.append("t", 0, 1, -1, second.clone()).await.unwrap_err();
+            assert!(matches!(err, StorageError::Stalled), "{err:?}");
+
+            // What the failed writeback left on disk: not the second batch.
+            // A real kernel would still serve it from the page cache; this
+            // test's disk can't, which is what lets it see the difference.
+            let log = std::fs::read_dir(tmp.path().join("t").join("0"))
+                .unwrap()
+                .flatten()
+                .map(|d| d.path())
+                .find(|p| p.extension().is_some_and(|x| x == "log"))
+                .unwrap();
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&log)
+                .unwrap()
+                .set_len(first_len)
+                .unwrap();
+
+            // The retry is written again, at the same offset.
+            assert_eq!(e.append("t", 0, 1, -1, second).await.unwrap(), 1);
+            assert!(journal
+                .ops
+                .lock()
+                .iter()
+                .any(|op| op.starts_with("truncate")));
+
+            // And it is on disk: another broker taking over sees both.
+            let fs: Arc<dyn Fs> = Arc::new(RealFs::new());
+            let other =
+                DiskStorageEngine::new(fs, tmp.path().to_path_buf(), PartitionConfig::default());
+            assert_eq!(other.take_over("t", 0, 2).await.unwrap(), 2);
+        });
+    }
+
+    /// gh #330: the takeover reconcile reaches a suspect partition even with
+    /// no traffic, because its epoch reads as below every assignment's.
+    #[test]
+    fn a_suspect_partition_reads_as_unconverged_and_a_takeover_reopens_it() {
+        rt().block_on(async {
+            let tmp = tempfile::tempdir().unwrap();
+            let journal = Arc::new(crate::fs::JournalFs::default());
+            let fs: Arc<dyn Fs> = journal.clone();
+            let e =
+                DiskStorageEngine::new(fs, tmp.path().to_path_buf(), PartitionConfig::default());
+            e.take_over("t", 0, 1).await.unwrap();
+            e.append("t", 0, 1, -1, build_batch(1, 1_000))
+                .await
+                .unwrap();
+            journal
+                .fail_next_file_sync
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            assert!(e
+                .append("t", 0, 1, -1, build_batch(1, 2_000))
+                .await
+                .is_err());
+            assert_eq!(e.partition_epoch("t", 0), Some(-1));
+
+            e.take_over("t", 0, 1).await.unwrap();
+            assert_eq!(e.partition_epoch("t", 0), Some(1));
+            assert_eq!(e.high_watermark("t", 0).unwrap(), 1);
+            assert_eq!(
+                e.append("t", 0, 1, -1, build_batch(1, 3_000))
+                    .await
+                    .unwrap(),
+                1
+            );
         });
     }
 

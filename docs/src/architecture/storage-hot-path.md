@@ -122,7 +122,8 @@ flowchart TB
         target --> fsync["spawn_blocking { lock(); log.sync_all() }<br/>fsync runs holding the partition mutex"]
         fsync --> watchdog{"done within the deadline?"}
         watchdog -- yes --> ok["completed_flush_seq = target<br/>notify_waiters()"]
-        watchdog -- "timeout / io error" --> dead["sticky flush_err = Stalled —<br/>partition fails fast on next append;<br/>orphaned fsync drains in background;<br/>a 5 s probe re-arms once a real fsync succeeds"]
+        watchdog -- "timeout" --> dead["sticky flush_err = Stalled —<br/>partition fails fast on next append;<br/>orphaned fsync drains in background;<br/>a 5 s probe re-arms once a real fsync succeeds<br/>(unless the orphan ends in an error)"]
+        watchdog -- "io error" --> suspect["sticky Stalled, tail suspect —<br/>no re-arm; the engine cuts the log back<br/>to the last synced length and reopens"]
     end
 
     subgraph deferred["deferred finalize — spawn_blocking after roll"]
@@ -148,13 +149,29 @@ Four properties that make this work:
    the partition fails fast instead of hanging appenders forever. It isn't
    permanent: every 5 s the committer probes the volume, and once a real
    fsync of the log succeeds the partition re-arms, with no restart or
-   leadership move.
-4. **A failed fsync stalls too, wherever it happens** (gh #289): the two
-   segment rolls sync the descriptor the committer syncs, and Linux reports
-   a writeback error once per descriptor, so the next fsync succeeds without
-   the failed bytes having reached the disk. An appender waiting on a flush
-   a failed sync covered gets `Stalled`, never an ack, even if it wakes after
-   the partition has re-armed.
+   leadership move. The timed-out fsync is still running, though, and the
+   probe waits for its answer first. If that answer is an error, the
+   partition is treated as in point 4.
+4. **A failed fsync is never healed in place, wherever it happens**
+   (gh #289, gh #330). The two segment rolls sync the descriptor the
+   committer syncs, and Linux reports a writeback error once per
+   descriptor. It can also mark the failed pages clean while keeping them
+   readable. The next fsync then succeeds without them, and a reopen on
+   the same host reads them back. An appender waiting on a flush a failed
+   sync covered gets `Stalled`, never an ack. The partition then stays
+   stalled. The next request that reaches it, or the takeover reconcile
+   within 10 s, cuts the active log back to the last length a successful
+   fsync covered and reopens the partition. Truncating also drops the
+   doubtful bytes from the page cache, and recovery rebuilds the high
+   watermark, the dedupe window and the transaction indexes from what is
+   left. A producer's retry is therefore written and synced again, rather
+   than matched against a batch that may never have reached the disk.
+   This is PostgreSQL's answer to the same kernel behaviour: it treats a
+   failed fsync as fatal and redoes the lost writes from its WAL. Here the
+   log is the WAL, so the producers' retries are the redo. Offsets in the
+   cut tail are handed out again, and a consumer that already read them
+   (the high watermark covers bytes before their fsync) sees different
+   records there.
 
 Note the committer holds the partition mutex for the fsync window
 (readers are unaffected via the ArcSwap; concurrent appenders queue on
@@ -478,7 +495,8 @@ ownership](./file-handles.md).
   [Transactions & idempotence](./transactions.md).
 - Fixes worth reading before touching this path: the durable log-start
   advance and the full-volume exception (gh #311, gh #325), re-arming after
-  a stall (gh #168), a manifest with no segments (gh #229), duplicates
+  a stall (gh #168) and cutting back after a failed fsync instead (gh #330),
+  a manifest with no segments (gh #229), duplicates
   waiting for the fsync (gh #321), and the CRC check on append (gh #228).
   Produce can still park a runtime worker on the partition mutex for up to
   one fsync (gh #333).

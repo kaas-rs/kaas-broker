@@ -641,6 +641,12 @@ pub struct ActiveSegment {
     /// entry is emitted when `log_size - last_indexed_log_pos >=
     /// index_interval_bytes`.
     last_indexed_log_pos: u64,
+    /// How much of the log the last successful [`Self::sync_log`]
+    /// covered; for a segment adopted from disk, its size when opened.
+    /// Past it, a failed fsync can leave bytes the page cache still
+    /// serves and the disk never got (gh #330), so that is where
+    /// recovery cuts the log back to.
+    synced_len: u64,
     /// The last batch in the log, for the recovery checkpoint (gh #230).
     /// `None` until a batch is appended or recovery reports one
     /// ([`Self::set_last_batch`]).
@@ -709,6 +715,7 @@ impl ActiveSegment {
             log_size: 0,
             last_offset: base_offset - 1,
             last_indexed_log_pos: 0,
+            synced_len: 0,
             last_batch: None,
             // gh #267: UNKNOWN, not 0 — this value gets stamped into
             // the closed SegmentMeta on roll, and the cleaner treats
@@ -734,6 +741,7 @@ impl ActiveSegment {
             log_size,
             last_offset: 0,
             last_indexed_log_pos: 0,
+            synced_len: log_size,
             last_batch: None,
             // gh #267: UNKNOWN, not 0. This is the arm that ate data:
             // the takeover roll on every restart closed the adopted
@@ -824,6 +832,7 @@ impl ActiveSegment {
         if let Ok(meta) = fs.stat(&self.meta.log_path) {
             self.log_size = meta.len();
             self.meta.size = meta.len();
+            self.synced_len = meta.len();
         }
         if let Ok(meta) = fs.stat(&self.meta.index_path) {
             // Map "N index entries" to "approx 4096*N bytes of log
@@ -909,6 +918,7 @@ impl ActiveSegment {
             Err(e) => return Err(e),
         }
         self.log_size = valid_end;
+        self.synced_len = self.synced_len.min(valid_end);
         if self.last_batch.is_some_and(|b| b.start >= valid_end) {
             self.last_batch = None;
         }
@@ -1081,7 +1091,15 @@ impl ActiveSegment {
         kaas_observability::metrics::global()
             .fsync_latency
             .record(started.elapsed().as_secs_f64(), &[]);
+        if out.is_ok() {
+            self.synced_len = self.log_size;
+        }
         out
+    }
+
+    /// See the `synced_len` field.
+    pub fn synced_len(&self) -> u64 {
+        self.synced_len
     }
 }
 
