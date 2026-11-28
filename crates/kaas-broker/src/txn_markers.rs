@@ -23,14 +23,16 @@
 //! "eventually" is load-bearing: an unpaid marker pins the LSO for
 //! every record written after it, not just the transaction's own.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use kaas_coordinator::{MarkerEntry, TxnStateStore, TxnTopic};
 
 use crate::broker::Broker;
 use crate::control_batch::build_control_batch;
+use crate::marker_watcher::{ApplyOutcome, MarkerApplier};
 
 /// Does this broker coordinate a transactional id? See
 /// [`reconcile_pending_markers`].
@@ -68,55 +70,19 @@ pub async fn dispatch_markers(
     // partitions go through the marker_queue (gh #175 file-queue
     // dispatch). Coordinator-less dev mode treats every partition
     // as same-broker.
-    let mut by_target: HashMap<Option<String>, Vec<(String, i32)>> = HashMap::new();
-    let coord = broker.coordinator();
-    for TxnTopic { topic, partitions } in partitions {
-        for &p in partitions {
-            let leader = match coord.as_ref() {
-                None => None, // dev mode: everything is local
-                Some(c) => match c.leader_for(topic, p) {
-                    Some(leader) => Some(leader),
-                    None => {
-                        // Unassigned with a coordinator installed. Treating
-                        // this as local created the partition to write the
-                        // marker, conjuring a directory for a topic that no
-                        // longer exists (gh #314). A topic that's gone has
-                        // nothing to mark. Anything else (the watch hasn't
-                        // listed yet, or the assignment hasn't caught up to
-                        // the topic) stays prepared, and the reconcile retries.
-                        let exists = broker
-                            .topics
-                            .get(topic)
-                            .is_some_and(|m| (0..m.partition_count).contains(&p));
-                        if broker.topics.is_synced() && !exists {
-                            tracing::info!(
-                                topic,
-                                partition = p,
-                                "txn marker skipped: the partition no longer exists"
-                            );
-                            continue;
-                        }
-                        return Err(ERR_COORDINATOR_NOT_AVAILABLE);
-                    }
-                },
-            };
-            by_target
-                .entry(leader)
-                .or_default()
-                .push((topic.clone(), p));
-        }
-    }
-
-    let self_id = broker.self_id.as_str();
-    // Splits: (local writes, per-target queue entries).
     let mut local_partitions: Vec<(String, i32)> = Vec::new();
     let mut queued: HashMap<String, Vec<(String, i32)>> = HashMap::new();
-    for (target, parts) in by_target {
-        match target {
-            None => local_partitions.extend(parts), // dev mode only, see above
-            Some(id) if id == self_id => local_partitions.extend(parts),
-            Some(id) => {
-                queued.entry(id).or_default().extend(parts);
+    for TxnTopic { topic, partitions } in partitions {
+        for &p in partitions {
+            match route(broker, topic, p) {
+                Route::Local => local_partitions.push((topic.clone(), p)),
+                Route::Peer(id) => queued.entry(id).or_default().push((topic.clone(), p)),
+                Route::Gone => tracing::info!(
+                    topic,
+                    partition = p,
+                    "txn marker skipped: the partition no longer exists"
+                ),
+                Route::Unknown => return Err(ERR_COORDINATOR_NOT_AVAILABLE),
             }
         }
     }
@@ -150,6 +116,151 @@ pub async fn dispatch_markers(
     Ok(())
 }
 
+/// Where a partition's marker goes.
+#[derive(Debug, PartialEq, Eq)]
+enum Route {
+    /// This broker leads it, or there's no coordinator (dev mode).
+    Local,
+    /// Another broker leads it.
+    Peer(String),
+    /// Its topic, or the partition, no longer exists: nothing to mark.
+    Gone,
+    /// Nobody leads it yet: try again later.
+    Unknown,
+}
+
+/// The one routing rule for a marker, for the coordinator's dispatch and for
+/// a peer forwarding what it found in its inbox (gh #316).
+///
+/// An unassigned partition is never local with a coordinator installed.
+/// Treating it as local created the partition to write the marker, conjuring
+/// a directory for a topic that no longer exists (gh #314). It's gone only
+/// once the topic watch has listed and the partition isn't there. Anything
+/// else (the watch hasn't listed yet, or the assignment hasn't caught up to
+/// the topic, or this broker has just started and loaded none) is unknown.
+fn route(broker: &Broker, topic: &str, partition: i32) -> Route {
+    let Some(c) = broker.coordinator() else {
+        return Route::Local;
+    };
+    match c.leader_for(topic, partition) {
+        Some(id) if id == c.self_id() => Route::Local,
+        Some(id) => Route::Peer(id),
+        None => {
+            let exists = broker
+                .topics
+                .get(topic)
+                .is_some_and(|m| (0..m.partition_count).contains(&partition));
+            if broker.topics.is_synced() && !exists {
+                Route::Gone
+            } else {
+                Route::Unknown
+            }
+        }
+    }
+}
+
+/// The production [`MarkerApplier`]: what a broker does with an entry in its
+/// marker-queue inbox (gh #175).
+///
+/// A partition it leads gets the control batch, appended with `acks = -1`.
+/// One that moved since the entry was written is forwarded to the broker that
+/// leads it now, and one nobody leads yet is kept for the next tick (gh
+/// #316). Dropping either lost an acknowledged commit, or let a
+/// `read_committed` consumer read an aborted record, since `EndTxn` had
+/// already answered and nothing would send the marker again.
+#[derive(Debug)]
+pub struct BrokerMarkerApplier {
+    broker: Arc<Broker>,
+}
+
+impl BrokerMarkerApplier {
+    pub fn new(broker: Arc<Broker>) -> Self {
+        Self { broker }
+    }
+}
+
+#[async_trait]
+impl MarkerApplier for BrokerMarkerApplier {
+    async fn apply(&self, entry: &MarkerEntry) -> ApplyOutcome {
+        let batch = Bytes::from(build_control_batch(
+            entry.producer_id,
+            entry.producer_epoch,
+            entry.commit,
+            entry.coordinator_epoch,
+        ));
+        let mut forward: BTreeMap<String, BTreeMap<String, Vec<i32>>> = BTreeMap::new();
+        let mut keep: BTreeMap<String, Vec<i32>> = BTreeMap::new();
+        for TxnTopic { topic, partitions } in &entry.partitions {
+            for &p in partitions {
+                match route(&self.broker, topic, p) {
+                    Route::Local => {
+                        if let Err(err) = append_marker(&self.broker, topic, p, &batch).await {
+                            tracing::warn!(
+                                topic,
+                                partition = p,
+                                %err,
+                                "MarkerWatcher: control-batch append failed; keeping \
+                                 it for the next tick"
+                            );
+                            keep.entry(topic.clone()).or_default().push(p);
+                        }
+                    }
+                    Route::Peer(id) => forward
+                        .entry(id)
+                        .or_default()
+                        .entry(topic.clone())
+                        .or_default()
+                        .push(p),
+                    Route::Gone => tracing::info!(
+                        topic,
+                        partition = p,
+                        pid = entry.producer_id,
+                        "MarkerWatcher: marker skipped: the partition no longer exists"
+                    ),
+                    Route::Unknown => {
+                        tracing::debug!(
+                            topic,
+                            partition = p,
+                            pid = entry.producer_id,
+                            "MarkerWatcher: no leader for the partition yet; keeping its \
+                             marker for the next tick"
+                        );
+                        keep.entry(topic.clone()).or_default().push(p);
+                    }
+                }
+            }
+        }
+        let topics = |m: BTreeMap<String, Vec<i32>>| {
+            m.into_iter()
+                .map(|(topic, partitions)| TxnTopic { topic, partitions })
+                .collect::<Vec<_>>()
+        };
+        ApplyOutcome {
+            forward: forward.into_iter().map(|(id, m)| (id, topics(m))).collect(),
+            keep: topics(keep),
+        }
+    }
+}
+
+/// Append one marker to a partition this broker leads, at its epoch.
+async fn append_marker(
+    broker: &Broker,
+    topic: &str,
+    partition: i32,
+    batch: &Bytes,
+) -> Result<(), kaas_storage::StorageError> {
+    let epoch = broker
+        .coordinator()
+        .and_then(|c| c.current_epoch(topic, partition))
+        .unwrap_or_else(|| broker.local_lease.current_epoch());
+    let _ = broker.engine.create_partition(topic, partition).await;
+    broker
+        .engine
+        .append(topic, partition, epoch, ACKS_ALL, batch.clone())
+        .await
+        .map(|_| ())
+}
+
 /// Append the control batch to every locally-led partition.
 ///
 /// A failed append aborts the whole dispatch: the caller leaves the
@@ -176,16 +287,7 @@ async fn write_local_markers(
         0,
     ));
     for (topic, p) in partitions {
-        let epoch = broker
-            .coordinator()
-            .and_then(|c| c.current_epoch(topic, *p))
-            .unwrap_or_else(|| broker.local_lease.current_epoch());
-        let _ = broker.engine.create_partition(topic, *p).await;
-        if let Err(err) = broker
-            .engine
-            .append(topic, *p, epoch, ACKS_ALL, batch.clone())
-            .await
-        {
+        if let Err(err) = append_marker(broker, topic, *p, &batch).await {
             tracing::warn!(
                 topic,
                 partition = p,
@@ -610,5 +712,213 @@ mod tests {
         assert!(!tmp.path().join("escaped").exists());
         assert!(!data.join("gone").exists());
         assert!(!data.join("real").exists());
+    }
+
+    /// A transactional data batch from `pid`: the control batch's bytes with
+    /// the control bit cleared.
+    fn txn_batch(pid: i64) -> Bytes {
+        let mut b = build_control_batch(pid, 0, true, 0);
+        b[21..23].copy_from_slice(&0x10_i16.to_be_bytes());
+        let crc = kaas_codec::crc::compute(&b[21..]);
+        b[17..21].copy_from_slice(&crc.to_be_bytes());
+        Bytes::from(b)
+    }
+
+    /// Broker `kaas-<n>` on `cluster`, with its own memory engine, topic `t`
+    /// (2 partitions) listed, and the shared marker queue wired.
+    fn peer(n: i32, cluster: &std::path::Path) -> Arc<Broker> {
+        listed_peer(n, cluster, true)
+    }
+
+    /// [`peer`], with the topic watch done listing or not.
+    fn listed_peer(n: i32, cluster: &std::path::Path, synced: bool) -> Arc<Broker> {
+        use crate::topic_registry::TopicMeta;
+        let engine: Arc<dyn StorageEngine> = Arc::new(MemoryStorage::new());
+        let topics = Arc::new(TopicRegistry::new());
+        topics.insert(TopicMeta {
+            name: "t".to_owned(),
+            partition_count: 2,
+            topic_id: [0; 16],
+        });
+        if synced {
+            topics.mark_synced();
+        }
+        let b = Arc::new(Broker::new(engine, topics, "test", n));
+        b.install_marker_queue(kaas_coordinator::MarkerQueue::open(cluster).unwrap());
+        b
+    }
+
+    fn watcher(b: &Arc<Broker>) -> crate::marker_watcher::MarkerWatcher {
+        crate::marker_watcher::MarkerWatcher::new(
+            b.marker_queue().unwrap(),
+            b.self_id.clone(),
+            Arc::new(BrokerMarkerApplier::new(b.clone())),
+        )
+    }
+
+    fn t(partitions: Vec<i32>) -> TxnTopic {
+        TxnTopic {
+            topic: "t".to_owned(),
+            partitions,
+        }
+    }
+
+    /// gh #316: each partition of an entry gets one of four fates. Led here:
+    /// marked. Led elsewhere: forwarded. Exists but nobody leads it: kept.
+    /// Gone: dropped, but only once the topic watch has listed.
+    #[tokio::test]
+    async fn the_applier_marks_forwards_keeps_and_drops() {
+        use crate::handlers::test_cluster::{self, PEER, SELF};
+        let cluster = tempfile::tempdir().unwrap();
+        for synced in [true, false] {
+            let b = listed_peer(0, cluster.path(), synced);
+            test_cluster::install(&b, cluster.path(), &[("t", 0, SELF), ("t", 1, PEER)]);
+            let entry = MarkerEntry {
+                transactional_id: "tx".to_owned(),
+                producer_id: 7,
+                producer_epoch: 0,
+                commit: true,
+                coordinator_epoch: 0,
+                partitions: vec![
+                    t(vec![0, 1]),
+                    TxnTopic {
+                        topic: "gone".to_owned(),
+                        partitions: vec![0],
+                    },
+                ],
+            };
+            let out = BrokerMarkerApplier::new(b.clone()).apply(&entry).await;
+            assert_eq!(out.forward, [(PEER.to_owned(), vec![t(vec![1])])]);
+            let gone = TxnTopic {
+                topic: "gone".to_owned(),
+                partitions: vec![0],
+            };
+            if synced {
+                assert!(out.keep.is_empty(), "{:?}", out.keep);
+            } else {
+                assert_eq!(
+                    out.keep,
+                    [gone],
+                    "absent means nothing before the watch lists"
+                );
+            }
+            assert_eq!(b.engine.high_watermark("t", 0).unwrap(), 1, "marked here");
+
+            // t/1 moves to nobody: it exists, so its marker is kept.
+            test_cluster::write(cluster.path(), 2, &[SELF, PEER], &[("t", 0, SELF)]);
+            assert!(b.coordinator().unwrap().apply_if_new());
+            let out = BrokerMarkerApplier::new(b.clone())
+                .apply(&MarkerEntry {
+                    partitions: vec![t(vec![1])],
+                    ..entry
+                })
+                .await;
+            assert_eq!(
+                out,
+                ApplyOutcome {
+                    forward: Vec::new(),
+                    keep: vec![t(vec![1])],
+                }
+            );
+        }
+    }
+
+    /// gh #316, the issue's sequences: the coordinator queued the marker for
+    /// the partition's old leader, and the partition moved before that broker
+    /// read it. The old leader dropped it, so an acknowledged commit stayed
+    /// invisible to `read_committed` for good, and an abort's records were
+    /// never marked aborted. Now it's forwarded and the new leader writes it.
+    #[tokio::test]
+    async fn a_marker_queued_for_the_old_leader_reaches_the_new_one() {
+        use crate::handlers::test_cluster;
+        for commit in [true, false] {
+            let cluster = tempfile::tempdir().unwrap();
+            let (a, b) = (peer(0, cluster.path()), peer(1, cluster.path()));
+            let brokers = ["kaas-0", "kaas-1"];
+            test_cluster::write(cluster.path(), 1, &brokers, &[("t", 0, "kaas-1")]);
+            for x in [&a, &b] {
+                let c = test_cluster::coordinator(&x.self_id, cluster.path());
+                assert!(c.apply_if_new());
+                x.install_coordinator(c);
+            }
+            // The transaction's record, in the log the new leader will serve.
+            a.engine.create_partition("t", 0).await.unwrap();
+            a.engine.append("t", 0, 2, -1, txn_batch(7)).await.unwrap();
+            assert_eq!(a.engine.last_stable_offset("t", 0).unwrap(), 0);
+
+            // EndTxn on kaas-0, which still sees kaas-1 leading.
+            assert_eq!(
+                dispatch_markers(&a, "tx", 7, 0, commit, &[t(vec![0])]).await,
+                Ok(())
+            );
+            assert_eq!(a.marker_queue().unwrap().list("kaas-1").unwrap().len(), 1);
+
+            // The partition moves to kaas-0 before kaas-1 reads its inbox.
+            test_cluster::write(cluster.path(), 2, &brokers, &[("t", 0, "kaas-0")]);
+            for x in [&a, &b] {
+                assert!(x.coordinator().unwrap().apply_if_new());
+            }
+            watcher(&b).tick().await;
+            watcher(&a).tick().await;
+
+            assert_eq!(
+                a.engine.high_watermark("t", 0).unwrap(),
+                2,
+                "marker written"
+            );
+            assert_eq!(
+                a.engine.last_stable_offset("t", 0).unwrap(),
+                2,
+                "commit={commit}"
+            );
+            let aborted = a.engine.aborted_transactions_in_range("t", 0, 0, 2);
+            assert_eq!(aborted.len(), usize::from(!commit), "commit={commit}");
+            let q = a.marker_queue().unwrap();
+            assert!(q.list("kaas-0").unwrap().is_empty());
+            assert!(q.list("kaas-1").unwrap().is_empty());
+        }
+    }
+
+    /// gh #316: a broker that has just started reads its inbox before it has
+    /// loaded an assignment, when it leads nothing. Dropping the marker then
+    /// left its partition's last stable offset pinned once it took the
+    /// partition back. It's kept until a leader is known.
+    #[tokio::test]
+    async fn a_marker_read_before_the_first_assignment_load_is_kept() {
+        use crate::handlers::test_cluster;
+        let cluster = tempfile::tempdir().unwrap();
+        let b = peer(1, cluster.path());
+        b.install_coordinator(test_cluster::coordinator("kaas-1", cluster.path()));
+        b.engine.create_partition("t", 0).await.unwrap();
+        b.engine.append("t", 0, 1, -1, txn_batch(7)).await.unwrap();
+        let q = b.marker_queue().unwrap();
+        q.enqueue(
+            "kaas-1",
+            &MarkerEntry {
+                transactional_id: "tx".to_owned(),
+                producer_id: 7,
+                producer_epoch: 0,
+                commit: true,
+                coordinator_epoch: 0,
+                partitions: vec![t(vec![0])],
+            },
+        )
+        .unwrap();
+
+        let w = watcher(&b);
+        w.tick().await;
+        assert_eq!(q.list("kaas-1").unwrap().len(), 1, "kept, not dropped");
+        assert_eq!(b.engine.high_watermark("t", 0).unwrap(), 1);
+
+        test_cluster::write(
+            cluster.path(),
+            1,
+            &["kaas-0", "kaas-1"],
+            &[("t", 0, "kaas-1")],
+        );
+        assert!(b.coordinator().unwrap().apply_if_new());
+        w.tick().await;
+        assert!(q.list("kaas-1").unwrap().is_empty());
+        assert_eq!(b.engine.last_stable_offset("t", 0).unwrap(), 2);
     }
 }

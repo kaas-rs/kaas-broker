@@ -55,7 +55,8 @@ written on take-over, close/relinquish and every 64 MiB of log beside
   `/data/__cluster/marker_queue/to-<broker>/`
   (`crates/kaas-coordinator/src/marker_queue.rs`), which each broker's
   `marker_watcher` polls and applies
-  (`crates/kaas-broker/src/marker_watcher.rs`). `EndTxn` returns success
+  (`crates/kaas-broker/src/marker_watcher.rs`), forwarding a partition
+  that has moved to its current leader (gh #316). `EndTxn` returns success
   once the queue entry is written
   ([EndTxn](../api/transactions.md#endtxn)).
 - **`read_committed` via LSO clamp.** The Fetch handler

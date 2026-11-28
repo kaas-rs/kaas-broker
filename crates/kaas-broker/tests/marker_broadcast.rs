@@ -32,13 +32,17 @@ impl Capturing {
 impl MarkerApplier for Capturing {
     async fn apply(&self, entry: &MarkerEntry) -> ApplyOutcome {
         self.calls.lock().push(entry.clone());
-        ApplyOutcome::Applied
+        ApplyOutcome::done()
     }
 }
 
 fn build_watcher(queue: &MarkerQueue, self_id: &str) -> (Arc<MarkerWatcher>, Arc<Capturing>) {
     let capturing = Arc::new(Capturing::default());
-    let watcher = Arc::new(MarkerWatcher::new(queue.inbox(self_id), capturing.clone()));
+    let watcher = Arc::new(MarkerWatcher::new(
+        queue.clone(),
+        self_id,
+        capturing.clone(),
+    ));
     (watcher, capturing)
 }
 
@@ -113,7 +117,7 @@ async fn inbox_routing_keeps_per_target_isolation() {
 
 /// Producer retried `EndTxn`, txn coord re-enqueued under the same
 /// `<pid>-<epoch>` file name. The receiver applies it twice (once
-/// per visible file). Wasteful but consumer-correct.
+/// per visible file).
 #[tokio::test]
 async fn retry_after_apply_reapplies_idempotent_at_consumer_level() {
     let tmp = tempfile::tempdir().unwrap();

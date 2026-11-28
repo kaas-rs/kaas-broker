@@ -17,8 +17,9 @@ load/evict — including the gh #89 orphan sweep), `group_hash.rs`
 (stops acking writes when heartbeats stall), `heartbeat_client.rs`,
 `fence_watcher.rs` + `marker_watcher.rs` (shared-volume pollers applying
 peer fences and txn markers), `producer_id.rs` (persisted per-broker PID
-blocks, gh #219), `txn_markers.rs` (shared COMMIT/ABORT marker dispatch +
-the prepared-txn reconcile, gh #225), `assignment.rs` (the
+blocks, gh #219), `txn_markers.rs` (shared COMMIT/ABORT marker dispatch,
+the prepared-txn reconcile, gh #225, and the inbox applier that forwards a
+moved partition's marker, gh #316), `assignment.rs` (the
 `assignment.json` schema), `control_batch.rs` (COMMIT/ABORT control-batch
 encoder), `listener_advert.rs` (the advertised-endpoint rule + broker
 catalog shared by Metadata and DescribeCluster), `argocd.rs` (ArgoCD

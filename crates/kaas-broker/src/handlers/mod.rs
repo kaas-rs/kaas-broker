@@ -218,24 +218,41 @@ pub(crate) mod test_cluster {
     /// (`(topic, partition, broker)`), load it, and install the
     /// coordinator on `b`. Partitions not listed are led by nobody.
     pub fn install(b: &Arc<Broker>, cluster_dir: &Path, leaders: &[(&str, i32, &str)]) {
-        let broker = |id: &str| BrokerAssignment {
-            id: id.to_owned(),
-            health: BrokerHealth::Alive,
-            last_seen: "x".to_owned(),
-        };
+        write(cluster_dir, 1, &[SELF, PEER], leaders);
+        let c = coordinator(SELF, cluster_dir);
+        assert!(c.apply_if_new(), "coordinator must load the assignment");
+        b.install_coordinator(c);
+    }
+
+    /// Write `assignment.json` at `version`, with `brokers` alive and
+    /// `leaders` (`(topic, partition, broker)`) leading at epoch `version`.
+    /// A coordinator loads a version above the one it has.
+    pub fn write(
+        cluster_dir: &Path,
+        version: u32,
+        brokers: &[&str],
+        leaders: &[(&str, i32, &str)],
+    ) {
         let a = Assignment {
             controller_epoch: 1,
-            assignment_version: 1,
+            assignment_version: i64::from(version),
             generated_at: "2026-01-01T00:00:00Z".to_owned(),
             controller: SELF.to_owned(),
-            brokers: vec![broker(SELF), broker(PEER)],
+            brokers: brokers
+                .iter()
+                .map(|id| BrokerAssignment {
+                    id: (*id).to_owned(),
+                    health: BrokerHealth::Alive,
+                    last_seen: "x".to_owned(),
+                })
+                .collect(),
             partitions: leaders
                 .iter()
                 .map(|(topic, partition, leader)| PartitionAssignment {
                     topic: (*topic).to_owned(),
                     partition: *partition,
                     broker: (*leader).to_owned(),
-                    epoch: 1,
+                    epoch: version,
                     role: PartitionRole::Leader,
                 })
                 .collect(),
@@ -246,13 +263,15 @@ pub(crate) mod test_cluster {
             serde_json::to_vec(&a).unwrap(),
         )
         .unwrap();
-        let c = Coordinator::new(
-            SELF,
+    }
+
+    /// A coordinator for `self_id` over `cluster_dir`, with nothing loaded.
+    pub fn coordinator(self_id: &str, cluster_dir: &Path) -> Arc<Coordinator> {
+        Coordinator::new(
+            self_id,
             cluster_dir,
             Arc::new(LocalLeaseEpoch),
             Arc::new(LocalHeartbeat),
-        );
-        assert!(c.apply_if_new(), "coordinator must load the assignment");
-        b.install_coordinator(c);
+        )
     }
 }

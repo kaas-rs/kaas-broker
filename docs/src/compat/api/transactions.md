@@ -259,7 +259,8 @@ partitions** get one queue file per target broker under
 `/data/__cluster/marker_queue/to-<broker>/<pid>-<epoch>.json` — a
 durably written queue entry is the durability boundary for a peer
 partition, since the peer's `MarkerWatcher` (2 s poll) retries until
-the marker applies. Only once every marker is durable does
+the marker applies, and forwards it to the partition's current leader
+if the partition moved before the peer read it (gh #316). Only once every marker is durable does
 `complete_end_txn` run: `Prepare* → Complete*`, lists cleared,
 `ongoingSinceMs` zeroed. The offsets come first of all, right after the prepare:
 the hook fires per recorded group (commit materialises the offsets
@@ -289,7 +290,7 @@ up.
   marker is *written to the partition log*; kaas completes once the
   queue entries land, so `read_committed` visibility (LSO advance) on
   peer-led partitions trails the `commitTransaction()` return by up to
-  the 2 s poll.
+  the 2 s poll, plus one poll per forward if the partition moved.
 - `CoordinatorEpoch` in emitted markers is always 0 (kaas tracks no txn
   coordinator epoch distinct from the assignment epoch); consumers do
   not act on the field.
@@ -309,6 +310,10 @@ mismatch → 90, `Empty` → invalid); `end_txn_idempotent_retry_returns_ok`
 and `end_txn_against_empty_is_invalid` in
 `crates/kaas-coordinator/src/txn_state.rs`; queue round-trip and
 overwrite-on-retry tests in `crates/kaas-coordinator/src/marker_queue.rs`;
+the forwarding tests in `crates/kaas-broker/src/txn_markers.rs` (a marker
+queued for a partition's old leader reaches the new one, for commit and
+abort, and one read before the first assignment load is kept) and the
+claim tests in `crates/kaas-broker/src/marker_watcher.rs`;
 `bins/kaas/tests/eos_v2.rs` (commit path visible to `read_committed`,
 abort path populates `AbortedTransactions[]`).
 

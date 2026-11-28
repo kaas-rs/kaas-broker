@@ -23,7 +23,10 @@ pub use manager::{
     GroupAssignmentSource, LeaveOutcome, LocalGroupSource, LocalTxnSource, Manager,
     TxnAssignmentSource,
 };
-pub use marker_queue::{marker_queue_dir, MarkerEntry, MarkerQueue, MARKER_QUEUE_DIR_NAME};
+pub use marker_queue::{
+    claimed_name, forwarded_name, is_claimed, marker_queue_dir, MarkerEntry, MarkerQueue,
+    MARKER_QUEUE_DIR_NAME,
+};
 pub use offset_store::{group_id_fits, offset_key, parse_offset_key, FetchSpec, OffsetStore};
 pub use txn_state::{
     EndTxnOutcome, InitPidOutcome, PendingMarkerDispatch, TxnAbortRecord, TxnEntry, TxnOffsetHook,

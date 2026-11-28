@@ -171,7 +171,7 @@ flowchart TD
     complete --> respond["EndTxn response error_code=0"]
     split -- "any dispatch fails" --> retriable["respond COORDINATOR_NOT_AVAILABLE (retriable)<br/>entry stays PrepareCommit — reconcile finishes it"]
     enqueue -.-> watcher["peer broker's marker watcher<br/>polls its own to-&lt;self&gt;/ every 2 s"]
-    watcher -.-> apply["applies marker as control-batch append<br/>to partitions it leads, then deletes the file"]
+    watcher -.-> apply["claims the file, appends the marker to partitions it leads,<br/>forwards the ones that moved to their leader,<br/>then deletes the file"]
 ```
 
 ### A batch can't open a transaction the coordinator doesn't know of
@@ -213,6 +213,42 @@ harmless: control batches have no sequence numbers, and consumers don't react
 to a second marker. Consumers in `read_committed` only see the
 transaction's records once these markers land (the fetch path clamps to
 the last stable offset).
+
+### A queued marker follows its partition
+
+By the time a peer reads its inbox, `EndTxn` has answered and nothing
+upstream will send the marker again, so the entry is owed to its
+partitions, not to that broker. The partition can move in between: the
+peer was drained or restarted, or the coordinator's view of
+`assignment.json` was behind. So the peer sorts each partition (gh #316):
+
+| The partition is | The peer |
+|---|---|
+| led by this broker | appends the marker |
+| led by another broker | forwards it to that broker's inbox |
+| led by nobody yet | keeps it in the file for the next poll |
+| gone with its topic, once the topic watch has listed | drops it |
+
+The third row includes a broker that has just started and hasn't loaded an
+assignment, when it leads nothing. Each hop adds one poll to the time before
+`read_committed` consumers see the transaction. Until gh #316 the peer
+dropped every partition it didn't lead. An acknowledged commit then stayed
+invisible to `read_committed` for good, behind a pinned last stable offset,
+and an abort's records could be read. Apache's marker channel looks the
+leader up again and resends, which is what forwarding does through the
+queue.
+
+An inbox has more than one writer now: the coordinator, and any peer
+forwarding to it. So the watcher claims a file before reading it, by
+renaming it to a name only it writes, and can then rewrite it with just
+the partitions still owed. Without the claim, the delete after an apply
+could take with it the entry a coordinator had just written under the same
+`<pid>-<epoch>.json` name for the producer's next transaction. A forward
+is named after the claimed file it came from and its partitions, so
+forwarding again after a crash rewrites the same file.
+
+An inbox is only read by its own broker. If a broker is removed for good,
+markers left in its inbox are never forwarded.
 
 ## Coordinator routing and staged offsets
 
@@ -289,7 +325,10 @@ poll rather than skipping it.
 - Txn state store + slot sharding:
   `crates/kaas-coordinator/src/txn_state.rs` — the architectural answer
   to gh #29 (no literal `__transaction_state` topic).
-- Marker queue: gh #175. Txn-slot hash ownership: gh #91. Two-phase
+- Marker queue: gh #175; forwarding a queued marker to the partition's
+  current leader, and the claim before a read: gh #316
+  (`BrokerMarkerApplier` in `crates/kaas-broker/src/txn_markers.rs`). Txn-slot
+  hash ownership: gh #91. Two-phase
   EndTxn + the marker reconcile: gh #225, shared dispatch in
   `crates/kaas-broker/src/txn_markers.rs` (`reconcile_pending_markers`
   over `TxnStateStore::pending_marker_dispatches`).

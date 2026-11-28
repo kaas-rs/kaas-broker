@@ -30,14 +30,14 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use bytes::Bytes;
 use kaas_broker::coordinator::{HeartbeatSource, LeaseEpochSource};
 use kaas_broker::heartbeatpb::controller_heartbeat_server::ControllerHeartbeatServer;
 use kaas_broker::heartbeatpb::BrokerStatus;
+use kaas_broker::txn_markers::BrokerMarkerApplier;
 use kaas_broker::{
-    build_control_batch, ApplyOutcome, Broker, Coordinator, FenceWatcher, GroupTakeoverDriver,
-    HeartbeatClient, LocalHeartbeat, LocalLeaseEpoch, MarkerApplier, MarkerWatcher,
-    ProducerEpochFencer, TakeoverDriver, TargetResolver,
+    Broker, Coordinator, FenceWatcher, GroupTakeoverDriver, HeartbeatClient, LocalHeartbeat,
+    LocalLeaseEpoch, MarkerApplier, MarkerWatcher, ProducerEpochFencer, TakeoverDriver,
+    TargetResolver,
 };
 use kaas_controller::{
     AssignmentLoop, AssignmentReason, BrokerSource, HeartbeatServer, HeartbeatService,
@@ -45,7 +45,7 @@ use kaas_controller::{
 };
 use kaas_coordinator::{
     fence_log_dir, BrokerEndpoint, BrokerLookup, FenceLog, FnLookup, LocalGroupSource,
-    LocalTxnSource, Manager, MarkerEntry, MarkerQueue, OffsetStore, TxnOffsetHook, TxnStateStore,
+    LocalTxnSource, Manager, MarkerQueue, OffsetStore, TxnOffsetHook, TxnStateStore,
 };
 use kaas_k8s::kube_watchers::{run_endpoint_watch, run_lease_watch, KubeLeaseEpoch};
 use kaas_k8s::{BrokerIdentity, BrokerRegistry};
@@ -225,11 +225,13 @@ pub fn install(
 
     // gh #175 MarkerWatcher: poll the per-broker marker inbox every
     // 2 s and apply each commit/abort marker to the partitions we
-    // currently lead.
-    let applier: Arc<dyn MarkerApplier> = Arc::new(BrokerMarkerApplier {
-        broker: broker.clone(),
-    });
-    let marker_watcher = Arc::new(MarkerWatcher::new(marker_queue.inbox(&self_id), applier));
+    // currently lead, forwarding the rest to whoever leads them now (gh #316).
+    let applier: Arc<dyn MarkerApplier> = Arc::new(BrokerMarkerApplier::new(broker.clone()));
+    let marker_watcher = Arc::new(MarkerWatcher::new(
+        marker_queue.clone(),
+        self_id.clone(),
+        applier,
+    ));
     let mw_cancel = cancel.clone();
     let mw_clone = marker_watcher.clone();
     tasks.push(tokio::spawn(async move {
@@ -393,66 +395,6 @@ struct EngineFencer {
 impl ProducerEpochFencer for EngineFencer {
     fn fence_producer_epoch(&self, pid: i64, epoch: i16) {
         self.engine.fence_producer_epoch(pid, epoch);
-    }
-}
-
-/// [`MarkerApplier`] adapter that bridges the inbound marker queue
-/// into the storage engine. For each `(topic, partition)` in the
-/// entry that this broker currently leads, builds a control batch
-/// via [`build_control_batch`] and appends it with `acks = -1`.
-/// Partitions led by another broker are silently skipped — the
-/// dispatcher should not have targeted us with them; logging
-/// preserves the breadcrumb.
-struct BrokerMarkerApplier {
-    broker: Arc<Broker>,
-}
-
-#[async_trait::async_trait]
-impl MarkerApplier for BrokerMarkerApplier {
-    async fn apply(&self, entry: &MarkerEntry) -> ApplyOutcome {
-        let batch = Bytes::from(build_control_batch(
-            entry.producer_id,
-            entry.producer_epoch,
-            entry.commit,
-            entry.coordinator_epoch,
-        ));
-        let coord = self.broker.coordinator();
-        for topic in &entry.partitions {
-            for &p in &topic.partitions {
-                let owns = coord.as_ref().is_none_or(|c| c.owns(&topic.topic, p));
-                if !owns {
-                    tracing::warn!(
-                        topic = %topic.topic,
-                        partition = p,
-                        pid = entry.producer_id,
-                        "MarkerWatcher: queue entry targeted us but we don't lead this \
-                         partition; assignment view may have drifted — marker dropped"
-                    );
-                    continue;
-                }
-                let epoch = coord
-                    .as_ref()
-                    .and_then(|c| c.current_epoch(&topic.topic, p))
-                    .unwrap_or_else(|| self.broker.local_lease.current_epoch());
-                let _ = self.broker.engine.create_partition(&topic.topic, p).await;
-                if let Err(err) = self
-                    .broker
-                    .engine
-                    .append(&topic.topic, p, epoch, -1, batch.clone())
-                    .await
-                {
-                    tracing::warn!(
-                        topic = %topic.topic,
-                        partition = p,
-                        %err,
-                        "MarkerWatcher: control-batch append failed; keeping \
-                         queue file for retry next tick"
-                    );
-                    return ApplyOutcome::Retry;
-                }
-            }
-        }
-        ApplyOutcome::Applied
     }
 }
 
